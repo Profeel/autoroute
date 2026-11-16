@@ -1,0 +1,1086 @@
+import Foundation
+
+public enum UpstreamError: Error, LocalizedError, Sendable {
+    case invalidURL(String)
+    case authError(statusCode: Int, message: String)
+    case modelUnavailable(statusCode: Int, message: String, availability: ModelAvailabilityStatus)
+    case networkError(message: String)
+    case httpError(statusCode: Int, rawBody: Data, message: String)
+    case invalidResponse(message: String)
+
+    public var statusCode: Int {
+        switch self {
+        case .invalidURL: return 400
+        case .authError(let code, _): return code
+        case .modelUnavailable(let code, _, _): return code
+        case .networkError: return 502
+        case .httpError(let code, _, _): return code
+        case .invalidResponse: return 502
+        }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL(let url):
+            return "无效的供应商 URL: \(url)"
+        case .authError(_, let msg):
+            return "鉴权失败 (API Key 无效或无权限): \(msg)"
+        case .modelUnavailable(_, let msg, _):
+            return "模型不可用: \(msg)"
+        case .networkError(let msg):
+            return "网络连接失败: \(msg)"
+        case .httpError(let code, _, let msg):
+            return "上游返回 HTTP \(code): \(msg)"
+        case .invalidResponse(let msg):
+            return "上游响应格式异常: \(msg)"
+        }
+    }
+}
+
+public struct UpstreamCompletionResult: Sendable {
+    public var statusCode: Int
+    public var responseBody: Data
+    public var assistantText: String
+    public var reasoningText: String?
+    public var usage: TokenUsage?
+    public var usageSource: UsageDataSource
+    public var usageEstimationMethod: String?
+    public var firstTokenMs: Double?
+    public var totalLatencyMs: Double
+}
+
+public struct ModelProbeResult: Sendable {
+    public var isAvailable: Bool
+    public var availability: ModelAvailabilityStatus
+    public var latencyMs: Double
+    public var note: String
+}
+
+public enum ProviderReachabilityOutcome: Sendable {
+    case reachable(discoveredModelIDs: [String])
+    case reachableNoModelList
+    case unreachable(ProviderHealthStatus, String)
+}
+
+public final class UpstreamClient: @unchecked Sendable {
+    private let session: URLSession
+
+    public init(session: URLSession? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let config = URLSessionConfiguration.ephemeral
+            config.waitsForConnectivity = false
+            config.requestCachePolicy = .reloadIgnoringLocalCacheData
+            self.session = URLSession(configuration: config)
+        }
+    }
+
+    // MARK: - Provider Model Discovery / Connectivity Check
+
+    public func fetchModels(
+        provider: ProviderConfig,
+        apiKey: String?,
+        secretsToRedact: [String] = []
+    ) async -> Result<[String], UpstreamError> {
+        if provider.apiProtocol == .codexChatGPT {
+            // Codex ChatGPT OAuth backend (/backend-api/codex) does not expose /v1/models;
+            // models are discovered from ~/.codex/models_cache.json and validated via /responses.
+            return .success([])
+        }
+
+        guard let url = provider.endpointURL(path: "/v1/models") else {
+            return .failure(.invalidURL(provider.baseURL))
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = min(20.0, max(5.0, provider.timeoutSeconds))
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            if provider.apiProtocol == .anthropicMessages {
+                request.setValue(key, forHTTPHeaderField: "x-api-key")
+                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            } else {
+                request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            }
+        }
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(.invalidResponse(message: "未收到有效的 HTTP 响应"))
+            }
+
+            if http.statusCode == 401 || http.statusCode == 403 {
+                let msg = extractErrorMessage(from: data, secrets: secretsToRedact) ?? "Unauthorized"
+                return .failure(.authError(statusCode: http.statusCode, message: msg))
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let msg = extractErrorMessage(from: data, secrets: secretsToRedact) ?? "HTTP \(http.statusCode)"
+                return .failure(.httpError(statusCode: http.statusCode, rawBody: data, message: msg))
+            }
+
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataList = obj["data"] as? [[String: Any]] else {
+                return .failure(.invalidResponse(message: "上游 /v1/models 返回格式不是 OpenAI 兼容列表"))
+            }
+
+            let ids = dataList.compactMap { $0["id"] as? String }.filter { !$0.isEmpty }
+            return .success(ids)
+        } catch {
+            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return .failure(.networkError(message: cleanMsg))
+        }
+    }
+
+    // MARK: - Chat Completions Execution (Non-Streaming & Streaming)
+
+    public func executeChatCompletion(
+        provider: ProviderConfig,
+        model: ModelConfig,
+        apiKey: String?,
+        originalPayload: [String: Any],
+        estimatedInputTokens: Int,
+        stream: Bool,
+        secretsToRedact: [String] = [],
+        onStreamHeadersReady: (@Sendable () async throws -> Void)? = nil,
+        onStreamChunk: (@Sendable (Data) async throws -> Void)? = nil
+    ) async -> Result<UpstreamCompletionResult, UpstreamError> {
+        switch provider.apiProtocol {
+        case .codexChatGPT, .openAIResponses:
+            return await executeResponsesCompletion(
+                provider: provider,
+                model: model,
+                apiKey: apiKey,
+                originalPayload: originalPayload,
+                estimatedInputTokens: estimatedInputTokens,
+                callerRequestedStream: stream,
+                secretsToRedact: secretsToRedact,
+                onStreamHeadersReady: onStreamHeadersReady,
+                onStreamChunk: onStreamChunk
+            )
+        case .anthropicMessages:
+            return await executeAnthropicCompletion(
+                provider: provider,
+                model: model,
+                apiKey: apiKey,
+                originalPayload: originalPayload,
+                estimatedInputTokens: estimatedInputTokens,
+                stream: stream,
+                secretsToRedact: secretsToRedact,
+                onStreamHeadersReady: onStreamHeadersReady,
+                onStreamChunk: onStreamChunk
+            )
+        case .openAIChatCompletions:
+            break
+        }
+
+        guard let url = provider.endpointURL(path: "/v1/chat/completions") else {
+            return .failure(.invalidURL(provider.baseURL))
+        }
+
+        var upstreamPayload = originalPayload
+        upstreamPayload["model"] = model.modelID
+        upstreamPayload["stream"] = stream
+
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: upstreamPayload, options: []) else {
+            return .failure(.invalidResponse(message: "无法序列化上游请求 JSON"))
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bodyData
+        request.timeoutInterval = max(5.0, provider.timeoutSeconds)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(stream ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+
+        let startTime = DispatchTime.now()
+
+        do {
+            if !stream {
+                let (data, response) = try await session.data(for: request)
+                let totalMs = elapsedMs(since: startTime)
+                guard let http = response as? HTTPURLResponse else {
+                    return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
+                }
+
+                if !(200...299).contains(http.statusCode) {
+                    return .failure(classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact))
+                }
+
+                // Parse OpenAI response to extract assistant text, usage, and normalize model field
+                var parsedObj = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                if parsedObj["model"] == nil || (parsedObj["model"] as? String)?.isEmpty == true {
+                    parsedObj["model"] = model.modelID
+                }
+
+                let (assistantText, reasoningText) = Self.extractAssistantAndReasoning(from: parsedObj)
+                let reportedUsage = extractUsage(from: parsedObj)
+                let finalUsage: TokenUsage?
+                let usageSource: UsageDataSource
+                let estimationNote: String?
+
+                if let reportedUsage {
+                    finalUsage = reportedUsage
+                    usageSource = .upstreamReported
+                    estimationNote = nil
+                } else {
+                    let textForEst = assistantText.isEmpty ? (reasoningText ?? "") : assistantText
+                    let estOut = RequestFeatureExtractor.estimateTokens(text: textForEst, messageCount: 0)
+                    finalUsage = TokenUsage(promptTokens: estimatedInputTokens, completionTokens: estOut)
+                    usageSource = .estimatedWhenMissing
+                    estimationNote = "上游响应未包含 usage 字段，按本地字符数 (~3.2 chars/token) 估算"
+                }
+
+                let outData = (try? JSONSerialization.data(withJSONObject: parsedObj, options: [])) ?? data
+                return .success(UpstreamCompletionResult(
+                    statusCode: http.statusCode,
+                    responseBody: outData,
+                    assistantText: assistantText,
+                    reasoningText: reasoningText,
+                    usage: finalUsage,
+                    usageSource: usageSource,
+                    usageEstimationMethod: estimationNote,
+                    firstTokenMs: totalMs,
+                    totalLatencyMs: totalMs
+                ))
+            } else {
+                // Streaming SSE request
+                let (asyncBytes, response) = try await session.bytes(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
+                }
+
+                if !(200...299).contains(http.statusCode) {
+                    var errorBytes = Data()
+                    for try await byte in asyncBytes {
+                        errorBytes.append(byte)
+                        if errorBytes.count > 65_536 { break }
+                    }
+                    return .failure(classifyHTTPError(statusCode: http.statusCode, data: errorBytes, secrets: secretsToRedact))
+                }
+
+                if let onStreamHeadersReady {
+                    try await onStreamHeadersReady()
+                }
+
+                var firstTokenMs: Double?
+                var accumulatedText = ""
+                var accumulatedReasoning = ""
+                var reportedUsage: TokenUsage?
+                var lineBuffer = Data()
+
+                func processLine(_ lineData: Data) async throws {
+                    guard let line = String(data: lineData, encoding: .utf8) else {
+                        if let onStreamChunk { try await onStreamChunk(lineData + Data([0x0A])) }
+                        return
+                    }
+
+                    let trimmed = line.trimmingCharacters(in: .newlines)
+                    if trimmed.hasPrefix("data:") {
+                        let payloadPart = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                        if payloadPart == "[DONE]" {
+                            if let onStreamChunk {
+                                try await onStreamChunk(Data("data: [DONE]\n\n".utf8))
+                            }
+                            return
+                        }
+
+                        if let jsonData = payloadPart.data(using: .utf8),
+                           var chunkObj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                            // Ensure executed model is identifiable in chunk JSON
+                            chunkObj["model"] = model.modelID
+
+                            let (deltaContent, deltaReasoning) = extractStreamDeltaParts(from: chunkObj)
+                            if let deltaContent, !deltaContent.isEmpty {
+                                if firstTokenMs == nil {
+                                    firstTokenMs = elapsedMs(since: startTime)
+                                }
+                                accumulatedText += deltaContent
+                            }
+                            if let deltaReasoning, !deltaReasoning.isEmpty {
+                                if firstTokenMs == nil {
+                                    firstTokenMs = elapsedMs(since: startTime)
+                                }
+                                accumulatedReasoning += deltaReasoning
+                            }
+                            if firstTokenMs == nil, chunkObj["choices"] != nil, hasAnyChoiceDelta(chunkObj) {
+                                firstTokenMs = elapsedMs(since: startTime)
+                            }
+
+                            if let chunkUsage = extractUsage(from: chunkObj) {
+                                reportedUsage = chunkUsage
+                            }
+
+                            if let rewrittenData = try? JSONSerialization.data(withJSONObject: chunkObj, options: []),
+                               let rewrittenStr = String(data: rewrittenData, encoding: .utf8) {
+                                if let onStreamChunk {
+                                    try await onStreamChunk(Data("data: \(rewrittenStr)\n\n".utf8))
+                                }
+                                return
+                            }
+                        }
+
+                        if let onStreamChunk {
+                            try await onStreamChunk(Data((trimmed + "\n\n").utf8))
+                        }
+                    } else if trimmed.isEmpty {
+                        // Already emitted \n\n after data lines; ignore extra blank delimiters unless non-data SSE fields used
+                    } else {
+                        if let onStreamChunk {
+                            try await onStreamChunk(Data((trimmed + "\n").utf8))
+                        }
+                    }
+                }
+
+                for try await byte in asyncBytes {
+                    if byte == 0x0A { // '\n'
+                        try await processLine(lineBuffer)
+                        lineBuffer.removeAll(keepingCapacity: true)
+                    } else if byte != 0x0D { // ignore '\r'
+                        lineBuffer.append(byte)
+                    }
+                }
+                if !lineBuffer.isEmpty {
+                    try await processLine(lineBuffer)
+                }
+
+                let totalMs = elapsedMs(since: startTime)
+                let finalUsage: TokenUsage?
+                let usageSource: UsageDataSource
+                let estimationNote: String?
+
+                if let reportedUsage {
+                    finalUsage = reportedUsage
+                    usageSource = .upstreamReported
+                    estimationNote = nil
+                } else {
+                    let textForEst = accumulatedText.isEmpty ? accumulatedReasoning : accumulatedText
+                    let estOut = RequestFeatureExtractor.estimateTokens(text: textForEst, messageCount: 0)
+                    finalUsage = TokenUsage(promptTokens: estimatedInputTokens, completionTokens: estOut)
+                    usageSource = .estimatedWhenMissing
+                    estimationNote = "上游流式响应未返回 usage 字段，按本地字符数 (~3.2 chars/token) 估算"
+                }
+
+                return .success(UpstreamCompletionResult(
+                    statusCode: http.statusCode,
+                    responseBody: Data(),
+                    assistantText: accumulatedText,
+                    reasoningText: accumulatedReasoning.isEmpty ? nil : accumulatedReasoning,
+                    usage: finalUsage,
+                    usageSource: usageSource,
+                    usageEstimationMethod: estimationNote,
+                    firstTokenMs: firstTokenMs ?? totalMs,
+                    totalLatencyMs: totalMs
+                ))
+            }
+        } catch {
+            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return .failure(.networkError(message: cleanMsg))
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func classifyHTTPError(statusCode: Int, data: Data, secrets: [String]) -> UpstreamError {
+        let msg = extractErrorMessage(from: data, secrets: secrets) ?? "HTTP \(statusCode)"
+        let lower = msg.lowercased()
+        if statusCode == 401 || statusCode == 403 {
+            return .authError(statusCode: statusCode, message: msg)
+        }
+        if lower.contains("retired") || lower.contains("deprecated") || statusCode == 410 {
+            return .modelUnavailable(statusCode: statusCode, message: msg, availability: .retired)
+        }
+        if statusCode == 402 || lower.contains("credit") || lower.contains("quota") || lower.contains("insufficient") || lower.contains("subscribe") || lower.contains("exhausted") || lower.contains("balance") {
+            return .modelUnavailable(statusCode: statusCode, message: msg, availability: .insufficientCredits)
+        }
+        return .httpError(statusCode: statusCode, rawBody: data, message: msg)
+    }
+
+    // MARK: - Active Health Probing
+
+    public func checkProviderReachability(
+        provider: ProviderConfig,
+        apiKey: String?,
+        timeoutSeconds: Double = 3.0,
+        secretsToRedact: [String] = []
+    ) async -> ProviderReachabilityOutcome {
+        guard let url = provider.endpointURL(path: "/v1/models") else {
+            return .unreachable(.networkError, "无效的 Base URL: \(provider.baseURL)")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = max(1.5, timeoutSeconds)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if provider.apiProtocol == .codexChatGPT {
+            if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+                return .reachableNoModelList
+            }
+            return .unreachable(.authError, "Codex ~/.codex/auth.json 缺少有效的 access_token")
+        }
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            if provider.apiProtocol == .anthropicMessages {
+                request.setValue(key, forHTTPHeaderField: "x-api-key")
+                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            } else {
+                request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            }
+        }
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .unreachable(.networkError, "未收到有效 HTTP 响应")
+            }
+            if http.statusCode == 401 || http.statusCode == 403 {
+                let msg = extractErrorMessage(from: data, secrets: secretsToRedact) ?? "HTTP \(http.statusCode)"
+                return .unreachable(.authError, "鉴权失败 (HTTP \(http.statusCode)): \(msg)")
+            }
+            if (200...299).contains(http.statusCode) {
+                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let dataList = obj["data"] as? [[String: Any]] {
+                    let ids = dataList.compactMap { $0["id"] as? String }.filter { !$0.isEmpty }
+                    return .reachable(discoveredModelIDs: ids)
+                }
+                return .reachableNoModelList
+            }
+            if http.statusCode == 404 {
+                // Some relays omit /v1/models while serving /v1/chat/completions
+                return .reachableNoModelList
+            }
+            let msg = extractErrorMessage(from: data, secrets: secretsToRedact) ?? "HTTP \(http.statusCode)"
+            return .unreachable(.serverError, "上游 HTTP \(http.statusCode): \(msg)")
+        } catch {
+            let clean = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return .unreachable(.networkError, clean)
+        }
+    }
+
+    public func probeModelHealth(
+        provider: ProviderConfig,
+        model: ModelConfig,
+        apiKey: String?,
+        timeoutSeconds: Double = 6.0,
+        secretsToRedact: [String] = []
+    ) async -> ModelProbeResult {
+        switch provider.apiProtocol {
+        case .codexChatGPT, .openAIResponses:
+            return await probeResponsesModel(
+                provider: provider,
+                model: model,
+                apiKey: apiKey,
+                timeoutSeconds: timeoutSeconds,
+                secretsToRedact: secretsToRedact
+            )
+        case .anthropicMessages:
+            return await probeAnthropicModel(
+                provider: provider,
+                model: model,
+                apiKey: apiKey,
+                timeoutSeconds: timeoutSeconds,
+                secretsToRedact: secretsToRedact
+            )
+        case .openAIChatCompletions:
+            break
+        }
+
+        guard let url = provider.endpointURL(path: "/v1/chat/completions") else {
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: 0, note: "自动测活剔除：无效的供应商 URL")
+        }
+
+        let probePayload: [String: Any] = [
+            "model": model.modelID,
+            "messages": [["role": "user", "content": "hi"]],
+            "max_tokens": 2,
+            "stream": false
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: probePayload, options: []) else {
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: 0, note: "自动测活剔除：无法构造探测请求")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bodyData
+        request.timeoutInterval = max(2.0, timeoutSeconds)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+
+        let start = DispatchTime.now()
+        do {
+            let (data, response) = try await session.data(for: request)
+            let latencyMs = elapsedMs(since: start)
+            guard let http = response as? HTTPURLResponse else {
+                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：上游未返回有效 HTTP 响应")
+            }
+
+            if (200...299).contains(http.statusCode) {
+                return ModelProbeResult(
+                    isAvailable: true,
+                    availability: .available,
+                    latencyMs: latencyMs,
+                    note: "实测可用 (\(Int(latencyMs)) ms)"
+                )
+            }
+
+            let err = classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact)
+            switch err {
+            case .modelUnavailable(_, let msg, let avail):
+                return ModelProbeResult(
+                    isAvailable: false,
+                    availability: avail,
+                    latencyMs: latencyMs,
+                    note: "自动测活剔除 (\(avail.displayName)): \(msg)"
+                )
+            case .authError(let code, let msg):
+                return ModelProbeResult(
+                    isAvailable: false,
+                    availability: .unavailable,
+                    latencyMs: latencyMs,
+                    note: "自动测活剔除 (鉴权失败 HTTP \(code)): \(msg)"
+                )
+            case .httpError(let code, _, let msg):
+                return ModelProbeResult(
+                    isAvailable: false,
+                    availability: .unavailable,
+                    latencyMs: latencyMs,
+                    note: "自动测活剔除 (HTTP \(code)): \(msg)"
+                )
+            default:
+                return ModelProbeResult(
+                    isAvailable: false,
+                    availability: .unavailable,
+                    latencyMs: latencyMs,
+                    note: "自动测活剔除：\(err.localizedDescription)"
+                )
+            }
+        } catch {
+            let latencyMs = elapsedMs(since: start)
+            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: .unavailable,
+                latencyMs: latencyMs,
+                note: "自动测活剔除：\(cleanMsg)"
+            )
+        }
+    }
+
+    private func extractErrorMessage(from data: Data, secrets: [String]) -> String? {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let errDict = obj["error"] as? [String: Any], let msg = errDict["message"] as? String {
+                return SecretRedactor.redact(msg, secrets: secrets)
+            }
+            if let msg = obj["message"] as? String {
+                return SecretRedactor.redact(msg, secrets: secrets)
+            }
+            if let errStr = obj["error"] as? String {
+                return SecretRedactor.redact(errStr, secrets: secrets)
+            }
+        }
+        if let raw = String(data: data, encoding: .utf8), !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return SecretRedactor.redact(String(raw.prefix(400)), secrets: secrets)
+        }
+        return nil
+    }
+
+    private func mapNetworkError(_ error: Error) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut:
+                return "请求上游超时 (Timeout)"
+            case .notConnectedToInternet, .networkConnectionLost:
+                return "当前无网络连接，请检查网络设置"
+            case .cannotConnectToHost, .cannotFindHost:
+                return "无法连接到上游服务器，请检查 Base URL 与服务是否启动"
+            default:
+                return urlError.localizedDescription
+            }
+        }
+        return error.localizedDescription
+    }
+
+    public static func extractAssistantAndReasoning(from json: [String: Any]) -> (content: String, reasoning: String?) {
+        guard let choices = json["choices"] as? [[String: Any]], let first = choices.first else {
+            return ("", nil)
+        }
+        if let msg = first["message"] as? [String: Any] {
+            let reasoning = (msg["reasoning_content"] as? String) ?? (msg["reasoning"] as? String)
+            if let content = msg["content"] as? String, !content.isEmpty {
+                return (content, reasoning?.isEmpty == false ? reasoning : nil)
+            }
+            if let toolCalls = msg["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+                let names = toolCalls.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+                return ("[tool_calls: \(names.joined(separator: ", "))]", reasoning?.isEmpty == false ? reasoning : nil)
+            }
+            return ("", reasoning?.isEmpty == false ? reasoning : nil)
+        }
+        return ("", nil)
+    }
+
+    private func extractStreamDeltaParts(from json: [String: Any]) -> (content: String?, reasoning: String?) {
+        guard let choices = json["choices"] as? [[String: Any]], let first = choices.first else {
+            return (nil, nil)
+        }
+        if let delta = first["delta"] as? [String: Any] {
+            let content = delta["content"] as? String
+            let reasoning = (delta["reasoning_content"] as? String) ?? (delta["reasoning"] as? String)
+            return (content, reasoning)
+        }
+        return (nil, nil)
+    }
+
+    private func hasAnyChoiceDelta(_ json: [String: Any]) -> Bool {
+        guard let choices = json["choices"] as? [[String: Any]], let first = choices.first else {
+            return false
+        }
+        if let delta = first["delta"] as? [String: Any] {
+            return delta["tool_calls"] != nil || delta["role"] != nil || delta["content"] != nil || delta["reasoning_content"] != nil
+        }
+        return false
+    }
+
+    private func extractUsage(from json: [String: Any]) -> TokenUsage? {
+        guard let usage = json["usage"] as? [String: Any] else {
+            return nil
+        }
+        let prompt = (usage["prompt_tokens"] as? Int) ?? (usage["input_tokens"] as? Int)
+        let completion = (usage["completion_tokens"] as? Int) ?? (usage["output_tokens"] as? Int)
+        let total = usage["total_tokens"] as? Int
+        if prompt == nil && completion == nil {
+            return nil
+        }
+        return TokenUsage(
+            promptTokens: prompt ?? 0,
+            completionTokens: completion ?? 0,
+            totalTokens: total
+        )
+    }
+
+    private func elapsedMs(since start: DispatchTime) -> Double {
+        let nanos = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+        return Double(nanos) / 1_000_000.0
+    }
+
+    // MARK: - Responses API & Codex ChatGPT OAuth Upstream
+
+    private func buildResponsesRequest(
+        provider: ProviderConfig,
+        url: URL,
+        bodyData: Data,
+        apiKey: String?,
+        timeout: Double
+    ) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bodyData
+        request.timeoutInterval = max(2.0, timeout)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+        if provider.apiProtocol == .codexChatGPT {
+            if let acct = provider.accountID?.trimmingCharacters(in: .whitespacesAndNewlines), !acct.isEmpty {
+                request.setValue(acct, forHTTPHeaderField: "ChatGPT-Account-Id")
+            }
+            request.setValue("codex_cli_rs", forHTTPHeaderField: "originator")
+            request.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
+        }
+        return request
+    }
+
+    private func executeResponsesCompletion(
+        provider: ProviderConfig,
+        model: ModelConfig,
+        apiKey: String?,
+        originalPayload: [String: Any],
+        estimatedInputTokens: Int,
+        callerRequestedStream: Bool,
+        secretsToRedact: [String],
+        onStreamHeadersReady: (@Sendable () async throws -> Void)?,
+        onStreamChunk: (@Sendable (Data) async throws -> Void)?
+    ) async -> Result<UpstreamCompletionResult, UpstreamError> {
+        let path = (provider.apiProtocol == .codexChatGPT) ? "/responses" : "/v1/responses"
+        guard let url = provider.endpointURL(path: path) else {
+            return .failure(.invalidURL(provider.baseURL))
+        }
+
+        let isCodex = provider.apiProtocol == .codexChatGPT
+        let upstreamPayload = ProtocolAdapters.chatToResponsesRequest(
+            originalPayload,
+            modelID: model.modelID,
+            forceStream: isCodex || callerRequestedStream,
+            store: isCodex ? false : nil,
+            defaultInstructions: isCodex ? "You are a helpful assistant." : nil
+        )
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: upstreamPayload, options: []) else {
+            return .failure(.invalidResponse(message: "无法序列化 Responses 上游请求 JSON"))
+        }
+
+        let request = buildResponsesRequest(
+            provider: provider,
+            url: url,
+            bodyData: bodyData,
+            apiKey: apiKey,
+            timeout: provider.timeoutSeconds
+        )
+        let startTime = DispatchTime.now()
+
+        do {
+            let (asyncBytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
+            }
+            if !(200...299).contains(http.statusCode) {
+                var errorBytes = Data()
+                for try await byte in asyncBytes {
+                    errorBytes.append(byte)
+                    if errorBytes.count > 65_536 { break }
+                }
+                return .failure(classifyHTTPError(statusCode: http.statusCode, data: errorBytes, secrets: secretsToRedact))
+            }
+
+            // Non-streaming /v1/responses may return plain JSON instead of SSE
+            let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            if !isCodex && !callerRequestedStream && !contentType.contains("text/event-stream") {
+                var fullData = Data()
+                for try await byte in asyncBytes { fullData.append(byte) }
+                let totalMs = elapsedMs(since: startTime)
+                let respObj = (try? JSONSerialization.jsonObject(with: fullData) as? [String: Any]) ?? [:]
+                let chatObj = ProtocolAdapters.responsesJSONToChatCompletion(respObj, fallbackModel: model.modelID)
+                let (assistantText, reasoningText) = Self.extractAssistantAndReasoning(from: chatObj)
+                let reportedUsage = extractUsage(from: chatObj)
+                let finalUsage = reportedUsage ?? TokenUsage(
+                    promptTokens: estimatedInputTokens,
+                    completionTokens: RequestFeatureExtractor.estimateTokens(text: assistantText, messageCount: 0)
+                )
+                let outData = (try? JSONSerialization.data(withJSONObject: chatObj, options: [])) ?? fullData
+                return .success(UpstreamCompletionResult(
+                    statusCode: http.statusCode,
+                    responseBody: outData,
+                    assistantText: assistantText,
+                    reasoningText: reasoningText,
+                    usage: finalUsage,
+                    usageSource: reportedUsage != nil ? .upstreamReported : .estimatedWhenMissing,
+                    usageEstimationMethod: reportedUsage == nil ? "上游未返回 usage，按本地字符数估算" : nil,
+                    firstTokenMs: totalMs,
+                    totalLatencyMs: totalMs
+                ))
+            }
+
+            if callerRequestedStream, let onStreamHeadersReady {
+                try await onStreamHeadersReady()
+            }
+
+            let translator = ResponsesUpstreamStreamTranslator(modelName: model.modelID)
+            var firstTokenMs: Double?
+            var buffer = Data()
+
+            for try await byte in asyncBytes {
+                buffer.append(byte)
+                if byte == 0x0A {
+                    let chunks = translator.processSSEBytes(buffer)
+                    buffer.removeAll(keepingCapacity: true)
+                    if !chunks.isEmpty && firstTokenMs == nil {
+                        firstTokenMs = elapsedMs(since: startTime)
+                    }
+                    if callerRequestedStream, let onStreamChunk {
+                        for c in chunks { try await onStreamChunk(c) }
+                    }
+                }
+            }
+            if !buffer.isEmpty {
+                let chunks = translator.processSSEBytes(buffer)
+                if callerRequestedStream, let onStreamChunk {
+                    for c in chunks { try await onStreamChunk(c) }
+                }
+            }
+            if callerRequestedStream, let onStreamChunk {
+                for c in translator.finishChunks() { try await onStreamChunk(c) }
+            }
+
+            if let errMsg = translator.errorMessage, translator.fullText.isEmpty {
+                return .failure(.httpError(statusCode: 502, rawBody: Data(), message: SecretRedactor.redact(errMsg, secrets: secretsToRedact)))
+            }
+
+            let totalMs = elapsedMs(since: startTime)
+            let reportedUsage = translator.usage
+            let finalUsage = reportedUsage ?? TokenUsage(
+                promptTokens: estimatedInputTokens,
+                completionTokens: RequestFeatureExtractor.estimateTokens(text: translator.fullText, messageCount: 0)
+            )
+
+            var responseBody = Data()
+            if !callerRequestedStream {
+                let chatObj: [String: Any]
+                if let respObj = translator.completedResponseObject {
+                    chatObj = ProtocolAdapters.responsesJSONToChatCompletion(respObj, fallbackModel: model.modelID)
+                } else {
+                    var msg: [String: Any] = ["role": "assistant", "content": translator.fullText]
+                    if !translator.fullReasoning.isEmpty { msg["reasoning_content"] = translator.fullReasoning }
+                    chatObj = [
+                        "id": "chatcmpl-\(UUID().uuidString.prefix(12))",
+                        "object": "chat.completion",
+                        "created": Int(Date().timeIntervalSince1970),
+                        "model": model.modelID,
+                        "choices": [["index": 0, "message": msg, "finish_reason": "stop"]],
+                        "usage": [
+                            "prompt_tokens": finalUsage.promptTokens,
+                            "completion_tokens": finalUsage.completionTokens,
+                            "total_tokens": finalUsage.totalTokens
+                        ]
+                    ]
+                }
+                responseBody = (try? JSONSerialization.data(withJSONObject: chatObj, options: [])) ?? Data()
+            }
+
+            return .success(UpstreamCompletionResult(
+                statusCode: http.statusCode,
+                responseBody: responseBody,
+                assistantText: translator.fullText,
+                reasoningText: translator.fullReasoning.isEmpty ? nil : translator.fullReasoning,
+                usage: finalUsage,
+                usageSource: reportedUsage != nil ? .upstreamReported : .estimatedWhenMissing,
+                usageEstimationMethod: reportedUsage == nil ? "上游未返回 usage，按本地字符数估算" : nil,
+                firstTokenMs: firstTokenMs ?? totalMs,
+                totalLatencyMs: totalMs
+            ))
+        } catch {
+            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return .failure(.networkError(message: cleanMsg))
+        }
+    }
+
+    private func probeResponsesModel(
+        provider: ProviderConfig,
+        model: ModelConfig,
+        apiKey: String?,
+        timeoutSeconds: Double,
+        secretsToRedact: [String]
+    ) async -> ModelProbeResult {
+        let path = (provider.apiProtocol == .codexChatGPT) ? "/responses" : "/v1/responses"
+        guard let url = provider.endpointURL(path: path) else {
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: 0, note: "自动测活剔除：无效的供应商 URL")
+        }
+
+        let isCodex = provider.apiProtocol == .codexChatGPT
+        let probePayload: [String: Any] = [
+            "model": model.modelID,
+            "instructions": "You are a helpful assistant.",
+            "input": [[
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_text", "text": "hi"]]
+            ]],
+            "store": false,
+            "stream": true
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: probePayload, options: []) else {
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: 0, note: "自动测活剔除：无法构造探测请求")
+        }
+
+        let request = buildResponsesRequest(
+            provider: provider,
+            url: url,
+            bodyData: bodyData,
+            apiKey: apiKey,
+            timeout: max(4.0, timeoutSeconds)
+        )
+        let start = DispatchTime.now()
+        do {
+            let (asyncBytes, response) = try await session.bytes(for: request)
+            let latencyMs = elapsedMs(since: start)
+            guard let http = response as? HTTPURLResponse else {
+                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：上游未返回有效 HTTP 响应")
+            }
+
+            if (200...299).contains(http.statusCode) {
+                var sample = Data()
+                for try await byte in asyncBytes {
+                    sample.append(byte)
+                    if sample.count >= 512 { break }
+                }
+                let text = String(data: sample, encoding: .utf8) ?? ""
+                if text.contains("response.failed") || text.contains("\"error\"") {
+                    let msg = extractErrorMessage(from: sample, secrets: secretsToRedact) ?? "model probe failed"
+                    return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(msg)")
+                }
+                return ModelProbeResult(
+                    isAvailable: true,
+                    availability: .available,
+                    latencyMs: latencyMs,
+                    note: isCodex ? "Codex 订阅实测可用 (\(Int(latencyMs)) ms)" : "实测可用 (\(Int(latencyMs)) ms)"
+                )
+            }
+
+            var errData = Data()
+            for try await byte in asyncBytes {
+                errData.append(byte)
+                if errData.count > 16_384 { break }
+            }
+            let err = classifyHTTPError(statusCode: http.statusCode, data: errData, secrets: secretsToRedact)
+            switch err {
+            case .modelUnavailable(_, let msg, let avail):
+                return ModelProbeResult(isAvailable: false, availability: avail, latencyMs: latencyMs, note: "自动测活剔除 (\(avail.displayName)): \(msg)")
+            case .authError(let code, let msg):
+                let hint = isCodex ? "Codex 登录态失效或已过期 (\(code)): \(msg)" : "自动测活剔除 (鉴权失败 HTTP \(code)): \(msg)"
+                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: hint)
+            case .httpError(let code, _, let msg):
+                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除 (HTTP \(code)): \(msg)")
+            default:
+                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(err.localizedDescription)")
+            }
+        } catch {
+            let latencyMs = elapsedMs(since: start)
+            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(cleanMsg)")
+        }
+    }
+
+    // MARK: - Anthropic Messages Upstream
+
+    private func executeAnthropicCompletion(
+        provider: ProviderConfig,
+        model: ModelConfig,
+        apiKey: String?,
+        originalPayload: [String: Any],
+        estimatedInputTokens: Int,
+        stream: Bool,
+        secretsToRedact: [String],
+        onStreamHeadersReady: (@Sendable () async throws -> Void)?,
+        onStreamChunk: (@Sendable (Data) async throws -> Void)?
+    ) async -> Result<UpstreamCompletionResult, UpstreamError> {
+        guard let url = provider.endpointURL(path: "/v1/messages") else {
+            return .failure(.invalidURL(provider.baseURL))
+        }
+        let upstreamPayload = ProtocolAdapters.chatToAnthropicRequest(originalPayload, modelID: model.modelID, stream: false)
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: upstreamPayload, options: []) else {
+            return .failure(.invalidResponse(message: "无法序列化 Anthropic 上游请求"))
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bodyData
+        request.timeoutInterval = max(5.0, provider.timeoutSeconds)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            request.setValue(key, forHTTPHeaderField: "x-api-key")
+        }
+
+        let startTime = DispatchTime.now()
+        do {
+            let (data, response) = try await session.data(for: request)
+            let totalMs = elapsedMs(since: startTime)
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
+            }
+            if !(200...299).contains(http.statusCode) {
+                return .failure(classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact))
+            }
+
+            let rawObj = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            let chatObj = ProtocolAdapters.anthropicJSONToChatCompletion(rawObj, fallbackModel: model.modelID)
+            let (assistantText, reasoningText) = Self.extractAssistantAndReasoning(from: chatObj)
+            let reportedUsage = extractUsage(from: chatObj)
+            let finalUsage = reportedUsage ?? TokenUsage(
+                promptTokens: estimatedInputTokens,
+                completionTokens: RequestFeatureExtractor.estimateTokens(text: assistantText, messageCount: 0)
+            )
+            let outData = (try? JSONSerialization.data(withJSONObject: chatObj, options: [])) ?? data
+
+            if stream, let onStreamHeadersReady, let onStreamChunk {
+                try await onStreamHeadersReady()
+                let chunkObj: [String: Any] = [
+                    "id": chatObj["id"] ?? "chatcmpl-\(UUID().uuidString.prefix(8))",
+                    "object": "chat.completion.chunk",
+                    "created": Int(Date().timeIntervalSince1970),
+                    "model": model.modelID,
+                    "choices": [[
+                        "index": 0,
+                        "delta": ["role": "assistant", "content": assistantText],
+                        "finish_reason": "stop"
+                    ]],
+                    "usage": [
+                        "prompt_tokens": finalUsage.promptTokens,
+                        "completion_tokens": finalUsage.completionTokens,
+                        "total_tokens": finalUsage.totalTokens
+                    ]
+                ]
+                if let cData = try? JSONSerialization.data(withJSONObject: chunkObj, options: []),
+                   let cStr = String(data: cData, encoding: .utf8) {
+                    try await onStreamChunk(Data("data: \(cStr)\n\n".utf8))
+                }
+                try await onStreamChunk(Data("data: [DONE]\n\n".utf8))
+            }
+
+            return .success(UpstreamCompletionResult(
+                statusCode: http.statusCode,
+                responseBody: outData,
+                assistantText: assistantText,
+                reasoningText: reasoningText,
+                usage: finalUsage,
+                usageSource: reportedUsage != nil ? .upstreamReported : .estimatedWhenMissing,
+                usageEstimationMethod: reportedUsage == nil ? "上游未返回 usage，按本地字符数估算" : nil,
+                firstTokenMs: totalMs,
+                totalLatencyMs: totalMs
+            ))
+        } catch {
+            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return .failure(.networkError(message: cleanMsg))
+        }
+    }
+
+    private func probeAnthropicModel(
+        provider: ProviderConfig,
+        model: ModelConfig,
+        apiKey: String?,
+        timeoutSeconds: Double,
+        secretsToRedact: [String]
+    ) async -> ModelProbeResult {
+        guard let url = provider.endpointURL(path: "/v1/messages") else {
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: 0, note: "自动测活剔除：无效的供应商 URL")
+        }
+        let payload: [String: Any] = [
+            "model": model.modelID,
+            "max_tokens": 2,
+            "messages": [["role": "user", "content": "hi"]]
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: 0, note: "自动测活剔除：无法构造探测请求")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bodyData
+        request.timeoutInterval = max(2.0, timeoutSeconds)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        if let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            request.setValue(key, forHTTPHeaderField: "x-api-key")
+        }
+        let start = DispatchTime.now()
+        do {
+            let (data, response) = try await session.data(for: request)
+            let latencyMs = elapsedMs(since: start)
+            guard let http = response as? HTTPURLResponse else {
+                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：上游未返回有效 HTTP 响应")
+            }
+            if (200...299).contains(http.statusCode) {
+                return ModelProbeResult(isAvailable: true, availability: .available, latencyMs: latencyMs, note: "实测可用 (\(Int(latencyMs)) ms)")
+            }
+            let err = classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact)
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(err.localizedDescription)")
+        } catch {
+            let latencyMs = elapsedMs(since: start)
+            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(cleanMsg)")
+        }
+    }
+}
