@@ -442,12 +442,17 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
     public var enableRetryOnUpstreamFailure: Bool
     public var activeDeciderPluginID: String
 
-    // Three-tier (Low / Medium / High) model configuration
+    // Three-tier (Low / Medium / High) model configuration (primary + ordered failover backups)
     public var lowTierModelID: UUID?
     public var mediumTierModelID: UUID?
     public var highTierModelID: UUID?
+    public var lowTierBackupModelIDs: [UUID]
+    public var mediumTierBackupModelIDs: [UUID]
+    public var highTierBackupModelIDs: [UUID]
     public var autoConfigureTiers: Bool
     public var preferTierMappingInAuto: Bool
+    public var enablePhaseDowngradeHysteresis: Bool
+    public var strictThreeTierPoolOnly: Bool
     public var lowTierIsManual: Bool
     public var mediumTierIsManual: Bool
     public var highTierIsManual: Bool
@@ -465,8 +470,13 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         lowTierModelID: UUID? = nil,
         mediumTierModelID: UUID? = nil,
         highTierModelID: UUID? = nil,
+        lowTierBackupModelIDs: [UUID] = [],
+        mediumTierBackupModelIDs: [UUID] = [],
+        highTierBackupModelIDs: [UUID] = [],
         autoConfigureTiers: Bool = true,
         preferTierMappingInAuto: Bool = true,
+        enablePhaseDowngradeHysteresis: Bool = false,
+        strictThreeTierPoolOnly: Bool = true,
         lowTierIsManual: Bool = false,
         mediumTierIsManual: Bool = false,
         highTierIsManual: Bool = false
@@ -483,8 +493,13 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         self.lowTierModelID = lowTierModelID
         self.mediumTierModelID = mediumTierModelID
         self.highTierModelID = highTierModelID
+        self.lowTierBackupModelIDs = lowTierBackupModelIDs
+        self.mediumTierBackupModelIDs = mediumTierBackupModelIDs
+        self.highTierBackupModelIDs = highTierBackupModelIDs
         self.autoConfigureTiers = autoConfigureTiers
         self.preferTierMappingInAuto = preferTierMappingInAuto
+        self.enablePhaseDowngradeHysteresis = enablePhaseDowngradeHysteresis
+        self.strictThreeTierPoolOnly = strictThreeTierPoolOnly
         self.lowTierIsManual = lowTierIsManual
         self.mediumTierIsManual = mediumTierIsManual
         self.highTierIsManual = highTierIsManual
@@ -495,7 +510,9 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         case maxInputPricePerMillion, maxOutputPricePerMillion
         case enableSessionStickiness, enableRetryOnUpstreamFailure, activeDeciderPluginID
         case lowTierModelID, mediumTierModelID, highTierModelID
+        case lowTierBackupModelIDs, mediumTierBackupModelIDs, highTierBackupModelIDs
         case autoConfigureTiers, preferTierMappingInAuto
+        case enablePhaseDowngradeHysteresis, strictThreeTierPoolOnly
         case lowTierIsManual, mediumTierIsManual, highTierIsManual
     }
 
@@ -513,8 +530,13 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         lowTierModelID = try c.decodeIfPresent(UUID.self, forKey: .lowTierModelID)
         mediumTierModelID = try c.decodeIfPresent(UUID.self, forKey: .mediumTierModelID)
         highTierModelID = try c.decodeIfPresent(UUID.self, forKey: .highTierModelID)
+        lowTierBackupModelIDs = try c.decodeIfPresent([UUID].self, forKey: .lowTierBackupModelIDs) ?? []
+        mediumTierBackupModelIDs = try c.decodeIfPresent([UUID].self, forKey: .mediumTierBackupModelIDs) ?? []
+        highTierBackupModelIDs = try c.decodeIfPresent([UUID].self, forKey: .highTierBackupModelIDs) ?? []
         autoConfigureTiers = try c.decodeIfPresent(Bool.self, forKey: .autoConfigureTiers) ?? true
         preferTierMappingInAuto = try c.decodeIfPresent(Bool.self, forKey: .preferTierMappingInAuto) ?? true
+        enablePhaseDowngradeHysteresis = try c.decodeIfPresent(Bool.self, forKey: .enablePhaseDowngradeHysteresis) ?? false
+        strictThreeTierPoolOnly = try c.decodeIfPresent(Bool.self, forKey: .strictThreeTierPoolOnly) ?? true
         lowTierIsManual = try c.decodeIfPresent(Bool.self, forKey: .lowTierIsManual) ?? false
         mediumTierIsManual = try c.decodeIfPresent(Bool.self, forKey: .mediumTierIsManual) ?? false
         highTierIsManual = try c.decodeIfPresent(Bool.self, forKey: .highTierIsManual) ?? false
@@ -528,6 +550,26 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         }
     }
 
+    public func backupModelIDs(for tier: ModelTier) -> [UUID] {
+        switch tier {
+        case .low: return lowTierBackupModelIDs
+        case .medium: return mediumTierBackupModelIDs
+        case .high: return highTierBackupModelIDs
+        }
+    }
+
+    /// Ordered pool of primary + backup model IDs for a tier (deduplicated).
+    public func modelIDs(for tier: ModelTier) -> [UUID] {
+        var result: [UUID] = []
+        if let primary = modelID(for: tier) {
+            result.append(primary)
+        }
+        for bid in backupModelIDs(for: tier) where !result.contains(bid) {
+            result.append(bid)
+        }
+        return result
+    }
+
     public func isManual(for tier: ModelTier) -> Bool {
         switch tier {
         case .low: return lowTierIsManual
@@ -536,17 +578,51 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         }
     }
 
+    public mutating func setBackupModelIDs(_ ids: [UUID], for tier: ModelTier) {
+        let primary = modelID(for: tier)
+        var deduped: [UUID] = []
+        for id in ids where id != primary && !deduped.contains(id) {
+            deduped.append(id)
+        }
+        switch tier {
+        case .low: lowTierBackupModelIDs = deduped
+        case .medium: mediumTierBackupModelIDs = deduped
+        case .high: highTierBackupModelIDs = deduped
+        }
+    }
+
+    public mutating func addBackupModel(_ modelID: UUID, to tier: ModelTier, isManual: Bool = true) {
+        if self.modelID(for: tier) == nil {
+            setTier(tier, modelID: modelID, isManual: isManual)
+            return
+        }
+        guard self.modelID(for: tier) != modelID else { return }
+        var backups = backupModelIDs(for: tier)
+        if !backups.contains(modelID) {
+            backups.append(modelID)
+            setBackupModelIDs(backups, for: tier)
+        }
+    }
+
+    public mutating func removeBackupModel(_ modelID: UUID, from tier: ModelTier) {
+        let filtered = backupModelIDs(for: tier).filter { $0 != modelID }
+        setBackupModelIDs(filtered, for: tier)
+    }
+
     public mutating func setTier(_ tier: ModelTier, modelID: UUID?, isManual: Bool) {
         switch tier {
         case .low:
             lowTierModelID = modelID
             lowTierIsManual = isManual
+            if let modelID { lowTierBackupModelIDs.removeAll { $0 == modelID } }
         case .medium:
             mediumTierModelID = modelID
             mediumTierIsManual = isManual
+            if let modelID { mediumTierBackupModelIDs.removeAll { $0 == modelID } }
         case .high:
             highTierModelID = modelID
             highTierIsManual = isManual
+            if let modelID { highTierBackupModelIDs.removeAll { $0 == modelID } }
         }
     }
 }
@@ -622,9 +698,19 @@ public struct PrivacySettings: Codable, Equatable, Sendable {
     public var recordRequestBody: Bool
     public var hasCompletedOnboarding: Bool
 
-    public init(recordRequestBody: Bool = true, hasCompletedOnboarding: Bool = false) {
+    public init(recordRequestBody: Bool = false, hasCompletedOnboarding: Bool = false) {
         self.recordRequestBody = recordRequestBody
         self.hasCompletedOnboarding = hasCompletedOnboarding
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recordRequestBody, hasCompletedOnboarding
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        recordRequestBody = try container.decodeIfPresent(Bool.self, forKey: .recordRequestBody) ?? false
+        hasCompletedOnboarding = try container.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? false
     }
 }
 
@@ -636,6 +722,8 @@ public struct AppConfigBundle: Codable, Equatable, Sendable {
     public var proxySettings: ProxySettings
     public var privacySettings: PrivacySettings
     public var agentBindings: [String: AgentModelBinding]
+    public var agentPolicyProfiles: [String: AgentPolicyProfile]
+    public var budgetSettings: MonthlyBudgetSettings
 
     public init(
         schemaVersion: Int = 1,
@@ -644,7 +732,9 @@ public struct AppConfigBundle: Codable, Equatable, Sendable {
         policy: RoutingPolicyConfig = RoutingPolicyConfig(),
         proxySettings: ProxySettings = ProxySettings(),
         privacySettings: PrivacySettings = PrivacySettings(),
-        agentBindings: [String: AgentModelBinding] = [:]
+        agentBindings: [String: AgentModelBinding] = [:],
+        agentPolicyProfiles: [String: AgentPolicyProfile] = [:],
+        budgetSettings: MonthlyBudgetSettings = MonthlyBudgetSettings()
     ) {
         self.schemaVersion = schemaVersion
         self.providers = providers
@@ -653,10 +743,12 @@ public struct AppConfigBundle: Codable, Equatable, Sendable {
         self.proxySettings = proxySettings
         self.privacySettings = privacySettings
         self.agentBindings = agentBindings
+        self.agentPolicyProfiles = agentPolicyProfiles
+        self.budgetSettings = budgetSettings
     }
 
     enum CodingKeys: String, CodingKey {
-        case schemaVersion, providers, models, policy, proxySettings, privacySettings, agentBindings
+        case schemaVersion, providers, models, policy, proxySettings, privacySettings, agentBindings, agentPolicyProfiles, budgetSettings
     }
 
     public init(from decoder: Decoder) throws {
@@ -668,10 +760,12 @@ public struct AppConfigBundle: Codable, Equatable, Sendable {
         proxySettings = try c.decodeIfPresent(ProxySettings.self, forKey: .proxySettings) ?? ProxySettings()
         privacySettings = try c.decodeIfPresent(PrivacySettings.self, forKey: .privacySettings) ?? PrivacySettings()
         agentBindings = try c.decodeIfPresent([String: AgentModelBinding].self, forKey: .agentBindings) ?? [:]
+        agentPolicyProfiles = try c.decodeIfPresent([String: AgentPolicyProfile].self, forKey: .agentPolicyProfiles) ?? [:]
+        budgetSettings = try c.decodeIfPresent(MonthlyBudgetSettings.self, forKey: .budgetSettings) ?? MonthlyBudgetSettings()
     }
 
     public func binding(for kind: AgentKind) -> AgentModelBinding {
-        agentBindings[kind.rawValue] ?? AgentModelBinding()
+        agentBindings[kind.rawValue] ?? .stableIdentity(for: kind)
     }
 }
 
@@ -731,6 +825,15 @@ public enum ReasoningEffort: String, Codable, CaseIterable, Sendable {
 
     public var requiresDeepReasoning: Bool {
         self == .high || self == .max
+    }
+
+    /// Standard OpenAI / Responses reasoning effort string ("low", "medium", "high").
+    public var upstreamEffortValue: String {
+        switch self {
+        case .low: return "low"
+        case .medium: return "medium"
+        case .high, .max: return "high"
+        }
     }
 }
 
@@ -801,11 +904,12 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
     public var subtaskCategory: AgentSubtaskCategory
     public var recommendedEffort: ReasoningEffort
     public var subtaskSummary: String?
+    public var clientProvidedEffort: ReasoningEffort?
 
     enum CodingKeys: String, CodingKey {
         case messageCount, estimatedInputTokens, requiresTools, requiresVision, requiresJSONMode
         case isStreaming, detectedTaskType, conversationFingerprint, isMultiTurn
-        case subtaskCategory, recommendedEffort, subtaskSummary
+        case subtaskCategory, recommendedEffort, subtaskSummary, clientProvidedEffort
     }
 
     public init(
@@ -820,7 +924,8 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         isMultiTurn: Bool,
         subtaskCategory: AgentSubtaskCategory? = nil,
         recommendedEffort: ReasoningEffort? = nil,
-        subtaskSummary: String? = nil
+        subtaskSummary: String? = nil,
+        clientProvidedEffort: ReasoningEffort? = nil
     ) {
         let resolvedSubtask = subtaskCategory ?? detectedTaskType.defaultSubtaskCategory
         self.messageCount = messageCount
@@ -835,6 +940,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         self.subtaskCategory = resolvedSubtask
         self.recommendedEffort = recommendedEffort ?? resolvedSubtask.recommendedEffort
         self.subtaskSummary = subtaskSummary
+        self.clientProvidedEffort = clientProvidedEffort
     }
 
     public init(from decoder: Decoder) throws {
@@ -853,6 +959,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         subtaskCategory = decodedSubtask
         recommendedEffort = try c.decodeIfPresent(ReasoningEffort.self, forKey: .recommendedEffort) ?? decodedSubtask.recommendedEffort
         subtaskSummary = try c.decodeIfPresent(String.self, forKey: .subtaskSummary)
+        clientProvidedEffort = try c.decodeIfPresent(ReasoningEffort.self, forKey: .clientProvidedEffort)
     }
 }
 
@@ -910,12 +1017,16 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
     public var selectedEffort: ReasoningEffort
     public var subtaskCategory: AgentSubtaskCategory?
     public var routingReasonNote: String?
+    public var agentID: String?
+    public var agentIdentitySource: AgentIdentitySource?
+    public var agentPolicyOverrideReason: String?
 
     enum CodingKeys: String, CodingKey {
         case requestedModel, isAutoRouted, selectedModelUUID, selectedModelID, selectedDisplayName
         case selectedProviderID, selectedProviderName, orderedFallbackCandidateIDs, candidateEvaluations
         case matchedRules, strategyName, policyVersion, deciderPluginID, decisionDurationMs, errorSummary
         case selectedEffort, subtaskCategory, routingReasonNote
+        case agentID, agentIdentitySource, agentPolicyOverrideReason
     }
 
     public init(
@@ -936,7 +1047,10 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
         errorSummary: String? = nil,
         selectedEffort: ReasoningEffort = .medium,
         subtaskCategory: AgentSubtaskCategory? = nil,
-        routingReasonNote: String? = nil
+        routingReasonNote: String? = nil,
+        agentID: String? = nil,
+        agentIdentitySource: AgentIdentitySource? = nil,
+        agentPolicyOverrideReason: String? = nil
     ) {
         self.requestedModel = requestedModel
         self.isAutoRouted = isAutoRouted
@@ -956,6 +1070,9 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
         self.selectedEffort = selectedEffort
         self.subtaskCategory = subtaskCategory
         self.routingReasonNote = routingReasonNote
+        self.agentID = agentID
+        self.agentIdentitySource = agentIdentitySource
+        self.agentPolicyOverrideReason = agentPolicyOverrideReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -978,6 +1095,9 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
         selectedEffort = try c.decodeIfPresent(ReasoningEffort.self, forKey: .selectedEffort) ?? .medium
         subtaskCategory = try c.decodeIfPresent(AgentSubtaskCategory.self, forKey: .subtaskCategory)
         routingReasonNote = try c.decodeIfPresent(String.self, forKey: .routingReasonNote)
+        agentID = try c.decodeIfPresent(String.self, forKey: .agentID)
+        agentIdentitySource = try c.decodeIfPresent(AgentIdentitySource.self, forKey: .agentIdentitySource)
+        agentPolicyOverrideReason = try c.decodeIfPresent(String.self, forKey: .agentPolicyOverrideReason)
     }
 }
 
@@ -1100,6 +1220,8 @@ public struct ComparisonAnalysis: Codable, Equatable, Sendable {
     public var latencyDifferenceMs: Double?
     public var sampleCount: Int
     public var note: String
+    /// True only when both A/B sides produced upstream-reported measured costs without estimated retries.
+    public var isMeasuredPair: Bool?
 
     public init(
         basis: ComparisonBasis,
@@ -1109,7 +1231,8 @@ public struct ComparisonAnalysis: Codable, Equatable, Sendable {
         costSavingsPercent: Double?,
         latencyDifferenceMs: Double?,
         sampleCount: Int,
-        note: String
+        note: String,
+        isMeasuredPair: Bool? = nil
     ) {
         self.basis = basis
         self.baselineModelID = baselineModelID
@@ -1119,6 +1242,7 @@ public struct ComparisonAnalysis: Codable, Equatable, Sendable {
         self.latencyDifferenceMs = latencyDifferenceMs
         self.sampleCount = sampleCount
         self.note = note
+        self.isMeasuredPair = isMeasuredPair
     }
 }
 
@@ -1188,6 +1312,11 @@ public enum CallStatus: String, Codable, Sendable {
     }
 }
 
+public enum CallExecutionOrigin: String, Codable, Sendable {
+    case real
+    case demo
+}
+
 public enum CallSource: String, Codable, Sendable {
     case testBench = "test_bench"
     case externalProxy = "external_proxy"
@@ -1230,6 +1359,8 @@ public struct CallRecord: Identifiable, Codable, Equatable, Sendable {
     public var errorMessage: String?
     public var clientName: String?
     public var endpointPath: String?
+    /// Nil means a legacy receipt whose real/demo provenance cannot be established safely.
+    public var executionOrigin: CallExecutionOrigin?
 
     public init(
         id: UUID = UUID(),
@@ -1260,7 +1391,8 @@ public struct CallRecord: Identifiable, Codable, Equatable, Sendable {
         reasoningPreview: String? = nil,
         errorMessage: String? = nil,
         clientName: String? = nil,
-        endpointPath: String? = nil
+        endpointPath: String? = nil,
+        executionOrigin: CallExecutionOrigin? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -1291,6 +1423,7 @@ public struct CallRecord: Identifiable, Codable, Equatable, Sendable {
         self.errorMessage = errorMessage
         self.clientName = clientName
         self.endpointPath = endpointPath
+        self.executionOrigin = executionOrigin
     }
 }
 

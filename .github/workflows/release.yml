@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  signed-notarized-release:
+    runs-on: macos-14
+    env:
+      AUTOROUTE_REQUIRE_DEVELOPER_ID: "1"
+      NOTARYTOOL_KEYCHAIN_PROFILE: autoroute-notary
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify tag matches version.env
+        run: |
+          source macos/version.env
+          expected_tag="v${AUTOROUTE_VERSION}"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Release refused: tag $GITHUB_REF_NAME does not match macos/version.env AUTOROUTE_VERSION=$AUTOROUTE_VERSION (expected $expected_tag)."
+            exit 1
+          fi
+
+      - name: Prepare temporary Developer ID keychain and notarytool profile
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          NOTARYTOOL_APPLE_ID: ${{ secrets.NOTARYTOOL_APPLE_ID }}
+          NOTARYTOOL_APPLE_PASSWORD: ${{ secrets.NOTARYTOOL_APPLE_PASSWORD }}
+          NOTARYTOOL_TEAM_ID: ${{ secrets.NOTARYTOOL_TEAM_ID }}
+        run: bash macos/prepare_release_signing.sh
+
+      - name: Run all Swift tests
+        run: swift test
+
+      - name: Build with Developer ID and hardened runtime
+        run: bash macos/build_app.sh
+
+      - name: Package signed app for notarization
+        run: bash macos/package_app.sh
+
+      - name: Notarize, staple, and repackage
+        run: bash macos/notarize_app.sh
+
+      - name: Verify final archive checksum
+        run: |
+          source macos/version.env
+          cd dist
+          shasum -a 256 -c "AutoRoute-${AUTOROUTE_VERSION}.zip.sha256"
+
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source macos/version.env
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/AutoRoute-${AUTOROUTE_VERSION}.zip" \
+            "dist/AutoRoute-${AUTOROUTE_VERSION}.zip.sha256" \
+            --title "AutoRoute ${AUTOROUTE_VERSION}" \
+            --generate-notes
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        run: bash macos/cleanup_release_signing.sh

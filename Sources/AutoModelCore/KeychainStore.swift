@@ -6,9 +6,14 @@ public protocol KeychainServiceProtocol: Sendable {
     func getAPIKey(for providerID: UUID) throws -> String?
     func deleteAPIKey(for providerID: UUID) throws
     func hasAPIKey(for providerID: UUID) -> Bool
+    func setLocalAPIToken(_ token: String) throws
+    func getLocalAPIToken() throws -> String?
     func allKnownSecretValues() -> [String]
     func clearAll() throws
 }
+
+/// Reserved account identifier; it cannot collide with normal random provider UUIDs in practice.
+private let localAPITokenAccountUUID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
 public enum KeychainError: LocalizedError, Sendable {
     case encodingFailed
@@ -69,7 +74,7 @@ public final class MacOSKeychainService: KeychainServiceProtocol, @unchecked Sen
         } else if existingStatus == errSecItemNotFound {
             var newItem = baseQuery
             newItem[kSecValueData as String] = data
-            newItem[kSecAttrLabel as String] = "Auto Model Provider API Key"
+            newItem[kSecAttrLabel as String] = "AutoRoute Provider API Key"
             newItem[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
             let addStatus = SecItemAdd(newItem as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
@@ -136,6 +141,14 @@ public final class MacOSKeychainService: KeychainServiceProtocol, @unchecked Sen
         (try? getAPIKey(for: providerID))?.isEmpty == false
     }
 
+    public func setLocalAPIToken(_ token: String) throws {
+        try setAPIKey(token, for: localAPITokenAccountUUID)
+    }
+
+    public func getLocalAPIToken() throws -> String? {
+        try getAPIKey(for: localAPITokenAccountUUID)
+    }
+
     public func allKnownSecretValues() -> [String] {
         lock.lock()
         defer { lock.unlock() }
@@ -194,6 +207,14 @@ public final class InMemoryKeychainService: KeychainServiceProtocol, @unchecked 
         lock.lock()
         defer { lock.unlock() }
         return storage[providerID]?.isEmpty == false
+    }
+
+    public func setLocalAPIToken(_ token: String) throws {
+        try setAPIKey(token, for: localAPITokenAccountUUID)
+    }
+
+    public func getLocalAPIToken() throws -> String? {
+        try getAPIKey(for: localAPITokenAccountUUID)
     }
 
     public func allKnownSecretValues() -> [String] {

@@ -1,5 +1,26 @@
 import Foundation
 
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    func markTrue() {
+        lock.withLock { flag = true }
+    }
+
+    var value: Bool {
+        lock.withLock { flag }
+    }
+}
+
+public enum LocalTokenPersistenceError: Error, LocalizedError, Sendable {
+    case verificationFailed
+
+    public var errorDescription: String? {
+        "Keychain 未返回刚写入的本地 API token；无法确认凭据已持久化。"
+    }
+}
+
 @MainActor
 public final class AutoModelEngine: ObservableObject {
     public enum ProxyRuntimeState: Equatable, Sendable {
@@ -29,6 +50,7 @@ public final class AutoModelEngine: ObservableObject {
 
     @Published public private(set) var config: AppConfigBundle
     @Published public private(set) var callHistory: [CallRecord]
+    @Published public private(set) var onboardingFunnel: LocalOnboardingFunnelState
     @Published public private(set) var proxyState: ProxyRuntimeState = .stopped
     @Published public private(set) var isLocalTestUpstreamRunning: Bool = false
     @Published public private(set) var localTestUpstreamPort: Int?
@@ -39,6 +61,11 @@ public final class AutoModelEngine: ObservableObject {
     @Published public private(set) var agentStatuses: [AgentIntegrationStatus] = []
     @Published public private(set) var probeAuditLogs: [String] = []
     @Published public private(set) var portSyncNeededForConnectedAgents: Bool = false
+    @Published public private(set) var cooldownUntilByModelID: [UUID: Date] = [:]
+    @Published public private(set) var localAPITokenPersistenceError: String?
+    private var transientFailureCountByModelID: [UUID: Int] = [:]
+
+    public var isLocalAPITokenPersistent: Bool { localAPITokenPersistenceError == nil }
 
     public let persistence: LocalPersistenceStore
     public let keychain: any KeychainServiceProtocol
@@ -47,8 +74,10 @@ public final class AutoModelEngine: ObservableObject {
     public let discoveryService: LocalModelDiscoveryService
     public let agentConfigService: AgentConfigService
     public let localTestUpstream: LocalTestUpstreamServer
+    public private(set) var localAPIToken: String
     private var proxyServer: ProxyServer?
     private var backgroundMaintenanceTask: Task<Void, Never>?
+    private var budgetLedger: BudgetLedger
 
     public init(
         persistence: LocalPersistenceStore = LocalPersistenceStore(),
@@ -68,9 +97,27 @@ public final class AutoModelEngine: ObservableObject {
             backupDirectory: persistence.baseDirectoryURL.appendingPathComponent("agent_backups", isDirectory: true)
         )
         self.localTestUpstream = LocalTestUpstreamServer()
+        do {
+            self.localAPIToken = try LocalAPITokenManager.loadOrCreate(keychain: keychain)
+            self.localAPITokenPersistenceError = nil
+        } catch {
+            // Keep a random per-process credential only to avoid an insecure shared placeholder,
+            // but block proxy startup and Agent writes until it is durably stored.
+            self.localAPIToken = (try? LocalAPITokenManager.generate()) ?? UUID().uuidString + UUID().uuidString
+            self.localAPITokenPersistenceError = "本地 API token 未能持久化到 Keychain：\(error.localizedDescription)。重启后 token 会变化，已接入的 Agent 将失效；在修复前不会自动启动代理或写入 Agent 配置。"
+        }
 
         self.config = persistence.loadConfig()
-        self.callHistory = persistence.loadHistory()
+        let loadedHistory = persistence.loadHistory()
+        self.callHistory = loadedHistory
+        if let storedLedger = persistence.loadBudgetLedger() {
+            self.budgetLedger = storedLedger
+        } else {
+            let backfilled = BudgetLedger(records: loadedHistory)
+            self.budgetLedger = backfilled
+            try? persistence.saveBudgetLedger(backfilled)
+        }
+        self.onboardingFunnel = persistence.loadOnboardingFunnel()
         self.autoConfigureModelTiers(forceResetManual: false)
         self.refreshAgentStatuses()
 
@@ -85,6 +132,10 @@ public final class AutoModelEngine: ObservableObject {
     // MARK: - Proxy Lifecycle
 
     public func startProxy() {
+        guard isLocalAPITokenPersistent else {
+            proxyState = .error("本地 API token 未持久化到 Keychain；拒绝启动代理，避免 Agent 使用重启后失效的临时凭据。")
+            return
+        }
         let port = config.proxySettings.port
         if proxyServer == nil {
             proxyServer = ProxyServer(engine: self)
@@ -102,6 +153,20 @@ public final class AutoModelEngine: ObservableObject {
             }
         } catch {
             proxyState = .error(error.localizedDescription)
+        }
+    }
+
+    public func retryPersistingLocalAPIToken() throws {
+        do {
+            try keychain.setLocalAPIToken(localAPIToken)
+            guard let persisted = try keychain.getLocalAPIToken(),
+                  LocalAPITokenManager.constantTimeEquals(persisted, localAPIToken) else {
+                throw LocalTokenPersistenceError.verificationFailed
+            }
+            localAPITokenPersistenceError = nil
+        } catch {
+            localAPITokenPersistenceError = "本地 API token 仍未持久化：\(error.localizedDescription)。请检查 macOS Keychain 访问权限后重试；代理启动和 Agent 写入保持禁用。"
+            throw error
         }
     }
 
@@ -236,7 +301,6 @@ public final class AutoModelEngine: ObservableObject {
             config.models.append(preset)
         }
 
-        config.privacySettings.hasCompletedOnboarding = true
         saveConfig()
         autoConfigureModelTiers(forceResetManual: false)
     }
@@ -321,7 +385,8 @@ public final class AutoModelEngine: ObservableObject {
             case .httpError, .modelUnavailable, .invalidResponse:
                 status = .serverError
             }
-            updateProviderHealth(providerID: providerID, status: status, error: err.localizedDescription)
+            let persistedError = persistedUpstreamErrorSummary(for: err, detailedMessage: err.localizedDescription)
+            updateProviderHealth(providerID: providerID, status: status, error: persistedError)
             return .failure(err)
         }
     }
@@ -370,8 +435,26 @@ public final class AutoModelEngine: ObservableObject {
         autoConfigureModelTiers(forceResetManual: false)
     }
 
+    /// Applies exponential cooldown for transient upstream errors (429 / 5xx / timeout)
+    /// without permanently evicting the model or overwriting its tier assignment.
+    private func recordTransientCooldown(for modelID: UUID, reason: String) {
+        let count = (transientFailureCountByModelID[modelID] ?? 0) + 1
+        transientFailureCountByModelID[modelID] = count
+        let schedule: [TimeInterval] = [15, 45, 120, 300]
+        let cooldownSec = schedule[min(count - 1, schedule.count - 1)]
+        cooldownUntilByModelID[modelID] = Date().addingTimeInterval(cooldownSec)
+        updateModelAvailability(
+            modelID: modelID,
+            status: .available,
+            note: "限流/抖动冷却 \(Int(cooldownSec))s（第 \(count) 次，到期自动恢复）：\(reason)",
+            autoEvicted: false
+        )
+    }
+
     public func restoreEvictedModel(id: UUID) {
         guard let idx = config.models.firstIndex(where: { $0.id == id }) else { return }
+        transientFailureCountByModelID[id] = 0
+        cooldownUntilByModelID.removeValue(forKey: id)
         config.models[idx].isAutoEvicted = false
         config.models[idx].availabilityStatus = .available
         config.models[idx].lastAvailabilityNote = "用户手动恢复（等待下次测活或请求验证）"
@@ -560,17 +643,22 @@ public final class AutoModelEngine: ObservableObject {
         probeProgressText = nil
 
         if result.isAvailable {
+            transientFailureCountByModelID[model.id] = 0
+            cooldownUntilByModelID.removeValue(forKey: model.id)
             config.models[modelIdx].availabilityStatus = .available
             config.models[modelIdx].isAutoEvicted = false
             config.models[modelIdx].lastProbeLatencyMs = result.latencyMs
             config.models[modelIdx].lastProbedAt = Date()
-            config.models[modelIdx].lastAvailabilityNote = result.note
+            config.models[modelIdx].lastAvailabilityNote = persistedProbeNote(for: result)
             updateProviderHealth(providerID: provider.id, status: .healthy, error: nil)
+        } else if result.isTransientFailure {
+            recordTransientCooldown(for: model.id, reason: persistedProbeNote(for: result))
         } else {
+            cooldownUntilByModelID.removeValue(forKey: model.id)
             config.models[modelIdx].availabilityStatus = result.availability
             config.models[modelIdx].isAutoEvicted = true
             config.models[modelIdx].lastProbedAt = Date()
-            config.models[modelIdx].lastAvailabilityNote = result.note
+            config.models[modelIdx].lastAvailabilityNote = persistedProbeNote(for: result)
         }
         saveConfig()
         autoConfigureModelTiers(forceResetManual: false)
@@ -633,12 +721,13 @@ public final class AutoModelEngine: ObservableObject {
                 reachableProviderIDs.insert(provider.id)
                 updateProviderHealth(providerID: provider.id, status: .unknown, error: nil)
             case .unreachable(let status, let msg):
-                updateProviderHealth(providerID: provider.id, status: status, error: msg)
+                let safeMessage = persistedUpstreamNote(msg, fallback: "供应商连接检测失败")
+                updateProviderHealth(providerID: provider.id, status: status, error: safeMessage)
                 for idx in config.models.indices where config.models[idx].providerID == provider.id {
                     config.models[idx].availabilityStatus = .unavailable
                     config.models[idx].isAutoEvicted = true
                     config.models[idx].lastProbedAt = Date()
-                    config.models[idx].lastAvailabilityNote = "自动剔除（供应商不可用）：\(msg)"
+                    config.models[idx].lastAvailabilityNote = "自动剔除（供应商不可用）：\(safeMessage)"
                 }
             }
         }
@@ -699,15 +788,20 @@ public final class AutoModelEngine: ObservableObject {
             guard let res = probeResults[modelID] else { continue }
             config.models[idx].lastProbedAt = now
             if res.isAvailable {
+                transientFailureCountByModelID[modelID] = 0
+                cooldownUntilByModelID.removeValue(forKey: modelID)
                 config.models[idx].availabilityStatus = .available
                 config.models[idx].isAutoEvicted = false
                 config.models[idx].lastProbeLatencyMs = res.latencyMs
-                config.models[idx].lastAvailabilityNote = res.note
+                config.models[idx].lastAvailabilityNote = persistedProbeNote(for: res)
+            } else if res.isTransientFailure {
+                recordTransientCooldown(for: modelID, reason: persistedProbeNote(for: res))
             } else {
+                cooldownUntilByModelID.removeValue(forKey: modelID)
                 config.models[idx].availabilityStatus = res.availability
                 config.models[idx].isAutoEvicted = true
                 config.models[idx].lastProbeLatencyMs = nil
-                config.models[idx].lastAvailabilityNote = res.note
+                config.models[idx].lastAvailabilityNote = persistedProbeNote(for: res)
             }
         }
 
@@ -824,42 +918,63 @@ public final class AutoModelEngine: ObservableObject {
         }
     }
 
-    /// Automatically selects healthy models for Low / Medium / High tiers.
-    /// Manual choices are preserved unless `forceResetManual` is true OR the manually chosen model became evicted/deleted.
+    /// Automatically fills empty/deleted Low / Medium / High tier slots with healthy models.
+    /// Existing tier bindings (both manual and already-assigned distinct tiers) and backup queues
+    /// are strictly preserved across probes, discovery, and strategy switches unless `forceResetManual` is true.
     public func autoConfigureModelTiers(forceResetManual: Bool = false) {
         let healthy = healthyAvailableModels()
         let healthyIDs = Set(healthy.map(\.id))
+        let allKnownIDs = Set(config.models.map(\.id))
         var nextPolicy = config.policy
 
-        // Determine which tiers currently need (re)assignment
-        func needsAssignment(for tier: ModelTier) -> Bool {
-            if forceResetManual { return true }
-            if let cid = nextPolicy.modelID(for: tier) {
-                if !healthyIDs.contains(cid) {
-                    // Assigned model was deleted, disabled, or auto-evicted -> repair automatically
-                    return nextPolicy.autoConfigureTiers
-                }
-                if nextPolicy.isManual(for: tier) {
-                    return false
-                }
-                // Non-manual tier should re-evaluate as new healthy models arrive or probes complete
-                return nextPolicy.autoConfigureTiers
-            }
-            return nextPolicy.autoConfigureTiers
-        }
-
-        // If all healthy models vanished, clear dangling IDs that don't even exist anymore
-        let allKnownIDs = Set(config.models.map(\.id))
+        // Only prune models that were deleted from config.models; never wipe temporarily unhealthy backups
+        // or overwrite primary tier bindings during transient faults.
         for tier in ModelTier.allCases {
             if let cid = nextPolicy.modelID(for: tier), !allKnownIDs.contains(cid) {
                 nextPolicy.setTier(tier, modelID: nil, isManual: false)
             }
+            let existingBackups = nextPolicy.backupModelIDs(for: tier).filter { allKnownIDs.contains($0) }
+            nextPolicy.setBackupModelIDs(existingBackups, for: tier)
+        }
+
+        // Detect bootstrap-shared auto tiers (e.g., when models were added one-by-one so multiple
+        // non-manual tiers temporarily pointed to the same single model).
+        var nonManualTierCounts: [UUID: Int] = [:]
+        var distinctAssignedHealthyIDs = Set<UUID>()
+        for tier in ModelTier.allCases {
+            if let cid = nextPolicy.modelID(for: tier) {
+                if healthyIDs.contains(cid) {
+                    distinctAssignedHealthyIDs.insert(cid)
+                }
+                if !nextPolicy.isManual(for: tier) {
+                    nonManualTierCounts[cid, default: 0] += 1
+                }
+            }
+        }
+        let sharedAutoIDs = Set(nonManualTierCounts.filter { $0.value > 1 }.keys)
+        let hasMoreDistinctHealthyModels = healthyIDs.count > distinctAssignedHealthyIDs.count
+
+        // Determine which tiers currently need (re)assignment
+        func needsAssignment(for tier: ModelTier) -> Bool {
+            if forceResetManual { return true }
+            guard nextPolicy.autoConfigureTiers else { return false }
+            guard let cid = nextPolicy.modelID(for: tier) else {
+                return true
+            }
+            if !allKnownIDs.contains(cid) {
+                return true
+            }
+            if nextPolicy.isManual(for: tier) {
+                return false
+            }
+            // Only split shared bootstrap tiers when additional distinct healthy models become available
+            return sharedAutoIDs.contains(cid) && hasMoreDistinctHealthyModels
         }
 
         if !healthy.isEmpty {
             var reservedIDs = Set<UUID>()
             for tier in ModelTier.allCases where !needsAssignment(for: tier) {
-                if let existingID = nextPolicy.modelID(for: tier), healthyIDs.contains(existingID) {
+                if let existingID = nextPolicy.modelID(for: tier), allKnownIDs.contains(existingID) {
                     reservedIDs.insert(existingID)
                 }
             }
@@ -1033,11 +1148,15 @@ public final class AutoModelEngine: ObservableObject {
 
     @discardableResult
     public func applyAgentIntegration(kind: AgentKind) throws -> AgentIntegrationStatus {
+        guard isLocalAPITokenPersistent else {
+            throw AgentConfigError.localTokenNotPersisted
+        }
         let binding = binding(for: kind)
         let status = try agentConfigService.applyAgentConfig(
             kind: kind,
             binding: binding,
             proxyPort: config.proxySettings.port,
+            localAPIToken: localAPIToken,
             resolvedTierDisplayNames: resolvedTierDisplayNames()
         )
         refreshAgentStatuses()
@@ -1115,6 +1234,23 @@ public final class AutoModelEngine: ObservableObject {
         autoConfigureModelTiers(forceResetManual: false)
     }
 
+    public func backupModels(for tier: ModelTier) -> [ModelConfig] {
+        let byID = Dictionary(uniqueKeysWithValues: config.models.map { ($0.id, $0) })
+        return config.policy.backupModelIDs(for: tier).compactMap { byID[$0] }
+    }
+
+    public func addTierBackupModel(tier: ModelTier, modelUUID: UUID) {
+        updatePolicy { policy in
+            policy.addBackupModel(modelUUID, to: tier, isManual: true)
+        }
+    }
+
+    public func removeTierBackupModel(tier: ModelTier, modelUUID: UUID) {
+        updatePolicy { policy in
+            policy.removeBackupModel(modelUUID, from: tier)
+        }
+    }
+
     public func setRecordRequestBody(_ enabled: Bool) {
         config.privacySettings.recordRequestBody = enabled
         saveConfig()
@@ -1125,10 +1261,106 @@ public final class AutoModelEngine: ObservableObject {
         saveConfig()
     }
 
-    public func clearCallHistory() {
-        callHistory.removeAll()
+    public func monthlyBudgetUsage(agentID: String? = nil, now: Date = Date()) -> MonthlyBudgetUsage {
+        budgetLedger.usage(agentID: agentID, now: now)
+    }
+
+    private func budgetRejection(agentID: String?, now: Date = Date()) -> BudgetExceededError? {
+        if let global = config.budgetSettings.global {
+            let usage = budgetLedger.usage(agentID: nil, now: now)
+            if let rejection = MonthlyBudgetEvaluator.rejection(usage: usage, limit: global) {
+                return rejection
+            }
+        }
+        if let agentID, let limit = config.budgetSettings.agentLimits[agentID] {
+            let usage = budgetLedger.usage(agentID: agentID, now: now)
+            if let rejection = MonthlyBudgetEvaluator.rejection(usage: usage, limit: limit) {
+                return rejection
+            }
+        }
+        return nil
+    }
+
+    public func monthlyBudgetWarning(agentID: String? = nil, now: Date = Date()) -> MonthlyBudgetWarningState {
+        let usage = monthlyBudgetUsage(agentID: agentID, now: now)
+        let limit: MonthlyBudgetLimit?
+        if let agentID {
+            limit = config.budgetSettings.agentLimits[agentID]
+        } else {
+            limit = config.budgetSettings.global
+        }
+        return MonthlyBudgetEvaluator.warning(
+            usage: usage,
+            limit: limit,
+            warningThreshold: config.budgetSettings.warningThreshold
+        )
+    }
+
+    public func updateGlobalBudget(_ limit: MonthlyBudgetLimit?) {
+        config.budgetSettings.global = limit
+        saveConfig()
+    }
+
+    public func updateBudgetWarningThreshold(_ threshold: Double) {
+        config.budgetSettings.warningThreshold = min(1, max(0, threshold))
+        saveConfig()
+    }
+
+    public func updateAgentBudget(_ limit: MonthlyBudgetLimit?, for kind: AgentKind) {
+        config.budgetSettings.agentLimits[kind.rawValue] = limit
+        saveConfig()
+    }
+
+    public func updateAgentPolicyProfile(_ profile: AgentPolicyProfile) {
+        config.agentPolicyProfiles[profile.kind.rawValue] = profile
         router.clearSessionStickiness()
-        try? persistence.clearHistory()
+        saveConfig()
+    }
+
+    public func clearCallHistory() throws {
+        var historyCleared = false
+        var ledgerCleared = false
+        do {
+            try persistence.clearHistory()
+            historyCleared = true
+            try persistence.clearBudgetLedger()
+            ledgerCleared = true
+            try persistence.clearMetrics()
+        } catch {
+            if historyCleared { try? persistence.saveHistory(callHistory) }
+            if ledgerCleared { try? persistence.saveBudgetLedger(budgetLedger) }
+            throw error
+        }
+        callHistory.removeAll()
+        budgetLedger.removeAll()
+        onboardingFunnel = LocalOnboardingFunnelState()
+        router.clearSessionStickiness()
+    }
+
+    public func recordOnboardingStarted() {
+        let previous = onboardingFunnel
+        onboardingFunnel.recordStart()
+        if onboardingFunnel != previous {
+            try? persistence.saveOnboardingFunnel(onboardingFunnel)
+        }
+    }
+
+    public func recordOnboardingDemoValidation() {
+        onboardingFunnel.recordDemoValidation()
+        try? persistence.saveOnboardingFunnel(onboardingFunnel)
+    }
+
+    public func recordOnboardingSkipped() {
+        onboardingFunnel.recordSkip()
+        try? persistence.saveOnboardingFunnel(onboardingFunnel)
+    }
+
+    public func localProductMetrics(now: Date = Date()) -> LocalProductMetrics {
+        LocalProductMetricsCalculator.calculate(records: callHistory, funnel: onboardingFunnel, now: now)
+    }
+
+    public func localProductMetricsExport(now: Date = Date()) -> LocalProductMetricsExport {
+        LocalProductMetricsExport(metrics: localProductMetrics(now: now), records: callHistory, now: now)
     }
 
     public func clearAllKeychainKeys() throws {
@@ -1160,13 +1392,13 @@ public final class AutoModelEngine: ObservableObject {
             return .failure(.badRequest(status: 400, code: "invalid_messages", message: "请求缺少非空的 'messages' 数组。"))
         }
         if payload["audio"] != nil {
-            return .failure(.badRequest(status: 400, code: "unsupported_parameter", message: "Auto Model 第一版暂不支持 'audio' 参数。"))
+            return .failure(.badRequest(status: 400, code: "unsupported_parameter", message: "AutoRoute 第一版暂不支持 'audio' 参数。"))
         }
         if let modalities = payload["modalities"] as? [String], modalities.contains("audio") {
-            return .failure(.badRequest(status: 400, code: "unsupported_parameter", message: "Auto Model 第一版暂不支持 audio modalities。"))
+            return .failure(.badRequest(status: 400, code: "unsupported_parameter", message: "AutoRoute 第一版暂不支持 audio modalities。"))
         }
         if let n = payload["n"] as? Int, n > 1 {
-            return .failure(.badRequest(status: 400, code: "unsupported_parameter", message: "Auto Model 第一版暂不支持 n > 1 的多候选采样。"))
+            return .failure(.badRequest(status: 400, code: "unsupported_parameter", message: "AutoRoute 第一版暂不支持 n > 1 的多候选采样。"))
         }
         return .success(())
     }
@@ -1184,7 +1416,8 @@ public final class AutoModelEngine: ObservableObject {
         sessionHeader: String? = nil,
         clientName: String? = nil,
         endpointPath: String? = nil,
-        abBaselineModelUUID: UUID? = nil,
+        agentHeader: String? = nil,
+        nativeResponsesPayload: [String: Any]? = nil,
         onStreamHeadersReady: (@Sendable ([String: String]) async throws -> Void)? = nil,
         onStreamChunk: (@Sendable (Data) async throws -> Void)? = nil
     ) async -> ExecutionOutcome {
@@ -1192,9 +1425,121 @@ public final class AutoModelEngine: ObservableObject {
         let requestedModel = (payload["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "auto"
         let effectiveRequestedModel = requestedModel.isEmpty ? "auto" : requestedModel
         let stream = (payload["stream"] as? Bool) ?? false
-        let features = RequestFeatureExtractor.extract(from: payload, sessionHeader: sessionHeader)
+        var features = RequestFeatureExtractor.extract(from: payload, sessionHeader: sessionHeader)
         let secrets = keychain.allKnownSecretValues()
+        if !config.privacySettings.recordRequestBody {
+            // Subtask summaries are derived from message text and are body data too.
+            features.subtaskSummary = nil
+        }
         let requestPreview = config.privacySettings.recordRequestBody ? buildRequestPreview(payload: payload, secrets: secrets) : nil
+
+        let agentResolution: ResolvedAgentRequest
+        do {
+            agentResolution = try AgentRequestResolver.resolve(
+                requestedModel: effectiveRequestedModel,
+                agentHeader: agentHeader,
+                globalPolicy: config.policy,
+                profiles: config.agentPolicyProfiles
+            )
+        } catch {
+            let resolutionError = (error as? AgentRequestResolutionError)
+                ?? AgentRequestResolutionError(message: "无法解析 Agent 身份，请检查模型别名。")
+            let decision = RoutingDecision(
+                requestedModel: effectiveRequestedModel,
+                isAutoRouted: true,
+                strategyName: config.policy.activeStrategy.displayName,
+                policyVersion: config.policy.policyVersion,
+                deciderPluginID: config.policy.activeDeciderPluginID,
+                decisionDurationMs: 0,
+                errorSummary: resolutionError.message
+            )
+            let record = CallRecord(
+                source: source,
+                status: .rejected,
+                requestedModel: effectiveRequestedModel,
+                executedModelID: nil,
+                executedModelDisplayName: nil,
+                executedProviderName: nil,
+                httpStatusCode: resolutionError.statusCode,
+                requestFeatures: features,
+                decision: decision,
+                attempts: [],
+                routingDecisionMs: 0,
+                upstreamFirstTokenMs: nil,
+                totalCompletionMs: 0,
+                finalUsage: nil,
+                usageSource: .unavailable,
+                usageEstimationMethod: nil,
+                costStatus: .noUsage,
+                primaryAttemptCostUSD: nil,
+                retryAttemptsCostUSD: 0,
+                totalCostUSD: nil,
+                requestPreview: requestPreview,
+                errorMessage: resolutionError.message,
+                clientName: resolvedClientName,
+                endpointPath: endpointPath
+            )
+            appendCallRecord(record)
+            return ExecutionOutcome(
+                httpStatusCode: resolutionError.statusCode,
+                headers: [:],
+                responseBody: openAIErrorJSON(
+                    message: resolutionError.message,
+                    type: "invalid_request_error",
+                    code: resolutionError.code
+                ),
+                callRecord: record
+            )
+        }
+        let routingRequestedModel = agentResolution.effectiveRequestedModel
+
+        if let budgetError = budgetRejection(agentID: agentResolution.agentKind?.rawValue) {
+            let decision = RoutingDecision(
+                requestedModel: effectiveRequestedModel,
+                isAutoRouted: true,
+                strategyName: agentResolution.policy.activeStrategy.displayName,
+                policyVersion: agentResolution.policy.policyVersion,
+                deciderPluginID: agentResolution.policy.activeDeciderPluginID,
+                decisionDurationMs: 0,
+                errorSummary: budgetError.message,
+                agentID: agentResolution.agentKind?.rawValue,
+                agentIdentitySource: agentResolution.identitySource,
+                agentPolicyOverrideReason: agentResolution.overrideReason
+            )
+            let record = CallRecord(
+                source: source,
+                status: .rejected,
+                requestedModel: effectiveRequestedModel,
+                executedModelID: nil,
+                executedModelDisplayName: nil,
+                executedProviderName: nil,
+                httpStatusCode: budgetError.statusCode,
+                requestFeatures: features,
+                decision: decision,
+                attempts: [],
+                routingDecisionMs: 0,
+                upstreamFirstTokenMs: nil,
+                totalCompletionMs: 0,
+                finalUsage: nil,
+                usageSource: .unavailable,
+                usageEstimationMethod: nil,
+                costStatus: .noUsage,
+                primaryAttemptCostUSD: nil,
+                retryAttemptsCostUSD: 0,
+                totalCostUSD: nil,
+                requestPreview: requestPreview,
+                errorMessage: budgetError.message,
+                clientName: resolvedClientName,
+                endpointPath: endpointPath
+            )
+            appendCallRecord(record)
+            return ExecutionOutcome(
+                httpStatusCode: budgetError.statusCode,
+                headers: ["Retry-After": "3600"],
+                responseBody: openAIErrorJSON(message: budgetError.message, type: "rate_limit_error", code: budgetError.code),
+                callRecord: record
+            )
+        }
 
         if case .failure(let valErr) = validateChatCompletionsPayload(payload),
            case .badRequest(let status, let code, let message) = valErr {
@@ -1243,19 +1588,30 @@ public final class AutoModelEngine: ObservableObject {
         }
 
         let runtimeMetrics = buildRuntimeMetricsMap()
-        let decision = router.route(
-            requestedModel: effectiveRequestedModel,
+        let eligibleProviders = config.providers.filter { provider in
+            nativeResponsesPayload == nil || provider.apiProtocol == .openAIResponses || provider.apiProtocol == .codexChatGPT
+        }
+        let eligibleProviderIDs = Set(eligibleProviders.map(\.id))
+        var decision = router.route(
+            requestedModel: routingRequestedModel,
             features: features,
-            providers: config.providers,
-            models: config.models,
-            policy: config.policy,
-            runtimeMetricsByModelID: runtimeMetrics
+            providers: eligibleProviders,
+            models: config.models.filter { eligibleProviderIDs.contains($0.providerID) },
+            policy: agentResolution.policy,
+            runtimeMetricsByModelID: runtimeMetrics,
+            stickinessNamespace: agentResolution.agentKind?.rawValue
         )
+        decision.requestedModel = effectiveRequestedModel
+        decision.agentID = agentResolution.agentKind?.rawValue
+        decision.agentIdentitySource = agentResolution.identitySource
+        decision.agentPolicyOverrideReason = agentResolution.overrideReason
 
         guard let primaryID = decision.selectedModelUUID else {
             let status = (decision.isAutoRouted ? 503 : 404)
-            let errCode = decision.isAutoRouted ? "no_eligible_model" : "model_not_found"
-            let msg = decision.errorSummary ?? "没有满足条件的可用模型"
+            let errCode = nativeResponsesPayload != nil ? "native_responses_route_unavailable" : (decision.isAutoRouted ? "no_eligible_model" : "model_not_found")
+            let msg = nativeResponsesPayload != nil
+                ? "此请求包含必须保留的原生 Responses 工具或上下文，所选模型没有可用的 Responses 上游。请使用 Responses 供应商。"
+                : (decision.errorSummary ?? "没有满足条件的可用模型")
             let record = CallRecord(
                 source: source,
                 status: .rejected,
@@ -1300,6 +1656,7 @@ public final class AutoModelEngine: ObservableObject {
         let overallStart = DispatchTime.now()
         var attempts: [UpstreamAttemptRecord] = []
         var lastError: UpstreamError?
+        let explicitTier = ModelTier.matchExplicitTier(requestedModel: routingRequestedModel)
 
         for (idx, candidateID) in candidateQueue.enumerated() {
             guard let model = config.models.first(where: { $0.id == candidateID }),
@@ -1315,6 +1672,7 @@ public final class AutoModelEngine: ObservableObject {
                 attemptNumber: idx + 1
             )
 
+            let headerFlag = LockedFlag()
             let result = await upstreamClient.executeChatCompletion(
                 provider: provider,
                 model: model,
@@ -1322,14 +1680,19 @@ public final class AutoModelEngine: ObservableObject {
                 originalPayload: payload,
                 estimatedInputTokens: features.estimatedInputTokens,
                 stream: stream,
+                nativeResponsesPayload: nativeResponsesPayload,
+                resolvedEffort: decision.selectedEffort,
+                clientProvidedEffort: features.clientProvidedEffort,
                 secretsToRedact: secrets,
                 onStreamHeadersReady: {
+                    headerFlag.markTrue()
                     if let onStreamHeadersReady {
                         try await onStreamHeadersReady(responseHeaders)
                     }
                 },
                 onStreamChunk: onStreamChunk
             )
+            let hasEmittedStreamHeaders = headerFlag.value
 
             switch result {
             case .success(let completion):
@@ -1365,11 +1728,27 @@ public final class AutoModelEngine: ObservableObject {
                 )
                 attempts.append(attemptRecord)
 
+                transientFailureCountByModelID[model.id] = 0
+                cooldownUntilByModelID.removeValue(forKey: model.id)
+
                 if decision.isAutoRouted {
+                    let bodySnippet = String(data: completion.responseBody, encoding: .utf8) ?? ""
+                    let hasToolCalls = completion.hasToolCalls
+                        || bodySnippet.contains("\"tool_calls\"")
+                        || bodySnippet.contains("\"function_call\"")
+                    let trimmedReply = completion.assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let wasToolStarved = features.requiresTools && !hasToolCalls && trimmedReply.count < 80
+                    let isRoutineSubtask = (decision.subtaskCategory?.recommendedTier ?? .medium) != .high
                     router.recordSuccessfulSessionModel(
                         fingerprint: features.conversationFingerprint,
                         modelUUID: model.id,
-                        policyVersion: decision.policyVersion
+                        policyVersion: decision.policyVersion,
+                        isRoutineSubtask: isRoutineSubtask,
+                        wasToolStarved: wasToolStarved,
+                        requestedModel: routingRequestedModel,
+                        explicitTier: explicitTier,
+                        isMultiTurn: features.isMultiTurn,
+                        stickinessNamespace: agentResolution.agentKind?.rawValue
                     )
                 }
 
@@ -1389,22 +1768,9 @@ public final class AutoModelEngine: ObservableObject {
                     ? completion.reasoningText.map { SecretRedactor.redact(String($0.prefix(2000)), secrets: secrets) }
                     : nil
 
-                // Compute honest comparison (only real A/B test or historical samples)
+                // Real A/B comparisons are attached only by the auditable interleaved runner.
                 var comparison: ComparisonAnalysis? = nil
-                if let baselineID = abBaselineModelUUID,
-                   baselineID != model.id,
-                   let baselineModel = config.models.first(where: { $0.id == baselineID }),
-                   let baselineProvider = config.providers.first(where: { $0.id == baselineModel.providerID }) {
-                    comparison = await runRealABComparison(
-                        baselineModel: baselineModel,
-                        baselineProvider: baselineProvider,
-                        payload: payload,
-                        estimatedInputTokens: features.estimatedInputTokens,
-                        secrets: secrets,
-                        autoTotalCostUSD: totalCostUSD,
-                        autoTotalLatencyMs: totalMs
-                    )
-                } else if decision.isAutoRouted {
+                if decision.isAutoRouted {
                     comparison = buildHistoricalComparison(
                         executedModel: model,
                         executedUsage: completion.usage,
@@ -1439,7 +1805,8 @@ public final class AutoModelEngine: ObservableObject {
                     responsePreview: responsePreview,
                     reasoningPreview: reasoningPreview,
                     clientName: resolvedClientName,
-                    endpointPath: endpointPath
+                    endpointPath: endpointPath,
+                    executionOrigin: executionOrigin(for: provider)
                 )
                 appendCallRecord(callRecord)
 
@@ -1453,22 +1820,29 @@ public final class AutoModelEngine: ObservableObject {
             case .failure(let upstreamErr):
                 lastError = upstreamErr
                 let cleanErrMsg = SecretRedactor.redact(upstreamErr.localizedDescription, secrets: secrets)
+                let persistedErrMsg = persistedUpstreamErrorSummary(for: upstreamErr, detailedMessage: cleanErrMsg)
+
                 switch upstreamErr {
                 case .authError:
-                    updateProviderHealth(providerID: provider.id, status: .authError, error: cleanErrMsg)
-                    updateModelAvailability(modelID: model.id, status: .unavailable, note: "运行时自动剔除（鉴权失败）：\(cleanErrMsg)", autoEvicted: true)
+                    updateProviderHealth(providerID: provider.id, status: .authError, error: persistedErrMsg)
+                    updateModelAvailability(modelID: model.id, status: .unavailable, note: "运行时自动剔除（鉴权失败）：\(persistedErrMsg)", autoEvicted: true)
                 case .networkError:
-                    updateProviderHealth(providerID: provider.id, status: .networkError, error: cleanErrMsg)
-                    updateModelAvailability(modelID: model.id, status: .unavailable, note: "运行时自动剔除（网络/超时）：\(cleanErrMsg)", autoEvicted: true)
-                case .modelUnavailable(_, let msg, let avail):
-                    updateModelAvailability(modelID: model.id, status: avail, note: "运行时自动剔除：\(msg)", autoEvicted: true)
-                case .httpError(let code, _, let msg):
-                    if code == 402 || code == 404 || code == 410 || code == 429 || code >= 500 {
+                    recordTransientCooldown(for: model.id, reason: persistedErrMsg)
+                case .modelUnavailable(_, _, let avail):
+                    if avail == .insufficientCredits || avail == .retired {
+                        updateModelAvailability(modelID: model.id, status: avail, note: "运行时自动剔除：\(persistedErrMsg)", autoEvicted: true)
+                    } else {
+                        recordTransientCooldown(for: model.id, reason: persistedErrMsg)
+                    }
+                case .httpError(let code, _, _):
+                    if code == 402 || code == 404 || code == 410 {
                         let mappedAvail: ModelAvailabilityStatus = (code == 402) ? .insufficientCredits : (code == 410 ? .retired : .unavailable)
-                        updateModelAvailability(modelID: model.id, status: mappedAvail, note: "运行时自动剔除 (HTTP \(code))：\(msg)", autoEvicted: true)
+                        updateModelAvailability(modelID: model.id, status: mappedAvail, note: "运行时自动剔除：\(persistedErrMsg)", autoEvicted: true)
+                    } else if code == 429 || code == 408 || code >= 500 {
+                        recordTransientCooldown(for: model.id, reason: persistedErrMsg)
                     }
                 case .invalidURL, .invalidResponse:
-                    updateModelAvailability(modelID: model.id, status: .unavailable, note: "运行时自动剔除：\(cleanErrMsg)", autoEvicted: true)
+                    recordTransientCooldown(for: model.id, reason: persistedErrMsg)
                 }
 
                 attempts.append(UpstreamAttemptRecord(
@@ -1486,14 +1860,22 @@ public final class AutoModelEngine: ObservableObject {
                     usageEstimationMethod: nil,
                     costUSD: nil,
                     costStatus: .noUsage,
-                    errorMessage: cleanErrMsg
+                    errorMessage: persistedErrMsg
                 ))
+
+                // Once SSE headers/chunks have been emitted to the caller socket, never switch models mid-stream.
+                if stream && hasEmittedStreamHeaders {
+                    break
+                }
             }
         }
 
         // All candidate attempts failed
         let finalStatus = lastError?.statusCode ?? 502
-        let finalMessage = SecretRedactor.redact(lastError?.localizedDescription ?? "上游调用失败", secrets: secrets)
+        let finalClientMessage = SecretRedactor.redact(lastError?.localizedDescription ?? "上游调用失败", secrets: secrets)
+        let finalPersistedMessage = lastError.map {
+            persistedUpstreamErrorSummary(for: $0, detailedMessage: finalClientMessage)
+        } ?? "上游调用失败"
         let retryCost = attempts.compactMap(\.costUSD).reduce(0.0, +)
         let totalMs = decision.decisionDurationMs + elapsedMs(since: overallStart)
 
@@ -1519,21 +1901,71 @@ public final class AutoModelEngine: ObservableObject {
             retryAttemptsCostUSD: retryCost,
             totalCostUSD: retryCost > 0 ? retryCost : nil,
             requestPreview: requestPreview,
-            errorMessage: finalMessage,
+            errorMessage: finalPersistedMessage,
             clientName: resolvedClientName,
-            endpointPath: endpointPath
+            endpointPath: endpointPath,
+            executionOrigin: attempts.last?.providerID.flatMap { providerID in
+                config.providers.first(where: { $0.id == providerID }).map { executionOrigin(for: $0) }
+            }
         )
         appendCallRecord(failedRecord)
 
         return ExecutionOutcome(
             httpStatusCode: finalStatus,
             headers: [:],
-            responseBody: openAIErrorJSON(message: finalMessage, type: "upstream_error", code: "upstream_failed"),
+            responseBody: openAIErrorJSON(message: finalClientMessage, type: "upstream_error", code: "upstream_failed"),
             callRecord: failedRecord
         )
     }
 
     // MARK: - Cost, Comparison & Helpers
+
+    private func persistedUpstreamErrorSummary(for error: UpstreamError, detailedMessage: String) -> String {
+        guard !config.privacySettings.recordRequestBody else { return detailedMessage }
+        switch error {
+        case .invalidURL:
+            return "供应商 URL 无效"
+        case .authError(let statusCode, _):
+            return "上游鉴权失败 (HTTP \(statusCode))"
+        case .modelUnavailable(let statusCode, _, _):
+            return "上游模型不可用 (HTTP \(statusCode))"
+        case .networkError:
+            return "上游网络连接失败"
+        case .httpError(let statusCode, _, _):
+            return "上游返回 HTTP \(statusCode)"
+        case .invalidResponse:
+            return "上游响应格式异常"
+        }
+    }
+
+    private func persistedUpstreamNote(_ detailedNote: String, fallback: String) -> String {
+        config.privacySettings.recordRequestBody ? detailedNote : fallback
+    }
+
+    private func persistedProbeNote(for result: ModelProbeResult) -> String {
+        if config.privacySettings.recordRequestBody {
+            return result.note
+        }
+        if result.isAvailable {
+            return "测活可用"
+        }
+        if result.isTransientFailure {
+            return "测活瞬时限流/抖动"
+        }
+        return "自动测活剔除（\(result.availability.displayName)）"
+    }
+
+    private func executionOrigin(for provider: ProviderConfig) -> CallExecutionOrigin {
+        if provider.name.hasPrefix("本地测试模拟上游") {
+            return .demo
+        }
+        if isLocalTestUpstreamRunning,
+           let localTestUpstreamPort,
+           provider.baseURL == "http://127.0.0.1:\(localTestUpstreamPort)" {
+            return .demo
+        }
+        return .real
+    }
 
     private func computeAttemptCost(model: ModelConfig, usage: TokenUsage?) -> (costUSD: Double?, status: CostCalculationStatus) {
         guard let usage else {
@@ -1548,62 +1980,66 @@ public final class AutoModelEngine: ObservableObject {
         return (calculated, .calculated)
     }
 
-    private func runRealABComparison(
-        baselineModel: ModelConfig,
-        baselineProvider: ProviderConfig,
-        payload: [String: Any],
-        estimatedInputTokens: Int,
-        secrets: [String],
-        autoTotalCostUSD: Double?,
-        autoTotalLatencyMs: Double
-    ) async -> ComparisonAnalysis {
-        let key = try? keychain.getAPIKey(for: baselineProvider.id)
-        let result = await upstreamClient.executeChatCompletion(
-            provider: baselineProvider,
-            model: baselineModel,
-            apiKey: key,
-            originalPayload: payload,
-            estimatedInputTokens: estimatedInputTokens,
-            stream: false,
-            secretsToRedact: secrets
-        )
+    private struct BaselineLatencyProfile {
+        var sampleCount: Int
+        var rawAvgLatencyMs: Double
+        var avgTTFTMs: Double?
+        var decodeMsPerOutputToken: Double?
 
-        switch result {
-        case .success(let completion):
-            let baselineCost = completion.usage.flatMap {
-                baselineModel.calculateCostUSD(promptTokens: $0.promptTokens, completionTokens: $0.completionTokens)
+        func estimatedLatencyMs(forCompletionTokens completionTokens: Int?) -> Double {
+            if let outTokens = completionTokens,
+               outTokens > 0,
+               let ttft = avgTTFTMs,
+               let decodeRate = decodeMsPerOutputToken {
+                return ttft + Double(outTokens) * decodeRate
             }
-            var costDiff: Double?
-            var savingsPct: Double?
-            if let autoCost = autoTotalCostUSD, let baseCost = baselineCost {
-                costDiff = baseCost - autoCost
-                if baseCost > 0 {
-                    savingsPct = ((baseCost - autoCost) / baseCost) * 100.0
+            return rawAvgLatencyMs
+        }
+    }
+
+    private func baselineLatencyProfile(for baselineModelID: String) -> BaselineLatencyProfile? {
+        let samples = callHistory.filter {
+            $0.status == .success && $0.executedModelID == baselineModelID
+        }
+        guard !samples.isEmpty else { return nil }
+
+        let rawAvg = samples.map(\.totalCompletionMs).reduce(0.0, +) / Double(samples.count)
+        let tokenSamples = samples.filter { ($0.finalUsage?.completionTokens ?? 0) > 0 }
+        var avgTTFTMs: Double?
+        var decodeMsPerOutputToken: Double?
+
+        if !tokenSamples.isEmpty {
+            let ttftSamples = tokenSamples.compactMap(\.upstreamFirstTokenMs)
+            if !ttftSamples.isEmpty {
+                let ttftSum = ttftSamples.reduce(0.0, +)
+                let avgTTFT = ttftSum / Double(ttftSamples.count)
+                var decodeTimeSum = 0.0
+                var outTokenSum = 0
+                for sample in tokenSamples {
+                    guard let outTok = sample.finalUsage?.completionTokens, outTok > 0 else { continue }
+                    let ttft = sample.upstreamFirstTokenMs ?? avgTTFT
+                    decodeTimeSum += max(0.0, sample.totalCompletionMs - ttft)
+                    outTokenSum += outTok
+                }
+                if outTokenSum > 0 {
+                    avgTTFTMs = avgTTFT
+                    decodeMsPerOutputToken = decodeTimeSum / Double(outTokenSum)
+                }
+            } else {
+                let outTokenSum = tokenSamples.compactMap { $0.finalUsage?.completionTokens }.reduce(0, +)
+                if outTokenSum > 0 {
+                    avgTTFTMs = 0.0
+                    decodeMsPerOutputToken = tokenSamples.map(\.totalCompletionMs).reduce(0.0, +) / Double(outTokenSum)
                 }
             }
-            let latencyDiff = completion.totalLatencyMs - autoTotalLatencyMs
-            return ComparisonAnalysis(
-                basis: .realABTest,
-                baselineModelID: baselineModel.modelID,
-                baselineModelDisplayName: baselineModel.displayName,
-                costDifferenceUSD: costDiff,
-                costSavingsPercent: savingsPct,
-                latencyDifferenceMs: latencyDiff,
-                sampleCount: 1,
-                note: "同请求实测对照：基准模型「\(baselineModel.displayName)」实际耗时 \(AutoModelFormatter.formatMs(completion.totalLatencyMs))，费用 \(AutoModelFormatter.formatUSD(baselineCost))"
-            )
-        case .failure(let err):
-            return ComparisonAnalysis(
-                basis: .realABTest,
-                baselineModelID: baselineModel.modelID,
-                baselineModelDisplayName: baselineModel.displayName,
-                costDifferenceUSD: nil,
-                costSavingsPercent: nil,
-                latencyDifferenceMs: nil,
-                sampleCount: 0,
-                note: "实测对照执行基准模型「\(baselineModel.displayName)」失败：\(err.localizedDescription)"
-            )
         }
+
+        return BaselineLatencyProfile(
+            sampleCount: samples.count,
+            rawAvgLatencyMs: rawAvg,
+            avgTTFTMs: avgTTFTMs,
+            decodeMsPerOutputToken: decodeMsPerOutputToken
+        )
     }
 
     private func buildHistoricalComparison(
@@ -1618,13 +2054,10 @@ public final class AutoModelEngine: ObservableObject {
             .sorted { $0.qualityScore > $1.qualityScore }
 
         for baseline in alternativeModels {
-            let samples = callHistory.filter {
-                $0.status == .success && $0.executedModelID == baseline.modelID
-            }
-            guard !samples.isEmpty else { continue }
+            guard let profile = baselineLatencyProfile(for: baseline.modelID) else { continue }
 
-            let avgBaselineLatency = samples.map(\.totalCompletionMs).reduce(0.0, +) / Double(samples.count)
-            let latencyDiff = avgBaselineLatency - autoTotalLatencyMs
+            let estBaselineLatency = profile.estimatedLatencyMs(forCompletionTokens: executedUsage?.completionTokens)
+            let latencyDiff = estBaselineLatency - autoTotalLatencyMs
 
             var costDiff: Double?
             var savingsPct: Double?
@@ -1640,6 +2073,15 @@ public final class AutoModelEngine: ObservableObject {
                 }
             }
 
+            let basisDetail: String
+            if let outTok = executedUsage?.completionTokens,
+               outTok > 0,
+               profile.decodeMsPerOutputToken != nil {
+                basisDetail = "同输出量 \(outTok) tokens 归一化估算 \(AutoModelFormatter.formatMs(estBaselineLatency))"
+            } else {
+                basisDetail = "历史均值 \(AutoModelFormatter.formatMs(profile.rawAvgLatencyMs))"
+            }
+
             return ComparisonAnalysis(
                 basis: .historicalEstimate,
                 baselineModelID: baseline.modelID,
@@ -1647,8 +2089,8 @@ public final class AutoModelEngine: ObservableObject {
                 costDifferenceUSD: costDiff,
                 costSavingsPercent: savingsPct,
                 latencyDifferenceMs: latencyDiff,
-                sampleCount: samples.count,
-                note: "历史估算：基于「\(baseline.displayName)」在本机的 \(samples.count) 条真实历史样本（均值 \(AutoModelFormatter.formatMs(avgBaselineLatency))）与当前请求用量按单价估算。"
+                sampleCount: profile.sampleCount,
+                note: "历史估算：基于「\(baseline.displayName)」在本机的 \(profile.sampleCount) 条真实历史样本（\(basisDetail)）与当前请求用量按单价估算。"
             )
         }
         return nil
@@ -1723,9 +2165,7 @@ public final class AutoModelEngine: ObservableObject {
             ? 0
             : successRecords.map(\.totalCompletionMs).reduce(0, +) / Double(successRecords.count)
 
-        let baselineSamples = callHistory.filter {
-            $0.status == .success && $0.executedModelID == baseline.modelID
-        }
+        let baselineProfile = baselineLatencyProfile(for: baseline.modelID)
         let comparisonLatencyPairs: [(actual: Double, baseline: Double)] = successRecords.compactMap { rec in
             guard let comparison = rec.comparison,
                   comparison.baselineModelID == baseline.modelID,
@@ -1737,10 +2177,24 @@ public final class AutoModelEngine: ObservableObject {
         var speedSampleCount = 0
         var speedBasisLabel = "待采集基准耗时样本"
 
-        if !baselineSamples.isEmpty {
-            baselineAvgLatencyMs = baselineSamples.map(\.totalCompletionMs).reduce(0, +) / Double(baselineSamples.count)
-            speedSampleCount = baselineSamples.count
-            speedBasisLabel = "同机 \(baselineSamples.count) 条基准实测"
+        if let profile = baselineProfile, !successRecords.isEmpty {
+            var estTurnLatencies: [Double] = []
+            var usedTokenNormalized = false
+            for rec in successRecords {
+                if rec.executedModelID == baseline.modelID {
+                    estTurnLatencies.append(rec.totalCompletionMs)
+                } else {
+                    if (rec.finalUsage?.completionTokens ?? 0) > 0 && profile.decodeMsPerOutputToken != nil {
+                        usedTokenNormalized = true
+                    }
+                    estTurnLatencies.append(profile.estimatedLatencyMs(forCompletionTokens: rec.finalUsage?.completionTokens))
+                }
+            }
+            baselineAvgLatencyMs = estTurnLatencies.reduce(0, +) / Double(estTurnLatencies.count)
+            speedSampleCount = profile.sampleCount
+            speedBasisLabel = usedTokenNormalized
+                ? "同机 \(profile.sampleCount) 条按用量归一化"
+                : "同机 \(profile.sampleCount) 条基准实测"
         } else if !comparisonLatencyPairs.isEmpty {
             baselineAvgLatencyMs = comparisonLatencyPairs.map(\.baseline).reduce(0, +) / Double(comparisonLatencyPairs.count)
             speedSampleCount = comparisonLatencyPairs.count
@@ -1832,10 +2286,34 @@ public final class AutoModelEngine: ObservableObject {
         return SecretRedactor.redact(summary, secrets: secrets)
     }
 
+    func setComparison(_ comparison: ComparisonAnalysis?, forRecordID recordID: UUID) {
+        guard let index = callHistory.firstIndex(where: { $0.id == recordID }) else { return }
+        callHistory[index].comparison = comparison
+    }
+
+    func persistCallHistory() {
+        try? persistence.saveHistory(callHistory)
+    }
+
     private func appendCallRecord(_ record: CallRecord) {
         callHistory.insert(record, at: 0)
         if callHistory.count > 500 {
             callHistory = Array(callHistory.prefix(500))
+        }
+        if record.source == .externalProxy,
+           record.status == .success,
+           record.executionOrigin == .real,
+           onboardingFunnel.isAwaitingFirstRealRoute {
+            onboardingFunnel.recordRealSuccess(at: record.timestamp)
+            try? persistence.saveOnboardingFunnel(onboardingFunnel)
+        }
+        if !record.attempts.isEmpty {
+            budgetLedger.record(record)
+            do {
+                try persistence.saveBudgetLedger(budgetLedger)
+            } catch {
+                lastPersistenceError = "预算账本持久化失败：\(error.localizedDescription)"
+            }
         }
         try? persistence.saveHistory(callHistory)
     }
@@ -1849,6 +2327,11 @@ public final class AutoModelEngine: ObservableObject {
             ]
         ]
         return (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+    }
+
+    public func cooldownRemainingSeconds(for modelID: UUID) -> Int? {
+        guard let until = cooldownUntilByModelID[modelID], until > Date() else { return nil }
+        return max(1, Int(ceil(until.timeIntervalSinceNow)))
     }
 
     private func buildRuntimeMetricsMap() -> [UUID: ModelRuntimeMetrics] {
@@ -1865,11 +2348,26 @@ public final class AutoModelEngine: ObservableObject {
                 stats[mid] = cur
             }
         }
+        let now = Date()
         var result: [UUID: ModelRuntimeMetrics] = [:]
         for (mid, s) in stats where s.totalCount > 0 {
             let avg = s.successCount > 0 ? (s.totalLatency / Double(s.successCount)) : 10_000.0
             let rate = Double(s.successCount) / Double(s.totalCount)
-            result[mid] = ModelRuntimeMetrics(averageLatencyMs: avg, successRate: rate, sampleCount: s.totalCount)
+            let cooldown = cooldownUntilByModelID[mid].flatMap { $0 > now ? $0 : nil }
+            result[mid] = ModelRuntimeMetrics(
+                averageLatencyMs: avg,
+                successRate: rate,
+                sampleCount: s.totalCount,
+                cooldownUntil: cooldown
+            )
+        }
+        for (mid, until) in cooldownUntilByModelID where until > now && result[mid] == nil {
+            result[mid] = ModelRuntimeMetrics(
+                averageLatencyMs: 5_000.0,
+                successRate: 1.0,
+                sampleCount: 0,
+                cooldownUntil: until
+            )
         }
         return result
     }

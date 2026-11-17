@@ -1,0 +1,41 @@
+name: Feature request
+description: 提出边界清晰、可验收的功能建议
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿提交 key、token、私有代码/正文或未脱敏配置。功能建议不承诺日期；先说明用户问题而非只指定实现。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 用户问题与使用场景
+      description: 哪个 Agent、协议或本地工作流遇到什么问题？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议行为与备选方案
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 可验收标准与测试命令
+      description: 包含旧配置兼容、协议/回退、隐私或指标口径要求。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏示例（可选）
+      description: 只用虚拟数据或脱敏收据，不附真实请求/响应正文。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 本建议不包含真实密钥、token 或私人正文
+          required: true

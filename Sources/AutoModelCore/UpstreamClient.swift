@@ -47,6 +47,31 @@ public struct UpstreamCompletionResult: Sendable {
     public var usageEstimationMethod: String?
     public var firstTokenMs: Double?
     public var totalLatencyMs: Double
+    public var hasToolCalls: Bool
+
+    public init(
+        statusCode: Int,
+        responseBody: Data,
+        assistantText: String,
+        reasoningText: String?,
+        usage: TokenUsage?,
+        usageSource: UsageDataSource,
+        usageEstimationMethod: String?,
+        firstTokenMs: Double?,
+        totalLatencyMs: Double,
+        hasToolCalls: Bool = false
+    ) {
+        self.statusCode = statusCode
+        self.responseBody = responseBody
+        self.assistantText = assistantText
+        self.reasoningText = reasoningText
+        self.usage = usage
+        self.usageSource = usageSource
+        self.usageEstimationMethod = usageEstimationMethod
+        self.firstTokenMs = firstTokenMs
+        self.totalLatencyMs = totalLatencyMs
+        self.hasToolCalls = hasToolCalls
+    }
 }
 
 public struct ModelProbeResult: Sendable {
@@ -54,6 +79,21 @@ public struct ModelProbeResult: Sendable {
     public var availability: ModelAvailabilityStatus
     public var latencyMs: Double
     public var note: String
+    public var isTransientFailure: Bool
+
+    public init(
+        isAvailable: Bool,
+        availability: ModelAvailabilityStatus,
+        latencyMs: Double,
+        note: String,
+        isTransientFailure: Bool = false
+    ) {
+        self.isAvailable = isAvailable
+        self.availability = availability
+        self.latencyMs = latencyMs
+        self.note = note
+        self.isTransientFailure = isTransientFailure
+    }
 }
 
 public enum ProviderReachabilityOutcome: Sendable {
@@ -143,17 +183,39 @@ public final class UpstreamClient: @unchecked Sendable {
         originalPayload: [String: Any],
         estimatedInputTokens: Int,
         stream: Bool,
+        nativeResponsesPayload: [String: Any]? = nil,
+        resolvedEffort: ReasoningEffort? = nil,
+        clientProvidedEffort: ReasoningEffort? = nil,
         secretsToRedact: [String] = [],
         onStreamHeadersReady: (@Sendable () async throws -> Void)? = nil,
         onStreamChunk: (@Sendable (Data) async throws -> Void)? = nil
     ) async -> Result<UpstreamCompletionResult, UpstreamError> {
+        if let nativeResponsesPayload {
+            guard provider.apiProtocol == .codexChatGPT || provider.apiProtocol == .openAIResponses else {
+                let message = "Native Responses requests require a Responses-compatible provider"
+                return .failure(.httpError(statusCode: 400, rawBody: Data(), message: message))
+            }
+            return await executeNativeResponsesCompletion(
+                provider: provider, model: model, apiKey: apiKey,
+                payload: nativeResponsesPayload, estimatedInputTokens: estimatedInputTokens,
+                stream: stream, resolvedEffort: resolvedEffort, clientProvidedEffort: clientProvidedEffort,
+                secretsToRedact: secretsToRedact, onStreamHeadersReady: onStreamHeadersReady, onStreamChunk: onStreamChunk
+            )
+        }
+        let preparedPayload = Self.injectReasoningEffortIfEligible(
+            payload: originalPayload,
+            model: model,
+            resolvedEffort: resolvedEffort,
+            clientProvidedEffort: clientProvidedEffort
+        )
+
         switch provider.apiProtocol {
         case .codexChatGPT, .openAIResponses:
             return await executeResponsesCompletion(
                 provider: provider,
                 model: model,
                 apiKey: apiKey,
-                originalPayload: originalPayload,
+                originalPayload: preparedPayload,
                 estimatedInputTokens: estimatedInputTokens,
                 callerRequestedStream: stream,
                 secretsToRedact: secretsToRedact,
@@ -165,7 +227,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 provider: provider,
                 model: model,
                 apiKey: apiKey,
-                originalPayload: originalPayload,
+                originalPayload: preparedPayload,
                 estimatedInputTokens: estimatedInputTokens,
                 stream: stream,
                 secretsToRedact: secretsToRedact,
@@ -180,7 +242,7 @@ public final class UpstreamClient: @unchecked Sendable {
             return .failure(.invalidURL(provider.baseURL))
         }
 
-        var upstreamPayload = originalPayload
+        var upstreamPayload = preparedPayload
         upstreamPayload["model"] = model.modelID
         upstreamPayload["stream"] = stream
 
@@ -246,7 +308,8 @@ public final class UpstreamClient: @unchecked Sendable {
                     usageSource: usageSource,
                     usageEstimationMethod: estimationNote,
                     firstTokenMs: totalMs,
-                    totalLatencyMs: totalMs
+                    totalLatencyMs: totalMs,
+                    hasToolCalls: Self.responseContainsToolCalls(parsedObj)
                 ))
             } else {
                 // Streaming SSE request
@@ -272,6 +335,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 var accumulatedText = ""
                 var accumulatedReasoning = ""
                 var reportedUsage: TokenUsage?
+                var observedStreamToolCalls = false
                 var lineBuffer = Data()
 
                 func processLine(_ lineData: Data) async throws {
@@ -307,6 +371,9 @@ public final class UpstreamClient: @unchecked Sendable {
                                     firstTokenMs = elapsedMs(since: startTime)
                                 }
                                 accumulatedReasoning += deltaReasoning
+                            }
+                            if Self.streamChunkContainsToolCalls(chunkObj) {
+                                observedStreamToolCalls = true
                             }
                             if firstTokenMs == nil, chunkObj["choices"] != nil, hasAnyChoiceDelta(chunkObj) {
                                 firstTokenMs = elapsedMs(since: startTime)
@@ -375,7 +442,8 @@ public final class UpstreamClient: @unchecked Sendable {
                     usageSource: usageSource,
                     usageEstimationMethod: estimationNote,
                     firstTokenMs: firstTokenMs ?? totalMs,
-                    totalLatencyMs: totalMs
+                    totalLatencyMs: totalMs,
+                    hasToolCalls: observedStreamToolCalls
                 ))
             }
         } catch {
@@ -395,10 +463,73 @@ public final class UpstreamClient: @unchecked Sendable {
         if lower.contains("retired") || lower.contains("deprecated") || statusCode == 410 {
             return .modelUnavailable(statusCode: statusCode, message: msg, availability: .retired)
         }
-        if statusCode == 402 || lower.contains("credit") || lower.contains("quota") || lower.contains("insufficient") || lower.contains("subscribe") || lower.contains("exhausted") || lower.contains("balance") {
+        let hasBillingSignal = lower.contains("credit") || lower.contains("balance") || lower.contains("subscribe") || lower.contains("billing")
+        let hasQuotaExhausted = (statusCode != 429) && (lower.contains("quota") || lower.contains("insufficient") || lower.contains("exhausted"))
+        if statusCode == 402 || hasBillingSignal || hasQuotaExhausted {
             return .modelUnavailable(statusCode: statusCode, message: msg, availability: .insufficientCredits)
         }
         return .httpError(statusCode: statusCode, rawBody: data, message: msg)
+    }
+
+    private func classifyProbeFailure(_ err: UpstreamError, latencyMs: Double, isCodex: Bool = false) -> ModelProbeResult {
+        switch err {
+        case .modelUnavailable(_, let msg, let avail):
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: avail,
+                latencyMs: latencyMs,
+                note: "自动测活剔除 (\(avail.displayName)): \(msg)",
+                isTransientFailure: false
+            )
+        case .authError(let code, let msg):
+            let hint = isCodex
+                ? "Codex 登录态失效或已过期 (\(code)): \(msg)"
+                : "自动测活剔除 (鉴权失败 HTTP \(code)): \(msg)"
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: .unavailable,
+                latencyMs: latencyMs,
+                note: hint,
+                isTransientFailure: false
+            )
+        case .httpError(let code, _, let msg):
+            let isTransient = (code == 429 || code == 408 || code >= 500)
+            let prefix = isTransient ? "测活瞬时限流/抖动" : "自动测活剔除"
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: .unavailable,
+                latencyMs: latencyMs,
+                note: "\(prefix) (HTTP \(code)): \(msg)",
+                isTransientFailure: isTransient
+            )
+        case .networkError(let msg), .invalidResponse(let msg):
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: .unavailable,
+                latencyMs: latencyMs,
+                note: "测活瞬时网络/响应异常：\(msg)",
+                isTransientFailure: true
+            )
+        case .invalidURL(let url):
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: .unavailable,
+                latencyMs: latencyMs,
+                note: "自动测活剔除：无效的供应商 URL \(url)",
+                isTransientFailure: false
+            )
+        }
+    }
+
+    private func classifyProbeNetworkError(_ error: Error, latencyMs: Double, secrets: [String]) -> ModelProbeResult {
+        let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secrets)
+        return ModelProbeResult(
+            isAvailable: false,
+            availability: .unavailable,
+            latencyMs: latencyMs,
+            note: "测活瞬时网络异常：\(cleanMsg)",
+            isTransientFailure: true
+        )
     }
 
     // MARK: - Active Health Probing
@@ -531,45 +662,10 @@ public final class UpstreamClient: @unchecked Sendable {
             }
 
             let err = classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact)
-            switch err {
-            case .modelUnavailable(_, let msg, let avail):
-                return ModelProbeResult(
-                    isAvailable: false,
-                    availability: avail,
-                    latencyMs: latencyMs,
-                    note: "自动测活剔除 (\(avail.displayName)): \(msg)"
-                )
-            case .authError(let code, let msg):
-                return ModelProbeResult(
-                    isAvailable: false,
-                    availability: .unavailable,
-                    latencyMs: latencyMs,
-                    note: "自动测活剔除 (鉴权失败 HTTP \(code)): \(msg)"
-                )
-            case .httpError(let code, _, let msg):
-                return ModelProbeResult(
-                    isAvailable: false,
-                    availability: .unavailable,
-                    latencyMs: latencyMs,
-                    note: "自动测活剔除 (HTTP \(code)): \(msg)"
-                )
-            default:
-                return ModelProbeResult(
-                    isAvailable: false,
-                    availability: .unavailable,
-                    latencyMs: latencyMs,
-                    note: "自动测活剔除：\(err.localizedDescription)"
-                )
-            }
+            return classifyProbeFailure(err, latencyMs: latencyMs)
         } catch {
             let latencyMs = elapsedMs(since: start)
-            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
-            return ModelProbeResult(
-                isAvailable: false,
-                availability: .unavailable,
-                latencyMs: latencyMs,
-                note: "自动测活剔除：\(cleanMsg)"
-            )
+            return classifyProbeNetworkError(error, latencyMs: latencyMs, secrets: secretsToRedact)
         }
     }
 
@@ -642,9 +738,50 @@ public final class UpstreamClient: @unchecked Sendable {
             return false
         }
         if let delta = first["delta"] as? [String: Any] {
-            return delta["tool_calls"] != nil || delta["role"] != nil || delta["content"] != nil || delta["reasoning_content"] != nil
+            return delta["tool_calls"] != nil || delta["function_call"] != nil || delta["role"] != nil || delta["content"] != nil || delta["reasoning_content"] != nil
         }
         return false
+    }
+
+    private static func streamChunkContainsToolCalls(_ json: [String: Any]) -> Bool {
+        guard let choices = json["choices"] as? [[String: Any]], let first = choices.first else {
+            return false
+        }
+        if let delta = first["delta"] as? [String: Any] {
+            if let toolCalls = delta["tool_calls"] as? [Any], !toolCalls.isEmpty { return true }
+            if delta["function_call"] != nil { return true }
+        }
+        if let finish = first["finish_reason"] as? String, finish == "tool_calls" {
+            return true
+        }
+        return false
+    }
+
+    private static func responseContainsToolCalls(_ json: [String: Any]) -> Bool {
+        guard let choices = json["choices"] as? [[String: Any]], let first = choices.first,
+              let msg = first["message"] as? [String: Any] else {
+            return false
+        }
+        if let toolCalls = msg["tool_calls"] as? [Any], !toolCalls.isEmpty { return true }
+        return msg["function_call"] != nil
+    }
+
+    private static func injectReasoningEffortIfEligible(
+        payload: [String: Any],
+        model: ModelConfig,
+        resolvedEffort: ReasoningEffort?,
+        clientProvidedEffort: ReasoningEffort?
+    ) -> [String: Any] {
+        guard clientProvidedEffort == nil,
+              let resolvedEffort,
+              payload["reasoning_effort"] == nil,
+              payload["reasoning"] == nil,
+              model.capabilities.contains(.reasoning) || model.defaultRole == .complexReasoning else {
+            return payload
+        }
+        var updated = payload
+        updated["reasoning_effort"] = resolvedEffort.upstreamEffortValue
+        return updated
     }
 
     private func extractUsage(from json: [String: Any]) -> TokenUsage? {
@@ -695,6 +832,101 @@ public final class UpstreamClient: @unchecked Sendable {
             request.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
         }
         return request
+    }
+
+    private func executeNativeResponsesCompletion(
+        provider: ProviderConfig, model: ModelConfig, apiKey: String?, payload: [String: Any],
+        estimatedInputTokens: Int, stream: Bool, resolvedEffort: ReasoningEffort?,
+        clientProvidedEffort: ReasoningEffort?, secretsToRedact: [String],
+        onStreamHeadersReady: (@Sendable () async throws -> Void)?,
+        onStreamChunk: (@Sendable (Data) async throws -> Void)?
+    ) async -> Result<UpstreamCompletionResult, UpstreamError> {
+        let isCodex = provider.apiProtocol == .codexChatGPT
+        guard let url = provider.endpointURL(path: isCodex ? "/responses" : "/v1/responses") else {
+            return .failure(.invalidURL(provider.baseURL))
+        }
+        var body = payload
+        body["model"] = model.modelID
+        body["stream"] = isCodex || stream
+        if isCodex {
+            body["store"] = false
+            if body["instructions"] == nil { body["instructions"] = "You are a helpful assistant." }
+        }
+        if clientProvidedEffort == nil, let resolvedEffort,
+           model.capabilities.contains(.reasoning) || model.defaultRole == .complexReasoning {
+            if body["reasoning_effort"] == nil {
+                if var reasoning = body["reasoning"] as? [String: Any] {
+                    if reasoning["effort"] == nil { reasoning["effort"] = resolvedEffort.upstreamEffortValue }
+                    body["reasoning"] = reasoning
+                } else if body["reasoning"] == nil {
+                    body["reasoning"] = ["effort": resolvedEffort.upstreamEffortValue]
+                }
+            }
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else {
+            return .failure(.invalidResponse(message: "无法序列化 Responses 上游请求 JSON"))
+        }
+        let request = buildResponsesRequest(provider: provider, url: url, bodyData: data, apiKey: apiKey, timeout: provider.timeoutSeconds)
+        let start = DispatchTime.now()
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
+            }
+            guard (200...299).contains(http.statusCode) else {
+                var error = Data()
+                for try await byte in bytes { error.append(byte); if error.count > 65_536 { break } }
+                return .failure(classifyHTTPError(statusCode: http.statusCode, data: error, secrets: secretsToRedact))
+            }
+            let isSSE = isCodex || stream || (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased().contains("text/event-stream")
+            var observer = NativeResponsesObserver()
+            var firstToken: Double?
+            var responseBody = Data()
+            if isSSE {
+                if stream, let onStreamHeadersReady { try await onStreamHeadersReady() }
+                var buffer = Data()
+                for try await byte in bytes {
+                    buffer.append(byte)
+                    // Deliver batches promptly without rewriting the upstream bytes.
+                    if byte == 10 || buffer.count >= 4096 {
+                        if stream, let onStreamChunk { try await onStreamChunk(buffer) }
+                        observer.append(buffer)
+                        if firstToken == nil && observer.hasOutput { firstToken = elapsedMs(since: start) }
+                        buffer.removeAll(keepingCapacity: true)
+                    }
+                }
+                if !buffer.isEmpty {
+                    if stream, let onStreamChunk { try await onStreamChunk(buffer) }
+                    observer.append(buffer)
+                }
+                if let error = observer.errorMessage {
+                    return .failure(.httpError(statusCode: 502, rawBody: Data(), message: SecretRedactor.redact(error, secrets: secretsToRedact)))
+                }
+                guard let completed = observer.completedResponse else {
+                    return .failure(.invalidResponse(message: "上游 Responses 流未完成"))
+                }
+                if !stream { responseBody = try JSONSerialization.data(withJSONObject: completed) }
+            } else {
+                for try await byte in bytes { responseBody.append(byte) }
+                guard let object = try? JSONSerialization.jsonObject(with: responseBody) as? [String: Any] else {
+                    return .failure(.invalidResponse(message: "上游 Responses JSON 无效"))
+                }
+                if let status = object["status"] as? String, status == "failed" || status == "incomplete" {
+                    return .failure(.invalidResponse(message: "上游 Responses 响应未完成: \(status)"))
+                }
+                observer.observeResponse(object)
+            }
+            let total = elapsedMs(since: start)
+            let reported = observer.usage
+            let usage = reported ?? TokenUsage(promptTokens: estimatedInputTokens, completionTokens: RequestFeatureExtractor.estimateTokens(text: observer.text.isEmpty ? observer.reasoning : observer.text, messageCount: 0))
+            return .success(UpstreamCompletionResult(statusCode: http.statusCode, responseBody: responseBody,
+                assistantText: observer.text, reasoningText: observer.reasoning.isEmpty ? nil : observer.reasoning,
+                usage: usage, usageSource: reported == nil ? .estimatedWhenMissing : .upstreamReported,
+                usageEstimationMethod: reported == nil ? "上游未返回 usage，按本地字符数估算" : nil,
+                firstTokenMs: firstToken ?? total, totalLatencyMs: total, hasToolCalls: observer.hasToolCalls))
+        } catch {
+            return .failure(.networkError(message: SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)))
+        }
     }
 
     private func executeResponsesCompletion(
@@ -772,7 +1004,8 @@ public final class UpstreamClient: @unchecked Sendable {
                     usageSource: reportedUsage != nil ? .upstreamReported : .estimatedWhenMissing,
                     usageEstimationMethod: reportedUsage == nil ? "上游未返回 usage，按本地字符数估算" : nil,
                     firstTokenMs: totalMs,
-                    totalLatencyMs: totalMs
+                    totalLatencyMs: totalMs,
+                    hasToolCalls: Self.responseContainsToolCalls(chatObj)
                 ))
             }
 
@@ -851,7 +1084,8 @@ public final class UpstreamClient: @unchecked Sendable {
                 usageSource: reportedUsage != nil ? .upstreamReported : .estimatedWhenMissing,
                 usageEstimationMethod: reportedUsage == nil ? "上游未返回 usage，按本地字符数估算" : nil,
                 firstTokenMs: firstTokenMs ?? totalMs,
-                totalLatencyMs: totalMs
+                totalLatencyMs: totalMs,
+                hasToolCalls: translator.hasToolCalls
             ))
         } catch {
             let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
@@ -927,21 +1161,10 @@ public final class UpstreamClient: @unchecked Sendable {
                 if errData.count > 16_384 { break }
             }
             let err = classifyHTTPError(statusCode: http.statusCode, data: errData, secrets: secretsToRedact)
-            switch err {
-            case .modelUnavailable(_, let msg, let avail):
-                return ModelProbeResult(isAvailable: false, availability: avail, latencyMs: latencyMs, note: "自动测活剔除 (\(avail.displayName)): \(msg)")
-            case .authError(let code, let msg):
-                let hint = isCodex ? "Codex 登录态失效或已过期 (\(code)): \(msg)" : "自动测活剔除 (鉴权失败 HTTP \(code)): \(msg)"
-                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: hint)
-            case .httpError(let code, _, let msg):
-                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除 (HTTP \(code)): \(msg)")
-            default:
-                return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(err.localizedDescription)")
-            }
+            return classifyProbeFailure(err, latencyMs: latencyMs, isCodex: isCodex)
         } catch {
             let latencyMs = elapsedMs(since: start)
-            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
-            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(cleanMsg)")
+            return classifyProbeNetworkError(error, latencyMs: latencyMs, secrets: secretsToRedact)
         }
     }
 
@@ -1030,7 +1253,8 @@ public final class UpstreamClient: @unchecked Sendable {
                 usageSource: reportedUsage != nil ? .upstreamReported : .estimatedWhenMissing,
                 usageEstimationMethod: reportedUsage == nil ? "上游未返回 usage，按本地字符数估算" : nil,
                 firstTokenMs: totalMs,
-                totalLatencyMs: totalMs
+                totalLatencyMs: totalMs,
+                hasToolCalls: Self.responseContainsToolCalls(chatObj)
             ))
         } catch {
             let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
@@ -1076,11 +1300,10 @@ public final class UpstreamClient: @unchecked Sendable {
                 return ModelProbeResult(isAvailable: true, availability: .available, latencyMs: latencyMs, note: "实测可用 (\(Int(latencyMs)) ms)")
             }
             let err = classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact)
-            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(err.localizedDescription)")
+            return classifyProbeFailure(err, latencyMs: latencyMs)
         } catch {
             let latencyMs = elapsedMs(since: start)
-            let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
-            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: "自动测活剔除：\(cleanMsg)")
+            return classifyProbeNetworkError(error, latencyMs: latencyMs, secrets: secretsToRedact)
         }
     }
 }

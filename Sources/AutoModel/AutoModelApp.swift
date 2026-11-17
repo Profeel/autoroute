@@ -112,8 +112,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusButtonAppearance() {
         guard let button = statusItem?.button else { return }
         let symbolName = engine.proxyState.isRunning ? "arrow.triangle.branch" : "exclamationmark.triangle"
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Auto Model")
-        button.toolTip = "Auto Model — \(engine.proxyState.statusText) · 策略: \(engine.config.policy.activeStrategy.displayName)"
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "AutoRoute")
+        button.toolTip = "AutoRoute — \(engine.proxyState.statusText) · 策略: \(engine.config.policy.activeStrategy.displayName)"
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {
@@ -150,7 +150,7 @@ struct AutoModelApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Window("Auto Model — 本地多模型路由器", id: "main") {
+        Window("AutoRoute — 本地多模型路由器", id: "main") {
             MainContentView(engine: appDelegate.engine, navigationState: appDelegate.navigationState)
                 .frame(minWidth: 980, minHeight: 660)
         }
@@ -346,7 +346,7 @@ struct MainContentView: View {
         HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-            Text("本地代理端口 127.0.0.1:\(occupiedPort) 已被其他程序占用，外部应用暂时无法连接到 Auto Model。")
+            Text("本地代理端口 127.0.0.1:\(occupiedPort) 已被其他程序占用，外部应用暂时无法连接到 AutoRoute。")
                 .font(.callout)
             Spacer()
             if let suggested {

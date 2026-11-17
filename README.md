@@ -1,121 +1,123 @@
-# Auto Model
+# AutoRoute
 
-[MIT License](LICENSE)
+[简体中文](README.zh-CN.md) · [MIT License](LICENSE) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
-**Auto Model** 是一款开源的原生 macOS 多模型路由 App。它运行在用户本机的 `127.0.0.1` 上，作为 OpenAI 兼容的本地 API 代理：你在自己的 AI 客户端里填写本机地址并将模型设为 `auto`，Auto Model 会根据用户配置的策略和请求特征在本机完成模型选择并转发请求，并在 Mac App 中为你保留一张可核对的「**路由收据**」。
+AutoRoute is an open-source, native macOS router for multiple model providers. It exposes a local `127.0.0.1` API to your coding agents, chooses a model according to your policy and request capabilities, forwards the request to your configured upstream, and keeps an inspectable local routing receipt.
 
-开源版无需注册账号、无需连接托管服务、无强制遥测。
+There is no hosted control plane, account requirement, or mandatory telemetry. You supply the upstream providers and credentials.
 
----
+## Why AutoRoute?
 
-## 核心特性（v1）
+- **One local endpoint, three tiers:** use `auto`, `auto/low`, `auto/medium`, or `auto/high` instead of rewiring every client.
+- **Deterministic constraints first:** tools, vision, context size, price caps, health, cooldowns, ordered fallbacks, and session stickiness are evaluated locally.
+- **Evidence instead of marketing:** receipts separate routing time, TTFT, total latency, upstream-reported usage, local estimates, retries, and missing prices.
+- **Agent-aware without losing compatibility:** stable identities such as `auto/agent/codex` support per-Agent policy and budgets while legacy `auto` configurations continue to work.
 
-- **原生 macOS App (SwiftUI + AppKit)**：主窗口 + 菜单栏状态入口，自适应系统浅色/深色外观。
-- **供应商与模型目录**：接入任意 OpenAI 兼容模型厂商、中转站或本地服务（如 Ollama / LM Studio / vLLM）；支持测试连通性与自动拉取 `/v1/models`。
-- **本机模型自动发掘与主动测活剔除**：自动扫描本机已配置的 OpenCode、Codex CLI、LM Studio、Ollama 等模型配置与本地 OpenAI 端口；通过实际轻量请求测活，自动剔除额度耗尽、已下线或超时的不可用模型。
-- **低 / 中 / 高三档模型配置与用户自定义**：基于测活可用模型自动推荐并分配 **低档 (`auto/low`)**、**中档 (`auto/medium`)**、**高档 (`auto/high`)** 模型；支持在界面随时下拉修改任意档位，不可用模型被剔除时自动替补健康模型。
-- **类 Magpie 多 Agent 一键配置**：自动检测 `~/.codex/config.toml`、`~/.config/opencode/opencode.json`、`~/.hermes/config.yaml`、`~/.claude/settings.json` 及 Shell/Continue 环境，支持自定义每个 Agent 绑定的模型/档位、安全备份原配置并一键注入本地网关，随时一键断开恢复原始配置。
-- **API Key 安全保存**：所有供应商密钥均保存在 **macOS Keychain**，绝不写入配置文件、调用历史或导出收据。
-- **本机确定性路由器**：
-  - 先按硬约束过滤（启用状态、供应商可用性、`tools` 能力、`vision` 能力、上下文上限、输入/输出价格上限）。
-  - 开箱即用三套策略：**省钱优先**、**均衡模式**、**质量优先**，支持固定模型、默认回退模型、多轮会话粘性（避免无意义切换破坏缓存）与失败自动重试。
-  - 预留 `RoutingDeciderPlugin` 可替换接口，未来可作为可选插件扩展 Jev、本地小模型或自定义决策器；默认不向任何第三方决策模型发送请求。
-- **可核对的路由收据**：
-  - 分开展示：**路由判断耗时**、**上游首字时间 (TTFT)**、**总完成时间**。
-  - 分开展示：**上游实测用量**（若上游未返回 `usage` 则明确标注本地估算及方法）、**按用户单价计算的费用**（未配置单价时显示“无法计算费用”）、**失败重试附加成本**。
-  - **诚实对照**：仅在存在真实历史样本（标注「历史估算」）或测试台主动运行 A/B 对照（标注「实测对照」）时才展示对比节省，绝不用未运行模型的想象耗时相减。
-- **隐私控制**：调用记录保存在本机，支持一键清空历史、脱敏导出收据 JSON，以及关闭请求/响应正文记录。
+## 60-second demo
 
----
+The scripted walkthrough covers **discover → connect → request → receipt → fallback**, plus an optional repeatable A/B run. It uses the built-in loopback mock for an offline demonstration and labels it as such.
 
-## 环境要求与构建
+[Open the 60-second demo and recording script](docs/demo/60-second-demo.md). No prerecorded video or official benchmark is claimed; run the steps locally to produce real evidence.
 
-- macOS 14.0+（已在 Apple Silicon macOS + Swift 6.2.3 / Xcode 26.2 下构建验证）
-- Swift 5.10+ / Xcode Command Line Tools
+The following screenshots come from the real app UI running with an isolated temporary configuration and only the built-in loopback mock. They demonstrate navigation and receipt formats, not real-provider performance or savings.
 
-### 运行测试
+![AutoRoute first-run onboarding with local-only API details and offline mock option](docs/assets/onboarding.png)
+
+![Three simulated model tiers and routing policy controls in the AutoRoute main window](docs/assets/routing-tiers.png)
+
+## Supported agents and protocols
+
+One-click backup/connect/restore is available for Codex, Claude Code, OpenCode, Hermes, and Shell/Continue. Guides:
+
+- [Codex](docs/integrations/codex.md)
+- [Claude Code](docs/integrations/claude-code.md)
+- [OpenCode](docs/integrations/opencode.md)
+
+![Agent integration page showing isolated configuration paths and backup, preview, connect, and restore controls](docs/assets/agent-integration.png)
+
+Local endpoints:
+
+| Endpoint | Compatibility |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI Chat Completions, JSON and SSE |
+| `POST /v1/responses` | OpenAI Responses, JSON and SSE, including native Responses routing where required |
+| `POST /v1/messages` | Anthropic Messages, JSON and SSE |
+| `GET /v1/models` | Legacy tiers, stable Agent aliases, and enabled concrete models |
+| `GET /health`, `GET /v1/health` | Minimal anonymous health response |
+
+Text, tool calls, vision messages, reasoning content, and usage extraction are supported within the documented adapter limits. Embeddings, image generation, audio, and `n > 1` are not implemented; unsupported requests receive an explicit error rather than silent degradation.
+
+## Install
+
+Requirements: macOS 14+, Swift 5.10+ or Xcode Command Line Tools. The verified development environment is Apple Silicon with Swift 6.2.3.
 
 ```bash
+git clone <your-authorized-repository-url> autoroute
+cd autoroute
 swift test
-```
-
-### 构建并打包 `.app`
-
-```bash
 bash macos/build_app.sh
-open dist/AutoModel.app
+open dist/AutoRoute.app
 ```
 
-构建产物位于 `dist/AutoModel.app`。
+`macos/build_app.sh` creates `dist/AutoRoute.app`. Without `DEVELOPER_ID_APPLICATION`, it uses an **ad-hoc signature for local development only**. See the [release checklist](docs/release/RELEASE_CHECKLIST.md) for Developer ID signing, notarization, ZIP/SHA-256, and Homebrew cask generation. A public Release or Homebrew installation is not implied by this source tree.
 
----
+## 5-minute Quickstart
 
-## 使用指南
-
-### 1. 添加供应商与模型
-
-1. 打开 **Auto Model**，在「供应商与模型」中添加你的 OpenAI 兼容中转站或本地服务（例如 `http://127.0.0.1:11434` 或 `https://your-relay.example.com/v1`）。
-2. 输入 API Key（会存入 macOS Keychain），点击 **测试连接 & 拉取模型** 验证连通性。
-3. 至少添加两个可用模型，配置输入/输出单价（不填则显示“无法计算费用”）、上下文窗口、能力标签（如 `工具调用`、`视觉图像`、`代码工程`）与默认用途。
-
-### 2. 在测试台验证
-
-切换到「测试台」，发送普通或流式（SSE）请求，确认上游正常返回，并在右侧查看实时生成的「路由收据」。
-
-### 3. 连接第三方 AI 应用
-
-本地代理默认监听 `http://127.0.0.1:8765`（可在「设置」中修改端口）：
-
-- **Base URL**: `http://127.0.0.1:8765/v1`
-- **API Key**: 任意非空占位字符串（例如 `local-auto-model`）
-- **Model**: `auto`（按任务与策略自动映射三档），或显式指定 `auto/low`、`auto/medium`、`auto/high`，也可填写具体模型 ID 直连转发。
-- **自动接入本地 Agent**：在 App 左侧进入「Agent 自动配置」，无需手动修改配置文件即可一键写入或恢复 Codex、OpenCode、Hermes 等应用。
-
-示例（`curl` 流式调用）：
+1. **Discover or add a provider.** In the app, explicitly choose local discovery or add an OpenAI-compatible provider. Discovery reads supported local Agent configuration and sends lightweight health requests only after your action. Provider keys are stored in macOS Keychain.
+2. **Confirm tiers and policy.** Assign healthy low/medium/high models and choose cost-first, balanced, or quality-first routing. Missing prices remain unknown; they are never treated as free.
+3. **Copy the local credential.** Open Settings and copy the Base URL and local API token. This random Keychain-backed token is different from provider API keys.
+4. **Connect an Agent or use curl.** One-click integration previews changes, backs up existing configuration, and can restore it. Stable Agent aliases include `auto/agent/codex`, `auto/agent/claudeCode`, and `auto/agent/opencode`, with optional `/low`, `/medium`, or `/high` suffixes.
+5. **Validate through a real socket.** Onboarding sends `URLSession → 127.0.0.1 → authenticated proxy → upstream`. It warns about possible upstream charges. The mock path is marked **demo** and does not complete real onboarding or count as measured savings.
 
 ```bash
-curl -N http://127.0.0.1:8765/v1/chat/completions \
+export AUTOROUTE_BASE_URL='http://127.0.0.1:8765/v1'
+export AUTOROUTE_API_TOKEN='paste-the-token-copied-from-AutoRoute-Settings'
+curl -N "$AUTOROUTE_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $AUTOROUTE_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "auto",
     "stream": true,
-    "messages": [{"role": "user", "content": "用三句话解释 Raft 共识算法"}]
+    "messages": [{"role": "user", "content": "Explain Raft consensus in three sentences."}]
   }'
 ```
 
-每个响应都会附带 `X-AutoModel-Executed-Model`、`X-AutoModel-Strategy`、`X-AutoModel-Policy-Version`、`X-AutoModel-Decision-Ms` 等响应头，同时 JSON chunk 中的 `model` 字段会反映实际执行的模型 ID。
+All endpoints except minimal health checks require the real local token via `Authorization: Bearer` or `x-api-key`. Arbitrary placeholders from older builds are not accepted.
 
----
+## Security and privacy
 
-## 数据流向说明
+- The server binds only to `127.0.0.1`, validates Host and Origin, compares tokens in constant time, and does not grant wildcard CORS.
+- Provider keys and the local API token use separate Keychain entries. Do not commit tokens, configuration exports, private prompts, or unredacted receipts.
+- If the local token cannot be persisted, AutoRoute keeps only a per-process random fallback and visibly blocks proxy startup and Agent writes until Keychain persistence is repaired.
+- Request/response body recording defaults to **off**. Existing explicit choices are preserved during migration. Derived prompt summaries and persisted upstream error bodies are also removed when body recording is disabled; only a fixed error category and HTTP status remain in history/config.
+- Routing receipts, the budget ledger, and minimal onboarding funnel state remain local. Settings can view, confirm-clear, and actively export aggregate metrics with schema and definition versions; failed clears are surfaced and do not claim success.
+- Local metrics do not contain prompts, code, responses, tokens, or advertising identifiers and do not start additional network requests. Demo and legacy-unclassified receipts are separated from real-route metrics.
+- Monthly global and per-Agent budgets use a durable local ledger independent of the capped UI history, so older spending still enforces the hard limit. Explicit demo receipts never count toward budgets. The settings warning threshold is non-blocking; only the hard limit rejects requests before upstream execution. In-flight work, delayed usage, and price changes can still overspend; always reconcile with provider billing.
 
+See [SECURITY.md](SECURITY.md) for reporting and [docs/development/P0-P2-DEVELOPMENT.md](docs/development/P0-P2-DEVELOPMENT.md) for the acceptance contract.
+
+## Repeatable A/B and cost accounting
+
+The Test Bench uses only the auditable interleaved A/B runner to alternate `auto` and a fixed baseline over independent sessions. Normal one-off requests never call a hidden baseline. Each side creates a CallRecord and passes through budget, usage, and retry accounting; the report stores sample/policy/Agent metadata, non-sensitive request parameters, model IDs, timestamps, retries, routing/TTFT/total latency, usage source, and cost status—not prompts or response bodies.
+
+Measured and estimated differences are reported separately per attempt, so an estimated retry cannot be counted as measured cost. Real A/B cost metrics accept only pairs where both sides use upstream-reported usage without estimated retries. Missing usage or prices stay missing. “Not assessed” quality means the report cannot claim equivalent quality. A real-upstream report must be generated by the user; the repository contains no fabricated official score.
+
+![Offline mock response beside its routing receipt, token usage, latency, and estimated cost](docs/assets/routing-receipt.png)
+
+![Interleaved local A/B report with independent sessions, sample version, and explicit unassessed-quality warning](docs/assets/ab-report.png)
+
+## Build, test, and contribute
+
+```bash
+swift test
+bash macos/build_app.sh
+git diff --check
+codesign --verify --deep --strict dist/AutoRoute.app
+bash macos/package_app.sh
 ```
-第三方 AI 应用 ──(http://127.0.0.1:8765/v1/chat/completions)──▶ Auto Model 本地代理
-                                                                   │
-                                       [本机硬约束过滤 + 策略评分] ──┘
-                                                                   │
-                                       (读取 macOS Keychain 密钥)  ▼
-                                                         用户配置的上游供应商
-                                                                   │
-                                                                   ▼
-                                           响应透传回调用方 + 本机生成路由收据
-```
 
-所有路由判断和历史存储均在用户本机执行，除用户配置的目标模型供应商外，不会向任何其他服务端发送数据。
+CI runs the complete test suite without filtering out security, migration, budget, A/B, or metrics tests. See [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), [CHANGELOG.md](CHANGELOG.md), and [Good First Issue candidates](docs/community/GOOD_FIRST_ISSUES.md).
 
----
+## License
 
-## 兼容范围与已知限制
-
-- **已实现**：
-  - `GET /health`、`GET /v1/health`
-  - `GET /v1/models`（返回 `auto`、`auto/low`、`auto/medium`、`auto/high` 及已启用的配置模型）
-  - `POST /v1/chat/completions`（OpenAI Chat Completions 普通 JSON 与流式 SSE 转发、工具调用、视觉多模态消息、`reasoning_content` 提取）
-  - `POST /v1/messages`（Anthropic Messages API 兼容转发，支持普通 JSON 与流式 SSE，适配 Claude Code 等客户端）
-  - `POST /v1/responses`（OpenAI Responses API 兼容转发，支持普通 JSON 与流式 SSE，适配新版 Codex / Responses 客户端）
-- **暂未实现（返回 `501 Not Implemented`）**：
-  - `POST /v1/embeddings`、图片生成等非对话接口
-- **参数限制**：
-  - 暂不支持 `audio` / `modalities: ["audio"]` 或 `n > 1` 多候选采样（会返回明确的 `400` 错误，不会静默忽略）。
-- **费用计算前提**：
-  - 费用按用户填写的每百万 tokens 单价计算，仅作对账估算；未填写单价或上游未返回/流式未携带 `usage` 时，会在收据中如实标记。
+AutoRoute is available under the [MIT License](LICENSE). Internal target names `AutoModel` and bundle identifier `org.automodel.app` remain for upgrade compatibility; the user-visible app is AutoRoute.

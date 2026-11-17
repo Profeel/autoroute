@@ -19,6 +19,9 @@ struct AgentIntegrationView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                if !engine.isLocalAPITokenPersistent {
+                    localCredentialBlockingBanner
+                }
                 headerBannerCard
 
                 if let feedbackMessage {
@@ -60,7 +63,7 @@ struct AgentIntegrationView: View {
                     }
                     .buttonStyle(.borderedProminent)
                 }
-                Text("以下为写入前（当前磁盘内容）与写入后（将注入 Auto Model 网关与三档配置）的对比：")
+                Text("以下为写入前（当前磁盘内容）与写入后（将注入 AutoRoute 网关与三档配置）的对比：")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack(alignment: .top, spacing: 12) {
@@ -99,12 +102,41 @@ struct AgentIntegrationView: View {
         }
     }
 
+    private var localCredentialBlockingBanner: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("本地 API token 未持久化，Agent 接入已阻断", systemImage: "exclamationmark.lock.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.red)
+                Text(engine.localAPITokenPersistenceError ?? "无法确认本地 token 已保存到 Keychain。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("修复前不会写入任何 Agent 配置，也不会自动启动代理；请先重试持久化，避免 Agent 使用重启后失效的临时 token。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                Button("检查并重试保存凭据") {
+                    do {
+                        try engine.retryPersistingLocalAPIToken()
+                        feedbackIsError = false
+                        feedbackMessage = "本地 token 已持久化，现在可以接入 Agent。"
+                    } catch {
+                        feedbackIsError = true
+                        feedbackMessage = "仍无法持久化本地凭据：\(error.localizedDescription)"
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(6)
+        }
+    }
+
     private var headerBannerCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("一键将 Auto Model 本地网关与低 / 中 / 高三档模型配置到各 AI Agent")
+                        Text("一键将 AutoRoute 本地网关与低 / 中 / 高三档模型配置到各 AI Agent")
                             .font(.headline)
                         Text("类似 Magpie 的接管方式：首次注入前自动备份原配置文件（保留现有供应商、MCP 与项目信任列表），支持随时一键断开并还原。")
                             .font(.caption)
@@ -124,7 +156,7 @@ struct AgentIntegrationView: View {
                         let res = engine.applyAllInstalledAgents()
                         if res.errors.isEmpty {
                             feedbackIsError = false
-                            feedbackMessage = "已成功将 Auto Model 配置写入 \(res.succeeded) 个已检测到的 Agent。"
+                            feedbackMessage = "已成功将 AutoRoute 配置写入 \(res.succeeded) 个已检测到的 Agent。"
                         } else {
                             feedbackIsError = true
                             feedbackMessage = "完成 \(res.succeeded) 个，失败：\(res.errors.joined(separator: "；"))"
@@ -133,6 +165,7 @@ struct AgentIntegrationView: View {
                         Label("一键配置全部已安装 Agent", systemImage: "bolt.fill")
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(!engine.isLocalAPITokenPersistent)
                 }
 
                 Divider()
@@ -194,7 +227,7 @@ struct AgentIntegrationView: View {
                                 .font(.headline)
 
                             if status.isConnectedToAutoModel {
-                                pillBadge("已接入 Auto Model", color: .green)
+                                pillBadge("已接入 AutoRoute", color: .green)
                             } else if status.isInstalled {
                                 pillBadge("已检测到本地配置", color: .blue)
                             } else {
@@ -353,18 +386,19 @@ struct AgentIntegrationView: View {
                         do {
                             let updated = try engine.applyAgentIntegration(kind: status.kind)
                             feedbackIsError = false
-                            feedbackMessage = "已成功将 Auto Model 写入「\(updated.kind.displayName)」(\(updated.configFilePath))。"
+                            feedbackMessage = "已成功将 AutoRoute 写入「\(updated.kind.displayName)」(\(updated.configFilePath))。"
                         } catch {
                             feedbackIsError = true
                             feedbackMessage = "配置 \(status.kind.displayName) 失败: \(error.localizedDescription)"
                         }
                     } label: {
                         Label(
-                            status.isConnectedToAutoModel ? "更新并重新写入配置" : "一键接入 Auto Model",
+                            status.isConnectedToAutoModel ? "更新并重新写入配置" : "一键接入 AutoRoute",
                             systemImage: "arrow.right.circle.fill"
                         )
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(!engine.isLocalAPITokenPersistent)
 
                     Button {
                         do {
@@ -372,6 +406,7 @@ struct AgentIntegrationView: View {
                                 kind: status.kind,
                                 binding: engine.binding(for: status.kind),
                                 proxyPort: engine.config.proxySettings.port,
+                                localAPIToken: engine.localAPIToken,
                                 resolvedTierDisplayNames: engine.resolvedTierDisplayNames()
                             )
                             previewPayload = ConfigPreviewPayload(kind: status.kind, before: preview.before, after: preview.after)
@@ -383,6 +418,7 @@ struct AgentIntegrationView: View {
                         Label("预览变更", systemImage: "doc.text.magnifyingglass")
                     }
                     .buttonStyle(.bordered)
+                    .disabled(!engine.isLocalAPITokenPersistent)
 
                     Button(role: .destructive) {
                         do {

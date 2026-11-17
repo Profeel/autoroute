@@ -41,6 +41,9 @@ struct MenuBarPopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if !engine.isLocalAPITokenPersistent {
+                localCredentialWarningSection
+            }
             headerSection
             impactBannerSection
             Divider()
@@ -55,6 +58,22 @@ struct MenuBarPopoverView: View {
         .frame(width: 360)
     }
 
+    private var localCredentialWarningSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("本地凭据未持久化", systemImage: "exclamationmark.lock.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+            Text("代理启动与 Agent 接入已禁止；请在设置中修复 Keychain 后重试。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
     private var headerSection: some View {
         HStack(spacing: 10) {
             Circle()
@@ -63,7 +82,7 @@ struct MenuBarPopoverView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text("Auto Model")
+                    Text("AutoRoute")
                         .font(.headline)
                     Text(engine.proxyState.isRunning ? "运行中" : "已停止")
                         .font(.caption2.weight(.semibold))
@@ -105,6 +124,7 @@ struct MenuBarPopoverView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .disabled(!engine.proxyState.isRunning && !engine.isLocalAPITokenPersistent)
         }
     }
 

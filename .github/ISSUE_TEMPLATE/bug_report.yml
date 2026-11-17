@@ -1,0 +1,49 @@
+name: Bug report
+description: 报告可复现的功能或构建问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **不要提交 API key、本地 token、私有提示词/代码/响应正文、Keychain 或未脱敏配置备份。**安全漏洞请使用 Security 私密报告。
+  - type: input
+    id: version
+    attributes:
+      label: AutoRoute 版本与 commit
+      placeholder: 0.1.0 (1), commit ...
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: macOS / Swift / Agent 版本
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现步骤
+      placeholder: 1. ... 2. ... 3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期与实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏收据与日志
+      description: 仅附脱敏路由收据、HTTP 状态和必要日志；移除 Authorization、x-api-key、正文和个人路径。
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已移除所有 key、token、正文和私人信息
+          required: true
+        - label: 我已使用当前版本复现，并检查已有 Issues
+          required: true

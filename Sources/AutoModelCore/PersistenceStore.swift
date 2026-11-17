@@ -4,6 +4,8 @@ public final class LocalPersistenceStore: @unchecked Sendable {
     public let baseDirectoryURL: URL
     public let configFileURL: URL
     public let historyFileURL: URL
+    public let metricsFileURL: URL
+    public let budgetLedgerFileURL: URL
 
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -23,6 +25,8 @@ public final class LocalPersistenceStore: @unchecked Sendable {
         self.baseDirectoryURL = resolvedDir
         self.configFileURL = resolvedDir.appendingPathComponent("config.json")
         self.historyFileURL = resolvedDir.appendingPathComponent("history.json")
+        self.metricsFileURL = resolvedDir.appendingPathComponent("local-metrics.json")
+        self.budgetLedgerFileURL = resolvedDir.appendingPathComponent("budget-ledger.json")
 
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -76,10 +80,64 @@ public final class LocalPersistenceStore: @unchecked Sendable {
         }
     }
 
+    public func loadBudgetLedger() -> BudgetLedger? {
+        queue.sync {
+            guard fileManager.fileExists(atPath: budgetLedgerFileURL.path),
+                  let data = try? Data(contentsOf: budgetLedgerFileURL),
+                  let ledger = try? decoder.decode(BudgetLedger.self, from: data) else {
+                return nil
+            }
+            return ledger
+        }
+    }
+
+    public func saveBudgetLedger(_ ledger: BudgetLedger) throws {
+        try queue.sync {
+            try fileManager.createDirectory(at: baseDirectoryURL, withIntermediateDirectories: true)
+            let data = try encoder.encode(ledger)
+            try data.write(to: budgetLedgerFileURL, options: .atomic)
+        }
+    }
+
+    public func clearBudgetLedger() throws {
+        try queue.sync {
+            if fileManager.fileExists(atPath: budgetLedgerFileURL.path) {
+                try fileManager.removeItem(at: budgetLedgerFileURL)
+            }
+        }
+    }
+
     public func clearHistory() throws {
         try queue.sync {
             if fileManager.fileExists(atPath: historyFileURL.path) {
                 try fileManager.removeItem(at: historyFileURL)
+            }
+        }
+    }
+
+    public func loadOnboardingFunnel() -> LocalOnboardingFunnelState {
+        queue.sync {
+            guard fileManager.fileExists(atPath: metricsFileURL.path),
+                  let data = try? Data(contentsOf: metricsFileURL),
+                  let state = try? decoder.decode(LocalOnboardingFunnelState.self, from: data) else {
+                return LocalOnboardingFunnelState()
+            }
+            return state
+        }
+    }
+
+    public func saveOnboardingFunnel(_ state: LocalOnboardingFunnelState) throws {
+        try queue.sync {
+            try fileManager.createDirectory(at: baseDirectoryURL, withIntermediateDirectories: true)
+            let data = try encoder.encode(state)
+            try data.write(to: metricsFileURL, options: .atomic)
+        }
+    }
+
+    public func clearMetrics() throws {
+        try queue.sync {
+            if fileManager.fileExists(atPath: metricsFileURL.path) {
+                try fileManager.removeItem(at: metricsFileURL)
             }
         }
     }

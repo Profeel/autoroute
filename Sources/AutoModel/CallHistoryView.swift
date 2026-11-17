@@ -15,8 +15,12 @@ struct CallHistoryView: View {
     @State private var modelFilter: String? = nil
     @State private var searchText: String = ""
     @State private var showAdvancedPolicyPopover = false
+    @State private var activeTierPopover: ModelTier? = nil
+    @State private var showTrafficDetailPopover = false
     @State private var maxInInput: String = ""
     @State private var maxOutInput: String = ""
+    @State private var clearHistoryError: String?
+    @State private var showClearHistoryError = false
 
     enum FilterMode: String, CaseIterable {
         case all = "全部"
@@ -26,7 +30,6 @@ struct CallHistoryView: View {
 
     enum GroupMode: String, CaseIterable {
         case bySession = "按会话"
-        case byComplexity = "按复杂度"
         case chronological = "按时间"
     }
 
@@ -43,13 +46,6 @@ struct CallHistoryView: View {
         let totalCostUSD: Double?
         let hasFailure: Bool
         let latestTimestamp: Date
-    }
-
-    private struct ComplexityGroup: Identifiable {
-        let id: String
-        let level: RoutingComplexityLevel
-        let summaryLine: String
-        let records: [CallRecord]
     }
 
     private var hasActiveExtraFilters: Bool {
@@ -167,9 +163,12 @@ struct CallHistoryView: View {
                 }
             }
 
-            let mergedPathText = segments.map { seg in
-                seg.count > 1 ? "\(seg.model) ×\(seg.count)" : seg.model
-            }.joined(separator: " → ")
+            let mergedPathText: String = {
+                if segments.isEmpty { return "" }
+                if segments.count == 1 { return segments[0].model }
+                if segments.count == 2 { return "\(segments[0].model) → \(segments[1].model)" }
+                return "\(segments.first!.model) → … → \(segments.last!.model)"
+            }()
 
             let totalDur = chronological.map(\.totalCompletionMs).reduce(0, +)
             let totalTok = chronological.compactMap { $0.finalUsage?.totalTokens }.reduce(0, +)
@@ -197,26 +196,6 @@ struct CallHistoryView: View {
         .sorted { $0.latestTimestamp > $1.latestTimestamp }
     }
 
-    private var complexityGroups: [ComplexityGroup] {
-        let grouped = Dictionary(grouping: baseFilteredRecords, by: \.routingComplexityLevel)
-        return RoutingComplexityLevel.allCases.compactMap { level in
-            guard let items = grouped[level], !items.isEmpty else { return nil }
-            let sorted = items.sorted { $0.timestamp > $1.timestamp }
-            var counts: [String: Int] = [:]
-            for r in sorted { counts[r.executedModelShortLabel, default: 0] += 1 }
-            let breakdownText = counts
-                .sorted { $0.value > $1.value }
-                .map { "\($0.key) ×\($0.value)" }
-                .joined(separator: "、")
-            return ComplexityGroup(
-                id: level.rawValue,
-                level: level,
-                summaryLine: "\(sorted.count) 次 · \(breakdownText)",
-                records: sorted
-            )
-        }
-    }
-
     private var selectedRecord: CallRecord? {
         if let id = selectedRecordID, let found = baseFilteredRecords.first(where: { $0.id == id }) {
             return found
@@ -231,6 +210,9 @@ struct CallHistoryView: View {
         Binding<String?>(
             get: {
                 if let current = selectedRecord {
+                    if let matched = sessionItems.first(where: { $0.recordsChronological.contains(where: { $0.id == current.id }) }) {
+                        return matched.id
+                    }
                     return current.sessionGroupKey
                 }
                 return sessionItems.first?.id
@@ -269,36 +251,25 @@ struct CallHistoryView: View {
                 onConsumeRequestedRecord?()
             }
         }
+        .alert("清空失败", isPresented: $showClearHistoryError) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(clearHistoryError ?? "调用历史未能删除，请检查本机存储权限。")
+        }
     }
 
     // MARK: - Clash Verge Style Home Header
 
     private var homeDashboardHeader: some View {
-        HStack(alignment: .top, spacing: 12) {
-            autoCoreConfigCard
-                .frame(maxWidth: .infinity)
-            trafficOverviewCard
-                .frame(maxWidth: .infinity)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Color(.windowBackgroundColor))
-    }
-
-    private var autoCoreConfigCard: some View {
         let healthyModels = engine.healthyAvailableModels()
         let healthyIDs = Set(healthyModels.map(\.id))
-        let providersByID = Dictionary(uniqueKeysWithValues: engine.config.providers.map { ($0.id, $0) })
+        let totalCost = engine.callHistory.compactMap(\.totalCostUSD).reduce(0, +)
+        let impact = engine.routingImpactSummary(todayOnly: false)
 
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Label("Auto 路由核心配置", systemImage: "arrow.triangle.branch")
-                        .font(.subheadline.weight(.semibold))
-
-                    Spacer(minLength: 4)
-
-                    // Compact 3-strategy segmented pills
+        return HStack(spacing: 10) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    // 1. Strategy preset pills
                     HStack(spacing: 3) {
                         ForEach(RoutingStrategyPreset.allCases, id: \.self) { preset in
                             let selected = engine.config.policy.activeStrategy == preset
@@ -307,9 +278,9 @@ struct CallHistoryView: View {
                             } label: {
                                 Text(strategyShortTitle(preset))
                                     .font(.caption2.weight(selected ? .semibold : .regular))
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 3)
-                                    .background(selected ? Color.accentColor.opacity(0.16) : Color(.controlBackgroundColor))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(selected ? Color.accentColor.opacity(0.18) : Color(.controlBackgroundColor))
                                     .foregroundStyle(selected ? Color.accentColor : .secondary)
                                     .clipShape(Capsule())
                             }
@@ -317,95 +288,238 @@ struct CallHistoryView: View {
                         }
                     }
 
-                    Button("自动配平") {
-                        engine.autoConfigureModelTiers(forceResetManual: true)
+                    Divider().frame(height: 18)
+
+                    // 2. Clickable 3-tier model pills (click to change primary / backups)
+                    HStack(spacing: 6) {
+                        ForEach(ModelTier.allCases) { tier in
+                            let assigned = engine.model(for: tier)
+                            let cooldownSecs = assigned.flatMap { engine.cooldownRemainingSeconds(for: $0.id) }
+                            let isHealthy = assigned.map { healthyIDs.contains($0.id) } ?? false
+                            let tierColor: Color = (tier == .low ? .green : (tier == .medium ? .blue : .purple))
+                            let backupCount = engine.config.policy.backupModelIDs(for: tier).count
+
+                            Button {
+                                activeTierPopover = (activeTierPopover == tier) ? nil : tier
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Circle()
+                                        .fill(assigned == nil ? Color.gray.opacity(0.4) : ((isHealthy && cooldownSecs == nil) ? tierColor : Color.orange))
+                                        .frame(width: 6, height: 6)
+                                    Text(tier.shortName)
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundStyle(tierColor)
+                                    Text(assigned.map { shortModelName($0.displayName) } ?? "未分配")
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    if let cooldownSecs {
+                                        Text("冷却\(cooldownSecs)s")
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .foregroundStyle(.orange)
+                                    } else if backupCount > 0 {
+                                        Text("+\(backupCount)")
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 8, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color(.controlBackgroundColor))
+                                .clipShape(Capsule())
+                                .overlay(
+                                    Capsule()
+                                        .strokeBorder(tierColor.opacity(0.25), lineWidth: 0.8)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .popover(
+                                isPresented: Binding(
+                                    get: { activeTierPopover == tier },
+                                    set: { if !$0 && activeTierPopover == tier { activeTierPopover = nil } }
+                                ),
+                                arrowEdge: .bottom
+                            ) {
+                                tierConfigPopover(for: tier)
+                            }
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                    .disabled(healthyModels.isEmpty)
 
                     Button {
                         syncPriceCapInputs()
                         showAdvancedPolicyPopover.toggle()
                     } label: {
-                        Image(systemName: "gearshape")
+                        Image(systemName: "slider.horizontal.3")
                             .font(.caption)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
-                    .help("高级路由规则与价格上限")
+                    .help("高级路由规则、防抖开关与三档锁死设置")
                     .popover(isPresented: $showAdvancedPolicyPopover, arrowEdge: .bottom) {
                         advancedPolicyPopoverContent
                     }
+                }
+            }
 
-                    Button {
-                        onNavigateToProviders?()
-                    } label: {
-                        HStack(spacing: 2) {
-                            Text("供应商")
-                            Image(systemName: "chevron.right")
+            // 3. Headline savings/speed strip (click to open full traffic & 20-turn trend popover)
+            Button {
+                showTrafficDetailPopover.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Text(AutoModelFormatter.formatUSD(totalCost))
+                        .font(.caption.weight(.bold).monospacedDigit())
+                        .foregroundStyle(.primary)
+
+                    if let impact {
+                        let costSavedPositive = impact.costSavedUSD >= 0
+                        if let pct = impact.costSavingsPercent {
+                            Text(String(format: "%@ %@%.1f%%", costSavedPositive ? "省费" : "多花", pct >= 0 ? "-" : "+", abs(pct)))
+                                .font(.caption2.weight(.semibold).monospacedDigit())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2.5)
+                                .background((costSavedPositive ? Color.green : Color.orange).opacity(0.14))
+                                .foregroundStyle(costSavedPositive ? Color.green : Color.orange)
+                                .clipShape(Capsule())
                         }
-                        .font(.caption2.weight(.semibold))
+                        if let speedPct = impact.speedGainPercent {
+                            Text(String(format: "速度 %@%.1f%%", speedPct >= 0 ? "+" : "-", abs(speedPct)))
+                                .font(.caption2.weight(.semibold).monospacedDigit())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2.5)
+                                .background(Color.blue.opacity(0.14))
+                                .foregroundStyle(Color.blue)
+                                .clipShape(Capsule())
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
+
+                    Image(systemName: "chart.xyaxis.line")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Color(.controlBackgroundColor).opacity(0.8))
+                .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .help("点击查看详细流量、20 轮趋势与 Top10% 长尾成本")
+            .popover(isPresented: $showTrafficDetailPopover, arrowEdge: .bottom) {
+                trafficOverviewCard
+                    .frame(width: 520)
+                    .padding(12)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color(.windowBackgroundColor))
+    }
+
+    private func tierConfigPopover(for tier: ModelTier) -> some View {
+        let healthyModels = engine.healthyAvailableModels()
+        let providersByID = Dictionary(uniqueKeysWithValues: engine.config.providers.map { ($0.id, $0) })
+        let assigned = engine.model(for: tier)
+        let cooldownSecs = assigned.flatMap { engine.cooldownRemainingSeconds(for: $0.id) }
+        let tierColor: Color = (tier == .low ? .green : (tier == .medium ? .blue : .purple))
+        let poolIDs = Set(engine.config.policy.modelIDs(for: tier))
+        let backups = engine.backupModels(for: tier)
+        let addableBackups = healthyModels.filter { !poolIDs.contains($0.id) }
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("\(tier.displayName)（\(tierEffortHint(tier))）")
+                    .font(.headline)
+                    .foregroundStyle(tierColor)
+                Spacer()
+                Button("自动配平") {
+                    engine.autoConfigureModelTiers(forceResetManual: true)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(healthyModels.isEmpty)
+            }
+
+            if let cooldownSecs {
+                Text("当前主模型正在限流/抖动冷却中（约 \(cooldownSecs)s 后自动恢复），请求会自动转由同档备选模型执行。")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("首选主模型").font(.caption).foregroundStyle(.secondary)
+                Picker(tier.shortName, selection: Binding(
+                    get: { engine.config.policy.modelID(for: tier) },
+                    set: { newID in
+                        engine.setTierModel(tier: tier, modelUUID: newID, isManual: newID != nil)
+                    }
+                )) {
+                    Text("未分配").tag(UUID?.none)
+                    ForEach(healthyModels) { m in
+                        let pName = providersByID[m.providerID]?.name ?? "未知"
+                        Text("\(shortModelName(m.displayName)) · \(pName)").tag(UUID?.some(m.id))
+                    }
+                    if let assigned, !healthyModels.contains(where: { $0.id == assigned.id }) {
+                        Text("\(shortModelName(assigned.displayName)) [不可用]").tag(UUID?.some(assigned.id))
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("失败自动切换备选池（按顺序）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if !addableBackups.isEmpty {
+                        Menu("+ 添加备选") {
+                            ForEach(addableBackups) { candidate in
+                                let cProvider = providersByID[candidate.providerID]?.name ?? "未知"
+                                Button("\(shortModelName(candidate.displayName)) · \(cProvider)") {
+                                    engine.addTierBackupModel(tier: tier, modelUUID: candidate.id)
+                                }
+                            }
+                        }
+                        .controlSize(.small)
+                    }
                 }
 
-                // 3-model slots (Low / Medium / High)
-                HStack(spacing: 8) {
-                    ForEach(ModelTier.allCases) { tier in
-                        let assigned = engine.model(for: tier)
-                        let isHealthy = assigned.map { healthyIDs.contains($0.id) } ?? false
-                        let tierColor: Color = (tier == .low ? .green : (tier == .medium ? .blue : .purple))
-                        let providerName = assigned.flatMap { providersByID[$0.providerID]?.name }
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 4) {
-                                Circle()
-                                    .fill(assigned == nil ? Color.gray.opacity(0.4) : (isHealthy ? Color.green : Color.orange))
-                                    .frame(width: 6, height: 6)
-                                Text("\(tier.shortName) · \(tierEffortHint(tier))")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(tierColor)
-                                Spacer()
-                                if engine.config.policy.isManual(for: tier) {
-                                    Text("手动")
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(.secondary)
-                                }
+                if backups.isEmpty {
+                    Text("尚未添加备选模型。主模型 429 限流或报错时将按策略回退。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(backups) { bk in
+                        let bkProv = providersByID[bk.providerID]?.name ?? "未知"
+                        HStack {
+                            Text("\(shortModelName(bk.displayName)) · \(bkProv)")
+                                .font(.caption)
+                            Spacer()
+                            Button {
+                                engine.removeTierBackupModel(tier: tier, modelUUID: bk.id)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                             }
-
-                            Picker(tier.shortName, selection: Binding(
-                                get: { engine.config.policy.modelID(for: tier) },
-                                set: { newID in
-                                    engine.setTierModel(tier: tier, modelUUID: newID, isManual: newID != nil)
-                                }
-                            )) {
-                                Text("未分配").tag(UUID?.none)
-                                ForEach(healthyModels) { m in
-                                    Text(shortModelName(m.displayName)).tag(UUID?.some(m.id))
-                                }
-                                if let assigned, !healthyModels.contains(where: { $0.id == assigned.id }) {
-                                    Text("\(shortModelName(assigned.displayName)) [不可用]").tag(UUID?.some(assigned.id))
-                                }
-                            }
-                            .labelsHidden()
-                            .controlSize(.small)
-                            .frame(maxWidth: .infinity)
-
-                            Text(providerName ?? "未指定供应商")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                            .buttonStyle(.plain)
                         }
-                        .padding(7)
-                        .background(Color(.controlBackgroundColor).opacity(0.65))
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color(.controlBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                     }
                 }
             }
-            .padding(2)
         }
+        .padding(14)
+        .frame(width: 320)
     }
 
     private var trafficOverviewCard: some View {
@@ -655,6 +769,14 @@ struct CallHistoryView: View {
                 get: { engine.config.policy.preferTierMappingInAuto },
                 set: { val in engine.updatePolicy { $0.preferTierMappingInAuto = val } }
             ))
+            Toggle("三段式防抖降档（高档规划后连续常规任务回落中档）", isOn: Binding(
+                get: { engine.config.policy.enablePhaseDowngradeHysteresis },
+                set: { val in engine.updatePolicy { $0.enablePhaseDowngradeHysteresis = val } }
+            ))
+            Toggle("严格仅限已配三档及备选模型（不越界使用其他模型）", isOn: Binding(
+                get: { engine.config.policy.strictThreeTierPoolOnly },
+                set: { val in engine.updatePolicy { $0.strictThreeTierPoolOnly = val } }
+            ))
 
             Divider()
 
@@ -880,10 +1002,15 @@ struct CallHistoryView: View {
                     .help("筛选")
 
                     Button {
-                        engine.clearCallHistory()
-                        selectedRecordID = nil
-                        complexityFilter = nil
-                        modelFilter = nil
+                        do {
+                            try engine.clearCallHistory()
+                            selectedRecordID = nil
+                            complexityFilter = nil
+                            modelFilter = nil
+                        } catch {
+                            clearHistoryError = error.localizedDescription
+                            showClearHistoryError = true
+                        }
                     } label: {
                         Image(systemName: "trash")
                             .foregroundStyle(.secondary)
@@ -918,28 +1045,6 @@ struct CallHistoryView: View {
                         sessionRow(session)
                             .tag(session.id)
                     }
-                case .byComplexity:
-                    List(selection: $selectedRecordID) {
-                        ForEach(complexityGroups) { group in
-                            Section {
-                                ForEach(group.records) { record in
-                                    recordRow(record)
-                                        .tag(record.id)
-                                }
-                            } header: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(group.level.displayName)
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(complexityColor(group.level))
-                                    Text(group.summaryLine)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                                .padding(.vertical, 2)
-                            }
-                        }
-                    }
                 case .chronological:
                     List(baseFilteredRecords, selection: $selectedRecordID) { record in
                         recordRow(record)
@@ -958,8 +1063,8 @@ struct CallHistoryView: View {
                     .frame(width: 7, height: 7)
 
                 Text(session.agentName)
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 6)
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 5)
                     .padding(.vertical, 1.5)
                     .background(Color.accentColor.opacity(0.14))
                     .foregroundStyle(Color.accentColor)
@@ -976,35 +1081,40 @@ struct CallHistoryView: View {
                     .foregroundStyle(.secondary)
             }
 
-            // Merged model path (no duplicate consecutive models)
-            Text(session.mergedPathText)
-                .font(.caption)
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-
             HStack(spacing: 6) {
-                Text("\(session.recordsChronological.count) 轮")
-                    .fontWeight(.medium)
+                Text(session.mergedPathText)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
                 if session.switchCount > 0 {
-                    Text("· 切换 \(session.switchCount) 次")
+                    Text("切\(session.switchCount)次")
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.purple.opacity(0.12))
                         .foregroundStyle(.purple)
+                        .clipShape(Capsule())
                 }
+
                 Spacer()
-                Text(AutoModelFormatter.formatMs(session.totalDurationMs))
-                    .monospacedDigit()
-                Text("·")
-                Text("\(formatTokenCount(session.totalTokens)) tok")
-                    .monospacedDigit()
-                if let cost = session.totalCostUSD {
+
+                HStack(spacing: 4) {
+                    Text("\(session.recordsChronological.count)轮")
                     Text("·")
-                    Text(AutoModelFormatter.formatUSD(cost))
-                        .monospacedDigit()
+                    Text("\(formatTokenCount(session.totalTokens))")
+                    if let cost = session.totalCostUSD {
+                        Text("·")
+                        Text(AutoModelFormatter.formatUSD(cost))
+                            .fontWeight(.medium)
+                    }
                 }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 3)
     }
 
     private func recordRow(_ record: CallRecord) -> some View {

@@ -1,3 +1,4 @@
+import AppKit
 import AutoModelCore
 import SwiftUI
 
@@ -9,8 +10,14 @@ struct TestBenchView: View {
     @State private var useStreaming: Bool = true
     @State private var includeToolsSample: Bool = false
     @State private var includeVisionSample: Bool = false
-    @State private var enableABBaseline: Bool = false
-    @State private var baselineModelID: UUID?
+        @State private var baselineModelID: UUID?
+    @State private var abRepetitions: Int = 3
+    @State private var abAgentKind: AgentKind?
+    @State private var abQualityMethod: ABQualityAssessmentMethod = .notAssessed
+    @State private var latestABReport: ABExperimentReport?
+    @State private var isRunningAB: Bool = false
+    @State private var showABConfirmation: Bool = false
+    @State private var abFeedback: String?
 
     @State private var isRunning: Bool = false
     @State private var streamedResponseText: String = ""
@@ -27,6 +34,16 @@ struct TestBenchView: View {
             if baselineModelID == nil {
                 baselineModelID = engine.config.models.first?.id
             }
+        }
+        .confirmationDialog(
+            "重复 A/B 将发送 \(abRepetitions * 2) 个真实上游请求，可能产生供应商费用。继续？",
+            isPresented: $showABConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("运行交错 A/B") {
+                Task { await runRepeatedAB() }
+            }
+            Button("取消", role: .cancel) {}
         }
     }
 
@@ -99,19 +116,6 @@ struct TestBenchView: View {
                 Toggle("附带 Tools", isOn: $includeToolsSample)
                 Toggle("附带 Vision 图片", isOn: $includeVisionSample)
 
-                Toggle("实测对照 (A/B)", isOn: $enableABBaseline)
-                    .help("同时向指定基准模型发送同一请求，获取真实的耗时与费用对比")
-
-                if enableABBaseline {
-                    Picker("对照模型", selection: $baselineModelID) {
-                        ForEach(enabledModels) { m in
-                            Text(m.displayName).tag(UUID?.some(m.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 170)
-                }
-
                 Spacer()
 
                 Button {
@@ -124,14 +128,78 @@ struct TestBenchView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isRunning || promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(isRunning || isRunningAB || promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
+
+            Divider()
+            abExperimentControls(enabledModels: enabledModels)
         }
         .padding(16)
     }
 
+    private func abExperimentControls(enabledModels: [ModelConfig]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Picker("固定基线", selection: $baselineModelID) {
+                    ForEach(enabledModels) { model in
+                        Text(model.displayName).tag(UUID?.some(model.id))
+                    }
+                }
+                .frame(width: 220)
+
+                Stepper("每侧重复 \(abRepetitions) 次", value: $abRepetitions, in: 1...10)
+                    .frame(width: 170)
+
+                Picker("质量评估", selection: $abQualityMethod) {
+                    Text("未评估").tag(ABQualityAssessmentMethod.notAssessed)
+                    Text("人工复核").tag(ABQualityAssessmentMethod.humanReview)
+                    Text("确定性精确匹配").tag(ABQualityAssessmentMethod.deterministicExactMatch)
+                }
+                .frame(width: 190)
+
+                Button {
+                    showABConfirmation = true
+                } label: {
+                    if isRunningAB {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("运行交错 A/B", systemImage: "arrow.triangle.swap")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isRunning || isRunningAB || baselineModelID == nil || promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            HStack(spacing: 10) {
+                Picker("A/B Agent 身份", selection: $abAgentKind) {
+                    Text("不指定（仅测试台）").tag(AgentKind?.none)
+                    ForEach(AgentKind.allCases) { kind in
+                        Text(kind.displayName).tag(AgentKind?.some(kind))
+                    }
+                }
+                .frame(width: 260)
+                Text("报告记录 Agent、策略版本与非敏感请求参数；真实请求仍按当前全局策略执行。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("每轮交替 auto 与固定基线的先后顺序，并为每次调用使用独立会话。两边除模型与会话标识外参数一致；报告不导出提示词或响应正文。普通单次请求不会隐式调用基线模型。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let abFeedback {
+                Text(abFeedback)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
     private var outputAndReceiptSection: some View {
-        HSplitView {
+        VStack(spacing: 0) {
+            if let latestABReport {
+                abReportSummary(latestABReport)
+                Divider()
+            }
+            HSplitView {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("上游响应正文")
@@ -186,7 +254,67 @@ struct TestBenchView: View {
                 }
             }
             .frame(minWidth: 420, idealWidth: 540)
+            }
         }
+    }
+
+    private func abReportSummary(_ report: ABExperimentReport) -> some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("A/B 报告 · \(report.sampleVersion) · \(report.samples.count) 次调用 · \(report.summary.comparablePricedPairs) 个有价配对")
+                    .font(.callout.weight(.semibold))
+                Text("实测成本差（基线 − auto）：\(formatOptionalUSD(report.summary.measuredCostDifferenceUSD)) · 本地估算差：\(formatOptionalUSD(report.summary.estimatedCostDifferenceUSD))")
+                    .font(.caption.monospacedDigit())
+                Text("平均总耗时差（基线 − auto）：\(report.summary.meanLatencyDifferenceMs.map { String(format: "%.1f ms", $0) } ?? "缺失")")
+                    .font(.caption.monospacedDigit())
+                Text("\(report.summary.costNote) \(report.summary.qualityNote)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("导出脱敏 JSON") { exportABReport() }
+                .buttonStyle(.bordered)
+        }
+        .padding(12)
+        .background(Color.accentColor.opacity(0.06))
+    }
+
+    private func runRepeatedAB() async {
+        guard let baselineModelID,
+              let baseline = engine.config.models.first(where: { $0.id == baselineModelID }) else {
+            abFeedback = "请选择一个仍然存在的固定基线模型。"
+            return
+        }
+        isRunningAB = true
+        abFeedback = nil
+        defer { isRunningAB = false }
+        let report = await engine.runABExperiment(
+            baselineModel: baseline,
+            prompt: promptText,
+            repetitions: abRepetitions,
+            agentID: abAgentKind,
+            qualityAssessmentMethod: abQualityMethod
+        )
+        latestABReport = report
+        abFeedback = "实验完成：auto 成功 \(report.summary.autoSuccessCount)/\(abRepetitions)，基线成功 \(report.summary.baselineSuccessCount)/\(abRepetitions)。样本量较小时请勿外推笼统百分比结论。"
+    }
+
+    private func exportABReport() {
+        guard let latestABReport else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "autoroute-ab-report.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try latestABReport.jsonData().write(to: url, options: .atomic)
+            abFeedback = "已导出不含提示词、响应正文和凭据的 A/B 报告到 \(url.lastPathComponent)。"
+        } catch {
+            abFeedback = "A/B 报告导出失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func formatOptionalUSD(_ value: Double?) -> String {
+        value.map(AutoModelFormatter.formatUSD) ?? "缺失（不按 0 元处理）"
     }
 
     private func runTestRequest() async {
@@ -258,7 +386,6 @@ struct TestBenchView: View {
         let outcome = await engine.executeChatCompletion(
             payload: payload,
             source: .testBench,
-            abBaselineModelUUID: enableABBaseline ? baselineModelID : nil,
             onStreamChunk: chunkHandler
         )
 

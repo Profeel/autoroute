@@ -1,0 +1,54 @@
+name: Integration compatibility
+description: 报告 Agent、供应商或协议兼容问题
+title: "[Compatibility] "
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **移除所有 API key、本地 token、私有提示词、代码、响应正文、账号和个人路径。**优先使用脱敏路由收据。
+  - type: input
+    id: versions
+    attributes:
+      label: AutoRoute / Agent / 供应商与版本
+      placeholder: AutoRoute commit, Codex/Claude Code/OpenCode version, provider type
+    validations:
+      required: true
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: 本机协议
+      options:
+        - OpenAI Chat Completions /v1/chat/completions
+        - OpenAI Responses /v1/responses
+        - Anthropic Messages /v1/messages
+        - Agent 配置接入或恢复
+        - 其他
+    validations:
+      required: true
+  - type: dropdown
+    id: streaming
+    attributes:
+      label: 请求模式
+      options: [普通 JSON, 流式 SSE, 两者都失败, 不适用]
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现与预期/实际行为
+      description: 包含模型别名、HTTP 状态、是否回退；不要包含消息正文。
+    validations:
+      required: true
+  - type: textarea
+    id: receipt
+    attributes:
+      label: 脱敏收据与配置结构
+      description: 可附字段名和脱敏收据；不要粘贴含 token 的 Agent 配置或备份。
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 已检查
+      options:
+        - label: 本地 token 与供应商密钥问题已区分，且所有值已脱敏
+          required: true
+        - label: 已检查端口、401/403、预算 429 和 Agent 恢复文档
+          required: true

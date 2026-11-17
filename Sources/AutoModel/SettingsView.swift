@@ -10,15 +10,21 @@ struct SettingsView: View {
     @State private var portInput: String = ""
     @State private var feedbackMessage: String?
     @State private var launchAtLoginEnabled: Bool = (SMAppService.mainApp.status == .enabled)
+    @State private var showClearHistoryConfirmation = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                if !engine.isLocalAPITokenPersistent {
+                    localTokenBlockingBanner
+                }
                 if engine.portSyncNeededForConnectedAgents {
                     portSyncBanner
                 }
                 proxyConfigCard
                 localSimulatorCard
+                BudgetSettingsCard(engine: engine)
+                LocalMetricsSettingsCard(engine: engine)
                 probeAuditLogsCard
                 privacyAndDataCard
                 openSourceAboutCard
@@ -29,6 +35,52 @@ struct SettingsView: View {
         .onAppear {
             portInput = String(engine.config.proxySettings.port)
             launchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
+        }
+        .confirmationDialog(
+            "将永久删除本机调用历史、会话粘性和本地指标，且无法撤销。供应商配置与 Keychain 密钥保留。继续？",
+            isPresented: $showClearHistoryConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("清空历史与指标", role: .destructive) {
+                do {
+                    try engine.clearCallHistory()
+                    feedbackMessage = "已清空本机调用历史、会话粘性缓存与本地指标。"
+                } catch {
+                    feedbackMessage = "清空失败，历史仍保留：\(error.localizedDescription)"
+                }
+            }
+            Button("取消", role: .cancel) {}
+        }
+    }
+
+    private var localTokenBlockingBanner: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    Image(systemName: "lock.trianglebadge.exclamationmark.fill")
+                        .font(.title2)
+                        .foregroundStyle(.red)
+                    Text("本地凭据未持久化，代理与 Agent 接入已阻断")
+                        .font(.callout.weight(.semibold))
+                }
+                Text(engine.localAPITokenPersistenceError ?? "本地 API token 未能写入 Keychain。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("在修复 Keychain 访问并成功持久化前，AutoRoute 不会自动启动代理，也不会写入任何 Agent 配置；请勿把当前临时 token 配置到外部客户端。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                Button("检查并重试保存凭据") {
+                    do {
+                        try engine.retryPersistingLocalAPIToken()
+                        feedbackMessage = "本地 API token 已持久化，现在可以启动代理并接入 Agent。"
+                    } catch {
+                        feedbackMessage = "仍无法持久化本地凭据：\(error.localizedDescription)"
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(6)
         }
     }
 
@@ -115,13 +167,42 @@ struct SettingsView: View {
                             engine.startProxy()
                         }
                         .buttonStyle(.borderedProminent)
+                        .disabled(!engine.isLocalAPITokenPersistent)
                     }
+                }
+
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("本地 API 凭据")
+                        .font(.callout.weight(.medium))
+                    Text("所有模型、对话和本地管理接口都需要此 token；供应商密钥使用独立 Keychain 条目。不要把 token 提交到 Git 或写入公开日志。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Button("复制 API token") {
+                            copyToPasteboard(engine.localAPIToken)
+                            feedbackMessage = "已复制本地 API token，请仅粘贴到受信任的本机客户端。"
+                        }
+                        .disabled(!engine.isLocalAPITokenPersistent)
+                        Button("复制 Base URL") {
+                            copyToPasteboard(engine.config.proxySettings.baseURLString)
+                            feedbackMessage = "已复制本地 Base URL。"
+                        }
+                        Button("复制 curl 模板") {
+                            let command = "curl $AUTOROUTE_BASE_URL/chat/completions -H \"Authorization: Bearer $AUTOROUTE_API_TOKEN\" -H \"Content-Type: application/json\" -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'"
+                            copyToPasteboard(command)
+                            feedbackMessage = "已复制不含真实 token 的 curl 模板；请先设置 AUTOROUTE_BASE_URL 与 AUTOROUTE_API_TOKEN。"
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
 
                 Toggle("打开 App 时自动启动本地代理", isOn: Binding(
                     get: { engine.config.proxySettings.autoStartProxy },
                     set: { engine.updateAutoStartProxy($0) }
                 ))
+                .disabled(!engine.isLocalAPITokenPersistent)
 
                 Toggle("启动时自动发掘本机已配置模型并定期巡检剔除不可用模型", isOn: Binding(
                     get: { engine.config.proxySettings.autoDiscoverAndProbeOnLaunch },
@@ -162,7 +243,7 @@ struct SettingsView: View {
                             if enable {
                                 try SMAppService.mainApp.register()
                                 launchAtLoginEnabled = true
-                                feedbackMessage = "已开启登录时自动启动 Auto Model。"
+                                feedbackMessage = "已开启登录时自动启动 AutoRoute。"
                             } else {
                                 try SMAppService.mainApp.unregister()
                                 launchAtLoginEnabled = false
@@ -170,12 +251,12 @@ struct SettingsView: View {
                             }
                         } catch {
                             launchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
-                            feedbackMessage = "设置开机自启失败（可将 AutoModel.app 拖入「应用程序」目录后重试）: \(error.localizedDescription)"
+                            feedbackMessage = "设置开机自启失败（可将 AutoRoute.app 拖入「应用程序」目录后重试）: \(error.localizedDescription)"
                         }
                     }
                 )) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("登录 macOS 时自动启动 Auto Model")
+                        Text("登录 macOS 时自动启动 AutoRoute")
                             .font(.callout.weight(.medium))
                         Text("开启后将在后台自动拉起本地 127.0.0.1 代理与菜单栏入口。")
                             .font(.caption)
@@ -254,8 +335,7 @@ struct SettingsView: View {
                     .disabled(engine.callHistory.isEmpty)
 
                     Button("清空所有调用历史", role: .destructive) {
-                        engine.clearCallHistory()
-                        feedbackMessage = "已清空本机调用历史与会话粘性缓存。"
+                        showClearHistoryConfirmation = true
                     }
                     .buttonStyle(.bordered)
                     .disabled(engine.callHistory.isEmpty)
@@ -315,7 +395,7 @@ struct SettingsView: View {
     private var openSourceAboutCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Auto Model · 开源 macOS 本地多模型路由器 (MIT License)")
+                Text("AutoRoute · 开源 macOS 本地多模型路由器 (MIT License)")
                     .font(.callout.weight(.semibold))
                 Text("• 开源版无需注册账号、不依赖托管中转服务、不发送遥测数据。")
                 Text("• 本机兼容接口：`POST /v1/chat/completions`（OpenAI Chat Completions 普通与流式）、`POST /v1/messages`（Anthropic Messages 普通与流式）、`POST /v1/responses`（OpenAI Responses 普通与流式）及 `GET /v1/models`。")
@@ -337,6 +417,11 @@ struct SettingsView: View {
             Label("开源说明与兼容范围", systemImage: "info.circle")
                 .font(.headline)
         }
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 
     private func applyPort() {

@@ -280,6 +280,7 @@ final class AutoModelTests: XCTestCase {
         // B. Streaming model=auto request under costFirst -> picks mock-fast-mini, estimates missing usage
         let streamURL = URL(string: "http://127.0.0.1:\(proxyPort)/v1/chat/completions")!
         var req = URLRequest(url: streamURL)
+        req.setValue("Bearer \(engine.localAPIToken)", forHTTPHeaderField: "Authorization")
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: [
@@ -310,6 +311,7 @@ final class AutoModelTests: XCTestCase {
         // C. Switch strategy to qualityFirst and call again -> chooses mock-coder-pro!
         engine.setStrategy(.qualityFirst)
         var req2 = URLRequest(url: streamURL)
+        req2.setValue("Bearer \(engine.localAPIToken)", forHTTPHeaderField: "Authorization")
         req2.httpMethod = "POST"
         req2.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req2.httpBody = try JSONSerialization.data(withJSONObject: [
@@ -332,12 +334,14 @@ final class AutoModelTests: XCTestCase {
 
         // D. Unsupported endpoints return 501; unknown model returns 404; unsupported param returns 400
         var embReq = URLRequest(url: URL(string: "http://127.0.0.1:\(proxyPort)/v1/embeddings")!)
+        embReq.setValue("Bearer \(engine.localAPIToken)", forHTTPHeaderField: "Authorization")
         embReq.httpMethod = "POST"
         embReq.httpBody = Data("{}".utf8)
         let (_, embResp) = try await URLSession.shared.data(for: embReq)
         XCTAssertEqual((embResp as? HTTPURLResponse)?.statusCode, 501)
 
         var unknownReq = URLRequest(url: streamURL)
+        unknownReq.setValue("Bearer \(engine.localAPIToken)", forHTTPHeaderField: "Authorization")
         unknownReq.httpMethod = "POST"
         unknownReq.httpBody = try JSONSerialization.data(withJSONObject: [
             "model": "nonexistent-model",
@@ -443,6 +447,7 @@ final class AutoModelTests: XCTestCase {
         // Unsupported `audio` parameter -> 400
         let url = URL(string: "http://127.0.0.1:\(proxyPort)/v1/chat/completions")!
         var audioReq = URLRequest(url: url)
+        audioReq.setValue("Bearer \(engine.localAPIToken)", forHTTPHeaderField: "Authorization")
         audioReq.httpMethod = "POST"
         audioReq.httpBody = try JSONSerialization.data(withJSONObject: [
             "model": "auto",
@@ -460,15 +465,24 @@ final class AutoModelTests: XCTestCase {
                 "stream": false,
                 "messages": [["role": "user", "content": "Explain caching."]]
             ],
-            source: .testBench,
-            abBaselineModelUUID: pricedPro.id
+            source: .testBench
         )
         XCTAssertEqual(outcome.httpStatusCode, 200)
         XCTAssertEqual(outcome.callRecord.costStatus, .missingPriceConfig)
         XCTAssertNil(outcome.callRecord.totalCostUSD)
-        XCTAssertEqual(outcome.callRecord.comparison?.basis, .realABTest)
-        XCTAssertEqual(outcome.callRecord.comparison?.baselineModelID, "mock-coder-pro")
-        XCTAssertNotNil(outcome.callRecord.comparison?.latencyDifferenceMs)
+
+        let report = await engine.runABExperiment(
+            baselineModel: pricedPro,
+            prompt: "Explain caching.",
+            repetitions: 1
+        )
+        XCTAssertEqual(report.samples.count, 2)
+        XCTAssertEqual(Set(report.samples.map(\.sessionID)).count, 2)
+        let abRecords = engine.callHistory.filter {
+            $0.source == .testBench && $0.endpointPath == "engine://ab-experiment"
+        }
+        XCTAssertEqual(abRecords.count, 2)
+        XCTAssertTrue(abRecords.allSatisfy { $0.executionOrigin != nil })
     }
 
     func testMacOSKeychainRoundTrip() throws {
@@ -725,15 +739,24 @@ final class AutoModelTests: XCTestCase {
         XCTAssertEqual(archDecision.selectedModelID, "mock-opus-high")
         XCTAssertTrue(archDecision.matchedRules.contains(where: { $0.contains("三档路由命中") && $0.contains("高档") }))
 
-        // User manually changes Low tier -> autoConfigureModelTiers(forceResetManual: false) must preserve manual override
+        // User manually changes Low tier (keeping flashModel as backup) -> autoConfigureModelTiers(forceResetManual: false) must preserve manual override
         engine.setTierModel(tier: .low, modelUUID: mediumModel.id, isManual: true)
+        engine.addTierBackupModel(tier: .low, modelUUID: flashModel.id)
         engine.autoConfigureModelTiers(forceResetManual: false)
         XCTAssertEqual(engine.config.policy.lowTierModelID, mediumModel.id)
         XCTAssertTrue(engine.config.policy.lowTierIsManual)
 
-        // If the manually assigned model becomes evicted, auto-maintenance self-heals Low back to healthy flashModel
+        // If the manually assigned model becomes temporarily evicted, its binding & manual flag are preserved
+        // while routing automatically fails over to the healthy tier backup, and auto-recovers once restored.
         engine.updateModelAvailability(modelID: mediumModel.id, status: .unavailable, note: "timeout", autoEvicted: true)
-        XCTAssertEqual(engine.config.policy.lowTierModelID, flashModel.id)
+        XCTAssertEqual(engine.config.policy.lowTierModelID, mediumModel.id)
+        XCTAssertTrue(engine.config.policy.lowTierIsManual)
+        let failoverLow = engine.router.route(requestedModel: "auto/low", features: lowFeatures, providers: engine.config.providers, models: engine.config.models, policy: engine.config.policy)
+        XCTAssertEqual(failoverLow.selectedModelID, "mock-flash-mini")
+
+        engine.restoreEvictedModel(id: mediumModel.id)
+        let recoveredLow = engine.router.route(requestedModel: "auto/low", features: lowFeatures, providers: engine.config.providers, models: engine.config.models, policy: engine.config.policy)
+        XCTAssertEqual(recoveredLow.selectedModelID, "mock-coder-mid")
     }
 
     @MainActor
@@ -802,16 +825,24 @@ final class AutoModelTests: XCTestCase {
             engine.upsertModel(model)
         }
 
-        // Switching to .costFirst should avoid the ultra-expensive flagship in High tier and pick cheaper models
+        // Switching to .costFirst initially populates empty tiers without overriding them later
         engine.setStrategy(.costFirst)
         XCTAssertEqual(engine.config.policy.activeStrategy, .costFirst)
         XCTAssertEqual(engine.config.policy.lowTierModelID, ultraCheap.id)
         XCTAssertNotEqual(engine.config.policy.highTierModelID, ultraFlagship.id)
+        let lockedLow = engine.config.policy.lowTierModelID
+        let lockedMedium = engine.config.policy.mediumTierModelID
+        let lockedHigh = engine.config.policy.highTierModelID
 
-        // Switching to .qualityFirst should automatically promote High tier to the ultraFlagship
-        // and upgrade Low/Medium tiers toward higher-quality models
+        // Switching to .qualityFirst must NOT silently overwrite already-configured tier models
         engine.setStrategy(.qualityFirst)
         XCTAssertEqual(engine.config.policy.activeStrategy, .qualityFirst)
+        XCTAssertEqual(engine.config.policy.lowTierModelID, lockedLow)
+        XCTAssertEqual(engine.config.policy.mediumTierModelID, lockedMedium)
+        XCTAssertEqual(engine.config.policy.highTierModelID, lockedHigh)
+
+        // Explicit recalculation ("重新自动推荐三档") recomputes tiers for the active .qualityFirst strategy
+        engine.autoConfigureModelTiers(forceResetManual: true)
         XCTAssertEqual(engine.config.policy.highTierModelID, ultraFlagship.id)
         XCTAssertNotEqual(engine.config.policy.lowTierModelID, ultraCheap.id)
     }
@@ -890,12 +921,14 @@ final class AutoModelTests: XCTestCase {
 
         // Apply custom bindings across all agents
         let codexBinding = AgentModelBinding(defaultModelOption: "auto/high")
-        let codexStatus = try service.applyAgentConfig(kind: .codex, binding: codexBinding, proxyPort: 8765)
+        let codexStatus = try service.applyAgentConfig(kind: .codex, binding: codexBinding, proxyPort: 8765, localAPIToken: "test-local-token")
         XCTAssertTrue(codexStatus.isConnectedToAutoModel)
         XCTAssertTrue(codexStatus.hasBackup)
         let injectedCodex = try String(contentsOf: codexDir.appendingPathComponent("config.toml"), encoding: .utf8)
         XCTAssertTrue(injectedCodex.contains("model = \"auto/high\""))
-        XCTAssertTrue(injectedCodex.contains("openai_base_url = \"http://127.0.0.1:8765/v1\""))
+        XCTAssertTrue(injectedCodex.contains("model_provider = \"autoroute\""))
+        XCTAssertTrue(injectedCodex.contains("[model_providers.autoroute]"))
+        XCTAssertTrue(injectedCodex.contains("base_url = \"http://127.0.0.1:8765/v1\""))
         XCTAssertTrue(injectedCodex.contains("[projects.\"/tmp/demo-project\"]"))
         XCTAssertTrue(injectedCodex.contains("trust_level = \"trusted\""))
 
@@ -909,6 +942,7 @@ final class AutoModelTests: XCTestCase {
             kind: .opencode,
             binding: openCodeBinding,
             proxyPort: 8765,
+            localAPIToken: "test-local-token",
             resolvedTierDisplayNames: [.low: "Flash Mini", .medium: "Coder Mid", .high: "Opus High"]
         )
         XCTAssertTrue(openCodeStatus.isConnectedToAutoModel)
@@ -935,7 +969,7 @@ final class AutoModelTests: XCTestCase {
         XCTAssertFalse(rescan.providers.contains(where: { $0.name.lowercased() == "automodel" }))
         XCTAssertFalse(rescan.providers.contains(where: { $0.baseURL.contains("127.0.0.1:8765") }))
 
-        let hermesStatus = try service.applyAgentConfig(kind: .hermes, binding: AgentModelBinding(), proxyPort: 8765)
+        let hermesStatus = try service.applyAgentConfig(kind: .hermes, binding: AgentModelBinding(), proxyPort: 8765, localAPIToken: "test-local-token")
         XCTAssertTrue(hermesStatus.isConnectedToAutoModel)
         let injectedHermes = try String(contentsOf: hermesDir.appendingPathComponent("config.yaml"), encoding: .utf8)
         XCTAssertTrue(injectedHermes.contains("provider: automodel"))
@@ -943,7 +977,7 @@ final class AutoModelTests: XCTestCase {
         XCTAssertTrue(injectedHermes.contains("max_tokens: 8192"))
         XCTAssertTrue(injectedHermes.contains("volcengine:"))
 
-        let claudeStatus = try service.applyAgentConfig(kind: .claudeCode, binding: openCodeBinding, proxyPort: 8765)
+        let claudeStatus = try service.applyAgentConfig(kind: .claudeCode, binding: openCodeBinding, proxyPort: 8765, localAPIToken: "test-local-token")
         XCTAssertTrue(claudeStatus.isConnectedToAutoModel)
         let injectedClaudeData = try Data(contentsOf: claudeDir.appendingPathComponent("settings.json"))
         let injectedClaude = try XCTUnwrap(JSONSerialization.jsonObject(with: injectedClaudeData) as? [String: Any])
@@ -954,14 +988,14 @@ final class AutoModelTests: XCTestCase {
         XCTAssertEqual(claudeEnv["ANTHROPIC_DEFAULT_SONNET_MODEL"] as? String, "auto/medium")
         XCTAssertEqual(claudeEnv["ANTHROPIC_DEFAULT_OPUS_MODEL"] as? String, "mock-opus-high")
 
-        let shellStatus = try service.applyAgentConfig(kind: .shellAndContinue, binding: openCodeBinding, proxyPort: 8765)
+        let shellStatus = try service.applyAgentConfig(kind: .shellAndContinue, binding: openCodeBinding, proxyPort: 8765, localAPIToken: "test-local-token")
         XCTAssertTrue(shellStatus.isConnectedToAutoModel)
         let envScript = try String(contentsOf: fakeHome.appendingPathComponent(".automodel/agent-env.sh"), encoding: .utf8)
         XCTAssertTrue(envScript.contains("export OPENAI_BASE_URL=\"http://127.0.0.1:8765/v1\""))
         XCTAssertTrue(envScript.contains("export AUTOMODEL_HIGH_MODEL=\"mock-opus-high\""))
 
         // Re-applying after modifying binding must NOT overwrite the original pre-AutoModel backup
-        _ = try service.applyAgentConfig(kind: .codex, binding: AgentModelBinding(defaultModelOption: "auto"), proxyPort: 8765)
+        _ = try service.applyAgentConfig(kind: .codex, binding: AgentModelBinding(defaultModelOption: "auto"), proxyPort: 8765, localAPIToken: "test-local-token")
 
         // Restore all agents cleanly -> exact original files restored, generated agent-env.sh deleted
         _ = try service.restoreAgentConfig(kind: .codex, proxyPort: 8765)
@@ -1058,9 +1092,10 @@ final class AutoModelTests: XCTestCase {
 
         // Test POST /v1/messages (non-stream)
         var msgReq = URLRequest(url: URL(string: "http://127.0.0.1:\(proxyPort)/v1/messages")!)
+        msgReq.setValue(engine.localAPIToken, forHTTPHeaderField: "x-api-key")
         msgReq.httpMethod = "POST"
         msgReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        msgReq.setValue("test-anthropic-key", forHTTPHeaderField: "x-api-key")
+        msgReq.setValue(engine.localAPIToken, forHTTPHeaderField: "x-api-key")
         msgReq.httpBody = try JSONSerialization.data(withJSONObject: [
             "model": "auto/low",
             "max_tokens": 128,
@@ -1079,6 +1114,7 @@ final class AutoModelTests: XCTestCase {
 
         // Test POST /v1/responses (non-stream)
         var respReq = URLRequest(url: URL(string: "http://127.0.0.1:\(proxyPort)/v1/responses")!)
+        respReq.setValue("Bearer \(engine.localAPIToken)", forHTTPHeaderField: "Authorization")
         respReq.httpMethod = "POST"
         respReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
         respReq.httpBody = try JSONSerialization.data(withJSONObject: [
@@ -1129,6 +1165,7 @@ final class AutoModelTests: XCTestCase {
             kind: .claudeCode,
             binding: AgentModelBinding(),
             proxyPort: 8765,
+            localAPIToken: "test-local-token",
             resolvedTierDisplayNames: [.low: "Mock Low", .medium: "Mock Med", .high: "Mock High"]
         )
         XCTAssertTrue(preview.before.contains("尚不存在"))
@@ -1452,7 +1489,7 @@ final class AutoModelTests: XCTestCase {
         XCTAssertEqual(exploreFeatures.subtaskCategory, .explorationSearch)
         XCTAssertEqual(exploreFeatures.recommendedEffort, .low)
 
-        let policy = RoutingPolicyConfig(
+        let strongStickyPolicy = RoutingPolicyConfig(
             policyVersion: 1,
             activeStrategy: .balanced,
             enableSessionStickiness: true,
@@ -1461,13 +1498,13 @@ final class AutoModelTests: XCTestCase {
             highTierModelID: reasonerModel.id,
             preferTierMappingInAuto: true
         )
-        let dExplore = router.route(requestedModel: "auto", features: exploreFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: policy)
+        let dExplore = router.route(requestedModel: "auto", features: exploreFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: strongStickyPolicy)
         XCTAssertEqual(dExplore.selectedModelID, "fast-flash")
         XCTAssertEqual(dExplore.selectedEffort, .low)
         XCTAssertEqual(dExplore.subtaskCategory, .explorationSearch)
         router.recordSuccessfulSessionModel(fingerprint: exploreFeatures.conversationFingerprint, modelUUID: fastModel.id, policyVersion: 1)
 
-        // 2. Multi-turn escalation to deep debugging (crash / stack trace) -> breaks weak sticky fastModel & routes to reasoner with max effort
+        // 2. Strong stickiness (default): multi-turn conversation stays locked to fast-flash without mid-session switching
         let debugFeatures = RequestFeatureExtractor.extract(from: [
             "model": "auto",
             "messages": [
@@ -1480,7 +1517,13 @@ final class AutoModelTests: XCTestCase {
         XCTAssertEqual(debugFeatures.subtaskCategory, .deepDebugging)
         XCTAssertEqual(debugFeatures.recommendedEffort, .max)
 
-        let dDebug = router.route(requestedModel: "auto", features: debugFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: policy)
+        let dSticky = router.route(requestedModel: "auto", features: debugFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: strongStickyPolicy)
+        XCTAssertEqual(dSticky.selectedModelID, "fast-flash")
+
+        // 3. When dynamic phase switching (enablePhaseDowngradeHysteresis) is explicitly enabled, deep debugging escalates to reasoner
+        var dynamicPolicy = strongStickyPolicy
+        dynamicPolicy.enablePhaseDowngradeHysteresis = true
+        let dDebug = router.route(requestedModel: "auto", features: debugFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: dynamicPolicy)
         XCTAssertEqual(dDebug.selectedModelID, "deep-reasoner")
         XCTAssertEqual(dDebug.selectedEffort, .max)
         XCTAssertEqual(dDebug.subtaskCategory, .deepDebugging)
@@ -1609,11 +1652,951 @@ final class AutoModelTests: XCTestCase {
         XCTAssertEqual(summary.evaluatedTurnCount, 5)
         XCTAssertGreaterThan(summary.costSavedUSD, 0.4)
         XCTAssertGreaterThan(summary.costSavingsPercent ?? 0, 50.0)
-        XCTAssertGreaterThan(summary.speedGainPercent ?? 0, 60.0)
-        XCTAssertGreaterThan(summary.speedSavedMsPerTurn ?? 0, 5000.0)
+        // With output-token normalization (1,000 vs 4,000 out tokens), baseline equivalent is ~4,950ms vs 2,880ms actual
+        XCTAssertGreaterThan(summary.speedGainPercent ?? 0, 35.0)
+        XCTAssertGreaterThan(summary.speedSavedMsPerTurn ?? 0, 1800.0)
         XCTAssertEqual(summary.retryCount, 1)
         XCTAssertEqual(summary.successRatePercent, 100)
         // The single expensive high-tier turn accounts for >95% of total spend
         XCTAssertGreaterThan(summary.top10PercentCostSharePercent ?? 0, 90.0)
+    }
+
+    @MainActor
+    func testTierBackupModelsMultiSourceAndFailoverOrder() async throws {
+        let store = makeTempStore()
+        let keychain = InMemoryKeychainService()
+        let engine = AutoModelEngine(
+            persistence: store,
+            keychain: keychain,
+            autoStartProxyIfConfigured: false
+        )
+
+        let p1 = ProviderConfig(name: "SourceA", baseURL: "https://a.local/v1", isEnabled: true, healthStatus: .healthy)
+        let p2 = ProviderConfig(name: "SourceB", baseURL: "https://b.local/v1", isEnabled: true, healthStatus: .healthy)
+        try engine.upsertProvider(p1, apiKey: "sk-a")
+        try engine.upsertProvider(p2, apiKey: "sk-b")
+
+        let lowPrimary = ModelConfig(
+            providerID: p1.id,
+            modelID: "glm-5.3-flash",
+            displayName: "GLM-5.3-Flash",
+            inputPricePerMillion: 0.1,
+            outputPricePerMillion: 0.3,
+            capabilities: [.chat, .tools],
+            defaultRole: .fastEconomy,
+            qualityScore: 72,
+            speedScore: 95
+        )
+        let lowBackup = ModelConfig(
+            providerID: p2.id,
+            modelID: "glm-5.3-flash",
+            displayName: "GLM-5.3-Flash",
+            inputPricePerMillion: 0.12,
+            outputPricePerMillion: 0.35,
+            capabilities: [.chat, .tools],
+            defaultRole: .fastEconomy,
+            qualityScore: 72,
+            speedScore: 92
+        )
+        let highModel = ModelConfig(
+            providerID: p1.id,
+            modelID: "deepseek-v4-pro",
+            displayName: "DeepSeek V4 Pro",
+            inputPricePerMillion: 2.0,
+            outputPricePerMillion: 8.0,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .complexReasoning,
+            qualityScore: 95,
+            speedScore: 70
+        )
+
+        engine.upsertModel(lowPrimary)
+        engine.upsertModel(lowBackup)
+        engine.upsertModel(highModel)
+        engine.setTierModel(tier: .low, modelUUID: lowPrimary.id, isManual: true)
+        engine.setTierModel(tier: .high, modelUUID: highModel.id, isManual: true)
+        engine.addTierBackupModel(tier: .low, modelUUID: lowBackup.id)
+
+        XCTAssertEqual(engine.config.policy.modelIDs(for: .low), [lowPrimary.id, lowBackup.id])
+
+        // Simple QA routes to Low primary, and same-tier backup from SourceB must be first in fallback queue
+        let qaFeatures = RequestFeatureExtractor.extract(from: ["messages": [["role": "user", "content": "hello"]]])
+        let decision = engine.router.route(
+            requestedModel: "auto",
+            features: qaFeatures,
+            providers: engine.config.providers,
+            models: engine.config.models,
+            policy: engine.config.policy
+        )
+        XCTAssertEqual(decision.selectedModelUUID, lowPrimary.id)
+        XCTAssertEqual(decision.orderedFallbackCandidateIDs.first, lowBackup.id)
+
+        // If lowPrimary is evicted, primary binding & backup list stay intact, routing fails over to lowBackup,
+        // and once lowPrimary recovers it automatically resumes primary traffic.
+        engine.updateModelAvailability(modelID: lowPrimary.id, status: .unavailable, note: "503", autoEvicted: true)
+        XCTAssertEqual(engine.config.policy.lowTierModelID, lowPrimary.id)
+        XCTAssertEqual(engine.config.policy.lowTierBackupModelIDs, [lowBackup.id])
+        let failoverDecision = engine.router.route(
+            requestedModel: "auto",
+            features: qaFeatures,
+            providers: engine.config.providers,
+            models: engine.config.models,
+            policy: engine.config.policy
+        )
+        XCTAssertEqual(failoverDecision.selectedModelUUID, lowBackup.id)
+
+        engine.restoreEvictedModel(id: lowPrimary.id)
+        let recoveredDecision = engine.router.route(
+            requestedModel: "auto",
+            features: qaFeatures,
+            providers: engine.config.providers,
+            models: engine.config.models,
+            policy: engine.config.policy
+        )
+        XCTAssertEqual(recoveredDecision.selectedModelUUID, lowPrimary.id)
+    }
+
+    func testResponsesStreamTranslatorEmitsFunctionCallEventsAndUsage() throws {
+        // 1. Multi-turn Responses input containing function_call + function_call_output + reasoning.effort
+        let reqRes = ProtocolAdapters.responsesToChatRequest([
+            "model": "auto",
+            "reasoning": ["effort": "high"],
+            "input": [
+                ["role": "user", "content": "check files"],
+                ["type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"],
+                ["type": "function_call_output", "call_id": "call_1", "output": "README.md"]
+            ],
+            "tools": [
+                ["type": "function", "name": "shell", "description": "run shell", "parameters": ["type": "object", "properties": ["cmd": ["type": "string"]]]]
+            ],
+            "stream": true
+        ])
+        guard case .success(let chatReq) = reqRes else {
+            return XCTFail("responsesToChatRequest failed")
+        }
+        XCTAssertEqual(chatReq["reasoning_effort"] as? String, "high")
+        let msgs = chatReq["messages"] as? [[String: Any]] ?? []
+        XCTAssertEqual(msgs.count, 3)
+        XCTAssertEqual(msgs[1]["role"] as? String, "assistant")
+        XCTAssertNotNil(msgs[1]["tool_calls"])
+        XCTAssertEqual(msgs[2]["role"] as? String, "tool")
+
+        // 2. Streaming Chat Completions tool_calls chunks -> Responses API SSE events
+        let translator = ResponsesStreamTranslator()
+        let chunk1 = Data("data: {\"id\":\"chatcmpl-1\",\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n".utf8)
+        let chunk2 = Data("data: {\"id\":\"chatcmpl-1\",\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":18,\"total_tokens\":138}}\n\n".utf8)
+        let doneChunk = Data("data: [DONE]\n\n".utf8)
+
+        let events = (translator.translateChunk(chunk1) + translator.translateChunk(chunk2) + translator.translateChunk(doneChunk))
+            .compactMap { String(data: $0, encoding: .utf8) }
+            .joined()
+
+        XCTAssertTrue(events.contains("event: response.created"))
+        XCTAssertTrue(events.contains("event: response.output_item.added"))
+        XCTAssertTrue(events.contains("\"type\":\"function_call\""))
+        XCTAssertTrue(events.contains("\"name\":\"shell\""))
+        XCTAssertTrue(events.contains("event: response.function_call_arguments.delta"))
+        XCTAssertTrue(events.contains("event: response.function_call_arguments.done"))
+        XCTAssertTrue(events.contains("event: response.output_item.done"))
+        XCTAssertTrue(events.contains("event: response.completed"))
+        XCTAssertTrue(events.contains("\"total_tokens\":138"))
+    }
+
+    func testPhaseHysteresisCooldownStrictPoolAndToolStarvation() throws {
+        let router = ModelRouter()
+        let pID = UUID()
+        let provider = ProviderConfig(id: pID, name: "PhaseRelay", baseURL: "https://phase.local/v1")
+
+        let medModel = ModelConfig(
+            providerID: pID,
+            modelID: "glm-5.3",
+            displayName: "GLM-5.3",
+            inputPricePerMillion: 0.5,
+            outputPricePerMillion: 2.0,
+            capabilities: [.chat, .coding, .tools],
+            defaultRole: .coding,
+            qualityScore: 86,
+            speedScore: 85
+        )
+        let highModel = ModelConfig(
+            providerID: pID,
+            modelID: "gpt-6-astra",
+            displayName: "GPT-6-Astra",
+            inputPricePerMillion: 10.0,
+            outputPricePerMillion: 30.0,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .complexReasoning,
+            qualityScore: 98,
+            speedScore: 60
+        )
+        let outsiderModel = ModelConfig(
+            providerID: pID,
+            modelID: "deepseek-outsider",
+            displayName: "DeepSeek Outsider",
+            inputPricePerMillion: 3.0,
+            outputPricePerMillion: 9.0,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .complexReasoning,
+            qualityScore: 95,
+            speedScore: 70
+        )
+
+        let policy = RoutingPolicyConfig(
+            policyVersion: 1,
+            activeStrategy: .balanced,
+            enableSessionStickiness: true,
+            lowTierModelID: medModel.id,
+            mediumTierModelID: medModel.id,
+            highTierModelID: highModel.id,
+            preferTierMappingInAuto: true,
+            enablePhaseDowngradeHysteresis: true,
+            strictThreeTierPoolOnly: true
+        )
+
+        let allModels = [medModel, highModel, outsiderModel]
+
+        // 1. Plan turn -> High tier, and strictThreeTierPoolOnly excludes outsiderModel from fallback queue
+        let fPlan = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "messages": [
+                ["role": "user", "content": "Compare microservices architecture tradeoffs and make a migration plan."]
+            ]
+        ], sessionHeader: "sess-phase-1")
+        let dPlan = router.route(requestedModel: "auto", features: fPlan, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dPlan.selectedModelUUID, highModel.id)
+        XCTAssertFalse(dPlan.orderedFallbackCandidateIDs.contains(outsiderModel.id))
+        router.recordSuccessfulSessionModel(fingerprint: fPlan.conversationFingerprint, modelUUID: highModel.id, policyVersion: 1, isRoutineSubtask: false)
+
+        // 2. First routine coding turn -> hysteresis holds High sticky (no 1-turn ping-pong)
+        let fRoutine1 = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "messages": [
+                ["role": "user", "content": "Compare microservices architecture tradeoffs and make a migration plan."],
+                ["role": "assistant", "content": "Plan ready."],
+                ["role": "user", "content": "请实现 Swift struct UserProfile 的编码逻辑"]
+            ]
+        ], sessionHeader: "sess-phase-1")
+        let dRoutine1 = router.route(requestedModel: "auto", features: fRoutine1, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dRoutine1.selectedModelUUID, highModel.id)
+        router.recordSuccessfulSessionModel(fingerprint: fRoutine1.conversationFingerprint, modelUUID: highModel.id, policyVersion: 1, isRoutineSubtask: true)
+
+        // 3. Second consecutive routine coding turn -> hysteresis threshold reached, smoothly steps down to Medium
+        let fRoutine2 = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "messages": [
+                ["role": "user", "content": "Compare microservices architecture tradeoffs and make a migration plan."],
+                ["role": "assistant", "content": "Plan ready."],
+                ["role": "user", "content": "请实现 Swift struct SettingsView 的表单保存代码"]
+            ]
+        ], sessionHeader: "sess-phase-1")
+        let dRoutine2 = router.route(requestedModel: "auto", features: fRoutine2, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dRoutine2.selectedModelUUID, medModel.id)
+        // Simulate tool starvation on medModel -> next turn should soft-escalate back to High
+        router.recordSuccessfulSessionModel(fingerprint: fRoutine2.conversationFingerprint, modelUUID: medModel.id, policyVersion: 1, isRoutineSubtask: true, wasToolStarved: true)
+
+        let dRescued = router.route(requestedModel: "auto", features: fRoutine2, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dRescued.selectedModelUUID, highModel.id)
+
+        // 4. Cooldown excludes highModel without permanent eviction -> falls back to medModel cleanly
+        let futureCooldown = Date().addingTimeInterval(20)
+        let dCooldown = router.route(
+            requestedModel: "auto",
+            features: fPlan,
+            providers: [provider],
+            models: allModels,
+            policy: policy,
+            runtimeMetricsByModelID: [
+                highModel.id: ModelRuntimeMetrics(averageLatencyMs: 2000, successRate: 0.9, sampleCount: 3, cooldownUntil: futureCooldown)
+            ]
+        )
+        XCTAssertEqual(dCooldown.selectedModelUUID, medModel.id)
+        let evalHigh = dCooldown.candidateEvaluations.first(where: { $0.modelUUID == highModel.id })
+        XCTAssertEqual(evalHigh?.passedHardConstraints, false)
+        XCTAssertTrue(evalHigh?.exclusionReasons.contains(where: { $0.contains("冷却中") }) ?? false)
+    }
+
+    func testStickinessIsolationShortPromptDisambiguationAndControlledStrictFallback() throws {
+        let router = ModelRouter()
+        let pID = UUID()
+        let provider = ProviderConfig(id: pID, name: "StrictRelay", baseURL: "https://strict.local/v1")
+
+        let lowModel = ModelConfig(
+            providerID: pID,
+            modelID: "strict-low",
+            displayName: "Strict Low",
+            inputPricePerMillion: 0.1,
+            outputPricePerMillion: 0.2,
+            capabilities: [.chat, .tools],
+            defaultRole: .fastEconomy,
+            qualityScore: 70,
+            speedScore: 95
+        )
+        let medModel = ModelConfig(
+            providerID: pID,
+            modelID: "strict-med",
+            displayName: "Strict Med",
+            inputPricePerMillion: 1.0,
+            outputPricePerMillion: 3.0,
+            capabilities: [.chat, .coding, .tools],
+            defaultRole: .coding,
+            qualityScore: 86,
+            speedScore: 80
+        )
+        let highModel = ModelConfig(
+            providerID: pID,
+            modelID: "strict-high",
+            displayName: "Strict High",
+            inputPricePerMillion: 5.0,
+            outputPricePerMillion: 15.0,
+            capabilities: [.chat, .coding, .reasoning, .tools, .vision],
+            defaultRole: .complexReasoning,
+            qualityScore: 98,
+            speedScore: 65
+        )
+        let outsiderModel = ModelConfig(
+            providerID: pID,
+            modelID: "strict-outsider-vision",
+            displayName: "Outsider Vision",
+            inputPricePerMillion: 2.0,
+            outputPricePerMillion: 6.0,
+            capabilities: [.chat, .vision, .tools],
+            defaultRole: .vision,
+            qualityScore: 90,
+            speedScore: 75
+        )
+
+        let policy = RoutingPolicyConfig(
+            policyVersion: 1,
+            activeStrategy: .balanced,
+            enableSessionStickiness: true,
+            lowTierModelID: lowModel.id,
+            mediumTierModelID: medModel.id,
+            highTierModelID: highModel.id,
+            preferTierMappingInAuto: true,
+            enablePhaseDowngradeHysteresis: false,
+            strictThreeTierPoolOnly: true
+        )
+        let allModels = [lowModel, medModel, highModel, outsiderModel]
+
+        // 1. Short generic opening ("Hi") without session header yields nil fingerprint so unrelated chats never collide;
+        //    once an assistant reply exists, distinct replies yield distinct fingerprints.
+        let singleHi = RequestFeatureExtractor.extract(from: [
+            "messages": [["role": "user", "content": "Hi"]]
+        ])
+        XCTAssertNil(singleHi.conversationFingerprint)
+
+        let chatA = RequestFeatureExtractor.extract(from: [
+            "messages": [
+                ["role": "user", "content": "Hi"],
+                ["role": "assistant", "content": "Welcome to project Alpha."],
+                ["role": "user", "content": "Let's inspect Alpha."]
+            ]
+        ])
+        let chatB = RequestFeatureExtractor.extract(from: [
+            "messages": [
+                ["role": "user", "content": "Hi"],
+                ["role": "assistant", "content": "Welcome to project Beta."],
+                ["role": "user", "content": "Let's inspect Beta."]
+            ]
+        ])
+        XCTAssertNotNil(chatA.conversationFingerprint)
+        XCTAssertNotNil(chatB.conversationFingerprint)
+        XCTAssertNotEqual(chatA.conversationFingerprint, chatB.conversationFingerprint)
+
+        // 2. Explicit tier sidecar call (auto/low) with the same session header must NOT pollute the `auto` sticky model
+        let turn1Auto = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "messages": [
+                ["role": "user", "content": "请帮我实现完整的 Swift 本地代理路由模块"],
+                ["role": "assistant", "content": "好的"],
+                ["role": "user", "content": "继续补充单元测试"]
+            ]
+        ], sessionHeader: "sess-isolated-1")
+        let dAuto1 = router.route(requestedModel: "auto", features: turn1Auto, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dAuto1.selectedModelUUID, medModel.id)
+        router.recordSuccessfulSessionModel(
+            fingerprint: turn1Auto.conversationFingerprint,
+            modelUUID: medModel.id,
+            policyVersion: 1,
+            requestedModel: "auto",
+            explicitTier: nil
+        )
+
+        // Sidecar summary call on auto/low in the same session
+        let dSidecarLow = router.route(requestedModel: "auto/low", features: turn1Auto, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dSidecarLow.selectedModelUUID, lowModel.id)
+        router.recordSuccessfulSessionModel(
+            fingerprint: turn1Auto.conversationFingerprint,
+            modelUUID: lowModel.id,
+            policyVersion: 1,
+            requestedModel: "auto/low",
+            explicitTier: .low
+        )
+
+        // Subsequent `auto` turn must still stick to medModel, unaffected by auto/low sidecar
+        let dAuto2 = router.route(requestedModel: "auto", features: turn1Auto, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dAuto2.selectedModelUUID, medModel.id)
+
+        // 3. Controlled fallback for explicit auto/high when highModel is in cooldown -> chooses adjacent medModel (not lowModel or outsider)
+        let cooldownMetrics = [
+            highModel.id: ModelRuntimeMetrics(averageLatencyMs: 500, successRate: 0.9, sampleCount: 2, cooldownUntil: Date().addingTimeInterval(30))
+        ]
+        let dHighFallback = router.route(
+            requestedModel: "auto/high",
+            features: turn1Auto,
+            providers: [provider],
+            models: allModels,
+            policy: policy,
+            runtimeMetricsByModelID: cooldownMetrics
+        )
+        XCTAssertEqual(dHighFallback.selectedModelUUID, medModel.id)
+        XCTAssertFalse(dHighFallback.orderedFallbackCandidateIDs.contains(outsiderModel.id))
+
+        // 4. Under strictThreeTierPoolOnly, if highModel (the only vision-capable tier model) is in cooldown,
+        //    a vision request must NOT leak to outsiderModel; it must return a clean no_eligible_model failure.
+        let visionFeatures = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "messages": [[
+                "role": "user",
+                "content": [
+                    ["type": "text", "text": "describe this screenshot"],
+                    ["type": "image_url", "image_url": ["url": "data:image/png;base64,AAA"]]
+                ]
+            ]]
+        ])
+        let dStrictBlocked = router.route(
+            requestedModel: "auto",
+            features: visionFeatures,
+            providers: [provider],
+            models: allModels,
+            policy: policy,
+            runtimeMetricsByModelID: cooldownMetrics
+        )
+        XCTAssertNil(dStrictBlocked.selectedModelUUID)
+        XCTAssertNotNil(dStrictBlocked.errorSummary)
+    }
+
+    @MainActor
+    func testExponentialCooldownOn429QuotaWithoutPermanentEviction() async throws {
+        let store = makeTempStore()
+        let keychain = InMemoryKeychainService()
+
+        // Mock upstream returns HTTP 429 with "rate limit quota exceeded" on primary model, and 200 on backup
+        let upstream = LocalTestUpstreamServer(behavior: .init(
+            requiredAPIKey: "sk-cooldown-test",
+            failModelsWithStatus: [
+                "mock-rate-limited": (429, "rate limit quota exceeded for this minute")
+            ],
+            artificialChunkDelayMs: 1
+        ))
+        let port = try upstream.start(port: 0)
+        defer { upstream.stop() }
+
+        let engine = AutoModelEngine(
+            persistence: store,
+            keychain: keychain,
+            autoStartProxyIfConfigured: false
+        )
+        let provider = ProviderConfig(name: "CooldownRelay", baseURL: "http://127.0.0.1:\(port)/v1", isEnabled: true, healthStatus: .healthy)
+        try engine.upsertProvider(provider, apiKey: "sk-cooldown-test")
+
+        let primaryModel = ModelConfig(
+            providerID: provider.id,
+            modelID: "mock-rate-limited",
+            displayName: "Primary RateLimited",
+            inputPricePerMillion: 0.5,
+            outputPricePerMillion: 1.5,
+            capabilities: [.chat, .tools],
+            defaultRole: .coding,
+            qualityScore: 88,
+            speedScore: 85
+        )
+        let backupModel = ModelConfig(
+            providerID: provider.id,
+            modelID: "mock-healthy-backup",
+            displayName: "Healthy Backup",
+            inputPricePerMillion: 0.6,
+            outputPricePerMillion: 1.8,
+            capabilities: [.chat, .tools],
+            defaultRole: .coding,
+            qualityScore: 84,
+            speedScore: 82
+        )
+        engine.upsertModel(primaryModel)
+        engine.upsertModel(backupModel)
+        engine.setTierModel(tier: .medium, modelUUID: primaryModel.id, isManual: true)
+        engine.addTierBackupModel(tier: .medium, modelUUID: backupModel.id)
+
+        // 1st runtime request hitting 429 on primary -> enters ~15s cooldown, fails over to backupModel,
+        // and NEVER permanently sets isAutoEvicted or alters mediumTierModelID / backups.
+        let outcome = await engine.executeChatCompletion(
+            payload: [
+                "model": "auto/medium",
+                "stream": false,
+                "messages": [["role": "user", "content": "请编写一个 Swift 工具函数"]]
+            ],
+            source: .externalProxy
+        )
+        XCTAssertEqual(outcome.httpStatusCode, 200)
+        XCTAssertEqual(outcome.callRecord.executedModelID, "mock-healthy-backup")
+
+        let storedAfterReq = try XCTUnwrap(engine.config.models.first(where: { $0.id == primaryModel.id }))
+        XCTAssertFalse(storedAfterReq.isAutoEvicted)
+        XCTAssertEqual(storedAfterReq.availabilityStatus, .available)
+        XCTAssertEqual(engine.config.policy.mediumTierModelID, primaryModel.id)
+        XCTAssertEqual(engine.config.policy.mediumTierBackupModelIDs, [backupModel.id])
+        let firstCooldown = try XCTUnwrap(engine.cooldownUntilByModelID[primaryModel.id])
+        XCTAssertGreaterThan(firstCooldown.timeIntervalSinceNow, 8)
+        XCTAssertLessThanOrEqual(firstCooldown.timeIntervalSinceNow, 16)
+
+        // 2nd & 3rd 429 failures via active probe -> exponential backoff escalates (45s, then 120s), still NOT auto-evicted
+        await engine.probeSingleModel(modelID: primaryModel.id)
+        let secondCooldown = try XCTUnwrap(engine.cooldownUntilByModelID[primaryModel.id])
+        XCTAssertGreaterThan(secondCooldown.timeIntervalSinceNow, 30)
+        XCTAssertLessThanOrEqual(secondCooldown.timeIntervalSinceNow, 46)
+
+        await engine.probeSingleModel(modelID: primaryModel.id)
+        let thirdCooldown = try XCTUnwrap(engine.cooldownUntilByModelID[primaryModel.id])
+        XCTAssertGreaterThan(thirdCooldown.timeIntervalSinceNow, 90)
+        XCTAssertLessThanOrEqual(thirdCooldown.timeIntervalSinceNow, 121)
+
+        let storedAfterProbes = try XCTUnwrap(engine.config.models.first(where: { $0.id == primaryModel.id }))
+        XCTAssertFalse(storedAfterProbes.isAutoEvicted)
+        XCTAssertEqual(storedAfterProbes.availabilityStatus, .available)
+        XCTAssertEqual(engine.config.policy.mediumTierModelID, primaryModel.id)
+        XCTAssertEqual(engine.config.policy.mediumTierBackupModelIDs, [backupModel.id])
+    }
+
+    @MainActor
+    func testDynamicEffortForBrowserToolLoopsAndSafeUpstreamInjectionAndStreamingToolCallStability() async throws {
+        // 1. Subtask & dynamic effort classification across ego-lite browser workflow + review without jumping to High tier
+        let router = ModelRouter()
+        let pID = UUID()
+        let provider = ProviderConfig(id: pID, name: "DynamicRelay", baseURL: "https://dyn.local/v1")
+
+        let lowModel = ModelConfig(
+            providerID: pID,
+            modelID: "glm-5.3-flash",
+            displayName: "GLM-5.3-Flash",
+            inputPricePerMillion: 0.1,
+            outputPricePerMillion: 0.3,
+            capabilities: [.chat, .tools],
+            defaultRole: .fastEconomy,
+            qualityScore: 72,
+            speedScore: 95
+        )
+        let medModel = ModelConfig(
+            providerID: pID,
+            modelID: "gpt-6.1-terra",
+            displayName: "gpt-6.1-terra",
+            inputPricePerMillion: 1.5,
+            outputPricePerMillion: 4.5,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .coding,
+            qualityScore: 88,
+            speedScore: 82
+        )
+        let highModel = ModelConfig(
+            providerID: pID,
+            modelID: "gpt-6-astra",
+            displayName: "GPT-6 Astra",
+            inputPricePerMillion: 10.0,
+            outputPricePerMillion: 30.0,
+            capabilities: [.chat, .coding, .reasoning, .tools, .vision],
+            defaultRole: .complexReasoning,
+            qualityScore: 98,
+            speedScore: 60
+        )
+
+        let policy = RoutingPolicyConfig(
+            policyVersion: 1,
+            activeStrategy: .balanced,
+            enableSessionStickiness: true,
+            lowTierModelID: lowModel.id,
+            mediumTierModelID: medModel.id,
+            highTierModelID: highModel.id,
+            preferTierMappingInAuto: true,
+            enablePhaseDowngradeHysteresis: false,
+            strictThreeTierPoolOnly: true
+        )
+        let allModels = [lowModel, medModel, highModel]
+        let toolsSpec: [[String: Any]] = [[
+            "type": "function",
+            "function": ["name": "ego_browser_click", "parameters": ["type": "object", "properties": [:]]]
+        ]]
+
+        // T1: User asks to browse x.com via ego-lite (even with "对比/避免") -> starts on Medium tier, medium effort
+        let f1 = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "tools": toolsSpec,
+            "messages": [
+                ["role": "user", "content": "在 x.com (通过 ego-lite) 访问，找到一些真实使用的案例，对比并避免常见错误"]
+            ]
+        ], sessionHeader: "sess-ego-1")
+        let d1 = router.route(requestedModel: "auto", features: f1, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(d1.selectedModelUUID, medModel.id)
+        XCTAssertEqual(d1.selectedEffort, .medium)
+        router.recordSuccessfulSessionModel(fingerprint: f1.conversationFingerprint, modelUUID: medModel.id, policyVersion: 1)
+
+        // T2: Routine ego-lite snapshot/click tool step -> stays on Medium tier, Effort drops dynamically to .low
+        let f2 = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "tools": toolsSpec,
+            "messages": [
+                ["role": "user", "content": "在 x.com (通过 ego-lite) 访问，找到一些真实使用的案例，对比并避免常见错误"],
+                ["role": "assistant", "content": "", "tool_calls": [[
+                    "id": "call_1", "type": "function", "function": ["name": "ego_browser_snapshot", "arguments": "{}"]
+                ]]],
+                ["role": "tool", "tool_call_id": "call_1", "content": "{\"status\":\"ok\",\"elements\":[\"link1\",\"link2\"]}"]
+            ]
+        ], sessionHeader: "sess-ego-1")
+        let d2 = router.route(requestedModel: "auto", features: f2, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(d2.selectedModelUUID, medModel.id)
+        XCTAssertEqual(d2.selectedEffort, .low)
+
+        // T3: Tool failure (selector timeout) -> stays on Medium tier, Effort boosts dynamically to .high for recovery
+        let f3 = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "tools": toolsSpec,
+            "messages": [
+                ["role": "user", "content": "在 x.com (通过 ego-lite) 访问，找到一些真实使用的案例，对比并避免常见错误"],
+                ["role": "assistant", "content": "", "tool_calls": [[
+                    "id": "call_2", "type": "function", "function": ["name": "ego_browser_click", "arguments": "{}"]
+                ]]],
+                ["role": "tool", "tool_call_id": "call_2", "content": "Error: selector not found after timeout"]
+            ]
+        ], sessionHeader: "sess-ego-1")
+        let d3 = router.route(requestedModel: "auto", features: f3, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(d3.selectedModelUUID, medModel.id)
+        XCTAssertEqual(d3.selectedEffort, .high)
+
+        // T4: Fresh session asking for review/audit -> stays on Medium tier with .high effort (no unnecessary High flagship!)
+        let fReview = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "tools": toolsSpec,
+            "messages": [
+                ["role": "user", "content": "请对刚才生成的微信小绿书内容做一次最终审核与校对"]
+            ]
+        ], sessionHeader: "sess-review-1")
+        let dReview = router.route(requestedModel: "auto", features: fReview, providers: [provider], models: allModels, policy: policy)
+        XCTAssertEqual(dReview.selectedModelUUID, medModel.id)
+        XCTAssertEqual(dReview.selectedEffort, .high)
+
+        // 2. End-to-end streaming tool_calls & safe reasoning_effort upstream injection:
+        //    Verify streaming tool_calls sets hasToolCalls=true (no false wasToolStarved ping-pong even with hysteresis ON),
+        //    and reasoning_effort is safely injected into upstream request for reasoning-capable Medium model.
+        final class CaptureBox: @unchecked Sendable {
+            private let lock = NSLock()
+            var efforts: [String?] = []
+            var models: [String] = []
+            func append(effort: String?, model: String) {
+                lock.withLock {
+                    efforts.append(effort)
+                    models.append(model)
+                }
+            }
+            func snapshot() -> ([String?], [String]) {
+                lock.withLock { (efforts, models) }
+            }
+        }
+        let captures = CaptureBox()
+        let mockUpstream = LoopbackHTTPServer { req, writer in
+            guard req.method == "POST", req.path == "/v1/chat/completions",
+                  let body = try? JSONSerialization.jsonObject(with: req.body) as? [String: Any] else {
+                writer.sendJSON(statusCode: 404, body: Data())
+                return
+            }
+            captures.append(effort: body["reasoning_effort"] as? String, model: (body["model"] as? String) ?? "")
+            writer.startChunkedStream(statusCode: 200)
+            let chunk1: [String: Any] = [
+                "id": "chatcmpl-tool-stream",
+                "object": "chat.completion.chunk",
+                "created": Int(Date().timeIntervalSince1970),
+                "model": (body["model"] as? String) ?? "gpt-6.1-terra",
+                "choices": [[
+                    "index": 0,
+                    "delta": [
+                        "role": "assistant",
+                        "tool_calls": [[
+                            "index": 0,
+                            "id": "call_stream_1",
+                            "type": "function",
+                            "function": ["name": "ego_browser_snapshot", "arguments": "{}"]
+                        ]]
+                    ],
+                    "finish_reason": NSNull()
+                ]]
+            ]
+            let chunk2: [String: Any] = [
+                "id": "chatcmpl-tool-stream",
+                "object": "chat.completion.chunk",
+                "created": Int(Date().timeIntervalSince1970),
+                "model": (body["model"] as? String) ?? "gpt-6.1-terra",
+                "choices": [[
+                    "index": 0,
+                    "delta": [:],
+                    "finish_reason": "tool_calls"
+                ]],
+                "usage": ["prompt_tokens": 50, "completion_tokens": 12, "total_tokens": 62]
+            ]
+            if let d1 = try? JSONSerialization.data(withJSONObject: chunk1),
+               let s1 = String(data: d1, encoding: .utf8) {
+                _ = writer.writeStreamChunk(Data("data: \(s1)\n\n".utf8))
+            }
+            if let d2 = try? JSONSerialization.data(withJSONObject: chunk2),
+               let s2 = String(data: d2, encoding: .utf8) {
+                _ = writer.writeStreamChunk(Data("data: \(s2)\n\n".utf8))
+            }
+            _ = writer.writeStreamChunk(Data("data: [DONE]\n\n".utf8))
+            writer.finishStream()
+        }
+        let upstreamPort = try mockUpstream.start(port: 0)
+        defer { mockUpstream.stop() }
+
+        let store = makeTempStore()
+        let keychain = InMemoryKeychainService()
+        let engine = AutoModelEngine(persistence: store, keychain: keychain, autoStartProxyIfConfigured: false)
+        let liveProvider = ProviderConfig(name: "LiveDyn", baseURL: "http://127.0.0.1:\(upstreamPort)/v1", isEnabled: true, healthStatus: .healthy)
+        try engine.upsertProvider(liveProvider, apiKey: "sk-dyn")
+
+        let eMed = ModelConfig(
+            providerID: liveProvider.id,
+            modelID: "gpt-6.1-terra",
+            displayName: "gpt-6.1-terra",
+            inputPricePerMillion: 1.5,
+            outputPricePerMillion: 4.5,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .coding,
+            qualityScore: 88,
+            speedScore: 82
+        )
+        let eHigh = ModelConfig(
+            providerID: liveProvider.id,
+            modelID: "gpt-6-astra",
+            displayName: "GPT-6 Astra",
+            inputPricePerMillion: 10.0,
+            outputPricePerMillion: 30.0,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .complexReasoning,
+            qualityScore: 98,
+            speedScore: 60
+        )
+        engine.upsertModel(eMed)
+        engine.upsertModel(eHigh)
+        engine.setTierModel(tier: .low, modelUUID: eMed.id, isManual: true)
+        engine.setTierModel(tier: .medium, modelUUID: eMed.id, isManual: true)
+        engine.setTierModel(tier: .high, modelUUID: eHigh.id, isManual: true)
+        // Even with hysteresis turned ON, streaming tool_calls must NOT falsely trigger wasToolStarved escalation
+        engine.updatePolicy { $0.enablePhaseDowngradeHysteresis = true }
+
+        let out1 = await engine.executeChatCompletion(
+            payload: [
+                "model": "auto",
+                "stream": true,
+                "tools": toolsSpec,
+                "messages": [
+                    ["role": "user", "content": "通过 ego-lite 打开网页并抓取内容"]
+                ]
+            ],
+            source: .externalProxy,
+            sessionHeader: "sess-stream-tool-1"
+        )
+        XCTAssertEqual(out1.httpStatusCode, 200)
+        XCTAssertEqual(out1.callRecord.executedModelID, "gpt-6.1-terra")
+
+        let out2 = await engine.executeChatCompletion(
+            payload: [
+                "model": "auto",
+                "stream": true,
+                "tools": toolsSpec,
+                "messages": [
+                    ["role": "user", "content": "通过 ego-lite 打开网页并抓取内容"],
+                    ["role": "assistant", "content": "", "tool_calls": [[
+                        "id": "call_stream_1", "type": "function", "function": ["name": "ego_browser_snapshot", "arguments": "{}"]
+                    ]]],
+                    ["role": "tool", "tool_call_id": "call_stream_1", "content": "{\"ok\":true}"]
+                ]
+            ],
+            source: .externalProxy,
+            sessionHeader: "sess-stream-tool-1"
+        )
+        XCTAssertEqual(out2.httpStatusCode, 200)
+        // Must remain on gpt-6.1-terra (NOT falsely ping-pong to gpt-6-astra!) and dynamically drop effort to "low"
+        XCTAssertEqual(out2.callRecord.executedModelID, "gpt-6.1-terra")
+        XCTAssertEqual(out2.callRecord.decision.selectedEffort, .low)
+
+        let (capturedEfforts, capturedModels) = captures.snapshot()
+        XCTAssertEqual(capturedModels, ["gpt-6.1-terra", "gpt-6.1-terra"])
+        XCTAssertEqual(capturedEfforts, ["medium", "low"])
+    }
+
+    @MainActor
+    func testSingleTurnSidecarAntiHijackAndOutputTokenNormalizedSpeedComparison() async throws {
+        // 1. A single-turn sidecar/background call sharing the same session header must NOT hijack
+        //    an active multi-turn sticky session onto a different tier model.
+        let router = ModelRouter()
+        let pID = UUID()
+        let provider = ProviderConfig(id: pID, name: "Relay", baseURL: "https://relay.local/v1")
+
+        let lowModel = ModelConfig(
+            providerID: pID,
+            modelID: "auto/glm-5.3-flash",
+            displayName: "GLM-5.3-Flash",
+            inputPricePerMillion: 0.12,
+            outputPricePerMillion: 0.42,
+            capabilities: [.chat, .tools],
+            defaultRole: .fastEconomy,
+            qualityScore: 72,
+            speedScore: 95
+        )
+        let medModel = ModelConfig(
+            providerID: pID,
+            modelID: "gpt-6.1-terra",
+            displayName: "gpt-6.1-terra",
+            inputPricePerMillion: 1.5,
+            outputPricePerMillion: 4.5,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .coding,
+            qualityScore: 88,
+            speedScore: 85
+        )
+        let highModel = ModelConfig(
+            providerID: pID,
+            modelID: "auto/gpt-6-astra",
+            displayName: "GPT-6 Astra",
+            inputPricePerMillion: 10.0,
+            outputPricePerMillion: 50.0,
+            capabilities: [.chat, .coding, .reasoning, .tools],
+            defaultRole: .complexReasoning,
+            qualityScore: 98,
+            speedScore: 60
+        )
+
+        let policy = RoutingPolicyConfig(
+            policyVersion: 1,
+            activeStrategy: .balanced,
+            enableSessionStickiness: true,
+            lowTierModelID: lowModel.id,
+            mediumTierModelID: medModel.id,
+            highTierModelID: highModel.id,
+            preferTierMappingInAuto: true,
+            enablePhaseDowngradeHysteresis: false,
+            strictThreeTierPoolOnly: true
+        )
+        let models = [lowModel, medModel, highModel]
+
+        // Establish multi-turn session on Medium (gpt-6.1-terra)
+        let multiTurnFeatures = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "messages": [
+                ["role": "user", "content": "请实现一个完整的本地路由插件，并保持多轮会话稳定"],
+                ["role": "assistant", "content": "好的，先搭好接口"],
+                ["role": "user", "content": "继续实现工具执行与状态保存"]
+            ]
+        ], sessionHeader: "sess-sidecar-guard")
+        XCTAssertTrue(multiTurnFeatures.isMultiTurn)
+        let dMain1 = router.route(requestedModel: "auto", features: multiTurnFeatures, providers: [provider], models: models, policy: policy)
+        XCTAssertEqual(dMain1.selectedModelUUID, medModel.id)
+        router.recordSuccessfulSessionModel(
+            fingerprint: multiTurnFeatures.conversationFingerprint,
+            modelUUID: medModel.id,
+            policyVersion: 1,
+            isMultiTurn: true
+        )
+
+        // Single-turn sidecar call ("grep ...") sharing the same session header routes to Low,
+        // and tries to record — anti-hijack must ignore overwriting the multi-turn sticky binding.
+        let sidecarFeatures = RequestFeatureExtractor.extract(from: [
+            "model": "auto",
+            "messages": [
+                ["role": "user", "content": "grep where config is saved"]
+            ]
+        ], sessionHeader: "sess-sidecar-guard")
+        XCTAssertFalse(sidecarFeatures.isMultiTurn)
+        let dSidecar = router.route(requestedModel: "auto", features: sidecarFeatures, providers: [provider], models: models, policy: policy)
+        XCTAssertEqual(dSidecar.selectedModelUUID, lowModel.id)
+        router.recordSuccessfulSessionModel(
+            fingerprint: sidecarFeatures.conversationFingerprint,
+            modelUUID: lowModel.id,
+            policyVersion: 1,
+            isMultiTurn: false
+        )
+
+        // Next multi-turn call on the main session must stay locked to gpt-6.1-terra!
+        let dMain2 = router.route(requestedModel: "auto", features: multiTurnFeatures, providers: [provider], models: models, policy: policy)
+        XCTAssertEqual(dMain2.selectedModelUUID, medModel.id)
+
+        // 2. Output-token-normalized speed comparison:
+        //    Baseline (GPT-6 Astra) averaged 14.5s on short 350-tok outputs (TTFT=9.5s, decode=14.3ms/tok).
+        //    Fast model (gpt-6.1-terra) took 28s on long 1,800-tok outputs (TTFT=4.0s, decode=13.3ms/tok).
+        //    With normalization, GPT-6 Astra would take 9.5 + 1.8*14.3 = 35.2s for 1,800 tokens -> AutoRoute is faster (+20%), NOT "slower"!
+        let store = makeTempStore()
+        let keychain = InMemoryKeychainService()
+        let engine = AutoModelEngine(persistence: store, keychain: keychain, autoStartProxyIfConfigured: false)
+        try engine.upsertProvider(provider, apiKey: "sk-norm")
+        engine.upsertModel(lowModel)
+        engine.upsertModel(medModel)
+        engine.upsertModel(highModel)
+        engine.setTierModel(tier: .high, modelUUID: highModel.id, isManual: true)
+
+        let baseFeat = RequestFeatureExtractor.extract(from: ["messages": [["role": "user", "content": "test normalized speed"]]])
+        let highDec = engine.router.route(requestedModel: "auto/gpt-6-astra", features: baseFeat, providers: engine.config.providers, models: engine.config.models, policy: engine.config.policy)
+        let medDec = engine.router.route(requestedModel: "gpt-6.1-terra", features: baseFeat, providers: engine.config.providers, models: engine.config.models, policy: engine.config.policy)
+
+        func makeRec(model: ModelConfig, dec: RoutingDecision, outTok: Int, ttftMs: Double, totalMs: Double) -> CallRecord {
+            let usage = TokenUsage(promptTokens: 10_000, completionTokens: outTok)
+            let cost = model.calculateCostUSD(promptTokens: 10_000, completionTokens: outTok)
+            return CallRecord(
+                source: .externalProxy,
+                status: .success,
+                requestedModel: "auto",
+                executedModelID: model.modelID,
+                executedModelDisplayName: model.displayName,
+                executedProviderName: provider.name,
+                httpStatusCode: 200,
+                requestFeatures: baseFeat,
+                decision: dec,
+                attempts: [
+                    UpstreamAttemptRecord(
+                        attemptIndex: 1,
+                        modelUUID: model.id,
+                        modelID: model.modelID,
+                        providerID: provider.id,
+                        providerName: provider.name,
+                        httpStatusCode: 200,
+                        succeeded: true,
+                        firstTokenMs: ttftMs,
+                        totalLatencyMs: totalMs,
+                        usage: usage,
+                        usageSource: .upstreamReported,
+                        usageEstimationMethod: nil,
+                        costUSD: cost,
+                        costStatus: .calculated,
+                        errorMessage: nil
+                    )
+                ],
+                routingDecisionMs: 1.0,
+                upstreamFirstTokenMs: ttftMs,
+                totalCompletionMs: totalMs,
+                finalUsage: usage,
+                usageSource: .upstreamReported,
+                usageEstimationMethod: nil,
+                costStatus: .calculated,
+                primaryAttemptCostUSD: cost,
+                retryAttemptsCostUSD: 0,
+                totalCostUSD: cost
+            )
+        }
+
+        let highSample = makeRec(model: highModel, dec: highDec, outTok: 350, ttftMs: 9_500, totalMs: 14_500)
+        let medLongTurn1 = makeRec(model: medModel, dec: medDec, outTok: 1_800, ttftMs: 4_000, totalMs: 28_000)
+        let medLongTurn2 = makeRec(model: medModel, dec: medDec, outTok: 1_800, ttftMs: 4_000, totalMs: 28_000)
+        try store.saveHistory([highSample, medLongTurn1, medLongTurn2])
+
+        let reloaded = AutoModelEngine(persistence: store, keychain: keychain, autoStartProxyIfConfigured: false)
+        let sessionImpact = try XCTUnwrap(reloaded.sessionImpactSummary(for: [medLongTurn1, medLongTurn2]))
+        XCTAssertGreaterThan(sessionImpact.speedGainPercent ?? -999, 15.0)
+        XCTAssertGreaterThan(sessionImpact.speedSavedMsPerTurn ?? -999, 6000.0)
+        XCTAssertTrue(sessionImpact.speedBasisLabel.contains("按用量归一化"))
     }
 }
