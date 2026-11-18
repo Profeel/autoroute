@@ -64,6 +64,7 @@ public final class AutoModelEngine: ObservableObject {
     @Published public private(set) var cooldownUntilByModelID: [UUID: Date] = [:]
     @Published public private(set) var localAPITokenPersistenceError: String?
     private var transientFailureCountByModelID: [UUID: Int] = [:]
+    private var retryNotBeforeByProviderID: [UUID: UInt64] = [:]
 
     public var isLocalAPITokenPersistent: Bool { localAPITokenPersistenceError == nil }
 
@@ -77,6 +78,9 @@ public final class AutoModelEngine: ObservableObject {
     public private(set) var localAPIToken: String
     private var proxyServer: ProxyServer?
     private var backgroundMaintenanceTask: Task<Void, Never>?
+    private var activeRequestCount = 0
+    private var requestDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isShuttingDown = false
     private var budgetLedger: BudgetLedger
 
     public init(
@@ -173,6 +177,23 @@ public final class AutoModelEngine: ObservableObject {
     public func stopProxy() {
         proxyServer?.stop()
         proxyState = .stopped
+    }
+
+    public func shutdown() async throws {
+        isShuttingDown = true
+        stopBackgroundTasks()
+        stopProxy()
+        stopLocalTestUpstream()
+        if activeRequestCount > 0 {
+            await withCheckedContinuation { requestDrainWaiters.append($0) }
+        }
+        do {
+            try await persistence.flush()
+        } catch {
+            lastPersistenceError = "退出前持久化失败：\(error.localizedDescription)"
+            isShuttingDown = false
+            throw error
+        }
     }
 
     public func stopBackgroundTasks() {
@@ -381,6 +402,10 @@ public final class AutoModelEngine: ObservableObject {
             case .authError:
                 status = .authError
             case .networkError, .invalidURL:
+                status = .networkError
+            case .clientDisconnected:
+                status = .healthy
+            case .requestDeadlineExceeded:
                 status = .networkError
             case .httpError, .modelUnavailable, .invalidResponse:
                 status = .serverError
@@ -1373,11 +1398,12 @@ public final class AutoModelEngine: ObservableObject {
     }
 
     public func saveConfig() {
-        do {
-            try persistence.saveConfig(config)
-            lastPersistenceError = nil
-        } catch {
-            lastPersistenceError = error.localizedDescription
+        persistence.enqueueConfig(config) { [weak self] result in
+            if case .failure(let error) = result {
+                Task { @MainActor [weak self] in
+                    self?.lastPersistenceError = "配置持久化失败：\(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -1421,6 +1447,15 @@ public final class AutoModelEngine: ObservableObject {
         onStreamHeadersReady: (@Sendable ([String: String]) async throws -> Void)? = nil,
         onStreamChunk: (@Sendable (Data) async throws -> Void)? = nil
     ) async -> ExecutionOutcome {
+        activeRequestCount += 1
+        defer {
+            activeRequestCount -= 1
+            if activeRequestCount == 0 {
+                let waiters = requestDrainWaiters
+                requestDrainWaiters.removeAll()
+                for waiter in waiters { waiter.resume() }
+            }
+        }
         let resolvedClientName = clientName ?? (source == .testBench ? "测试台" : nil)
         let requestedModel = (payload["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "auto"
         let effectiveRequestedModel = requestedModel.isEmpty ? "auto" : requestedModel
@@ -1435,6 +1470,9 @@ public final class AutoModelEngine: ObservableObject {
 
         let agentResolution: ResolvedAgentRequest
         do {
+            if isShuttingDown {
+                throw AgentRequestResolutionError(message: "AutoRoute 正在退出，已停止接收新请求")
+            }
             agentResolution = try AgentRequestResolver.resolve(
                 requestedModel: effectiveRequestedModel,
                 agentHeader: agentHeader,
@@ -1479,7 +1517,7 @@ public final class AutoModelEngine: ObservableObject {
                 clientName: resolvedClientName,
                 endpointPath: endpointPath
             )
-            appendCallRecord(record)
+            if !isShuttingDown { await appendCallRecord(record) }
             return ExecutionOutcome(
                 httpStatusCode: resolutionError.statusCode,
                 headers: [:],
@@ -1532,7 +1570,7 @@ public final class AutoModelEngine: ObservableObject {
                 clientName: resolvedClientName,
                 endpointPath: endpointPath
             )
-            appendCallRecord(record)
+            await appendCallRecord(record)
             return ExecutionOutcome(
                 httpStatusCode: budgetError.statusCode,
                 headers: ["Retry-After": "3600"],
@@ -1578,7 +1616,7 @@ public final class AutoModelEngine: ObservableObject {
                 clientName: resolvedClientName,
                 endpointPath: endpointPath
             )
-            appendCallRecord(record)
+            await appendCallRecord(record)
             return ExecutionOutcome(
                 httpStatusCode: status,
                 headers: [:],
@@ -1638,7 +1676,7 @@ public final class AutoModelEngine: ObservableObject {
                 clientName: resolvedClientName,
                 endpointPath: endpointPath
             )
-            appendCallRecord(record)
+            await appendCallRecord(record)
             return ExecutionOutcome(
                 httpStatusCode: status,
                 headers: [:],
@@ -1652,18 +1690,52 @@ public final class AutoModelEngine: ObservableObject {
         if config.policy.enableRetryOnUpstreamFailure && decision.isAutoRouted {
             candidateQueue.append(contentsOf: decision.orderedFallbackCandidateIDs)
         }
+        let allowedAttempts = config.policy.enableRetryOnUpstreamFailure && decision.isAutoRouted
+            ? max(1, config.policy.maxUpstreamAttempts)
+            : 1
+        if candidateQueue.count > allowedAttempts {
+            decision.matchedRules.append("最大尝试次数 \(allowedAttempts)，跳过其余候选")
+            candidateQueue.removeSubrange(allowedAttempts..<candidateQueue.count)
+        }
 
         let overallStart = DispatchTime.now()
+        let requestDeadlineNanos = DispatchTime.now().uptimeNanoseconds &+ UInt64(max(1, config.policy.maxRequestDurationSeconds) * 1_000_000_000)
         var attempts: [UpstreamAttemptRecord] = []
         var lastError: UpstreamError?
         let explicitTier = ModelTier.matchExplicitTier(requestedModel: routingRequestedModel)
 
-        for (idx, candidateID) in candidateQueue.enumerated() {
+        candidateAttempts: for (idx, candidateID) in candidateQueue.enumerated() {
             guard let model = config.models.first(where: { $0.id == candidateID }),
                   let provider = config.providers.first(where: { $0.id == model.providerID }) else {
                 continue
             }
 
+            while let notBefore = retryNotBeforeByProviderID[provider.id], notBefore > DispatchTime.now().uptimeNanoseconds {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if notBefore > now {
+                    guard notBefore < requestDeadlineNanos else {
+                        decision.matchedRules.append("Retry-After 超出剩余 deadline，跳过候选 \(model.modelID)")
+                        if lastError == nil {
+                            lastError = .httpError(statusCode: 429, rawBody: Data(), message: "供应商仍处于 Retry-After 冷却中")
+                        }
+                        continue candidateAttempts
+                    }
+                    decision.matchedRules.append("遵守供应商 Retry-After，等待后尝试 \(model.modelID)")
+                    do {
+                        try await Task.sleep(nanoseconds: notBefore - now)
+                    } catch {
+                        lastError = .clientDisconnected
+                        decision.matchedRules.append("等待 Retry-After 时请求取消，停止后续候选")
+                        break candidateAttempts
+                    }
+                }
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now < requestDeadlineNanos else {
+                lastError = .requestDeadlineExceeded
+                decision.matchedRules.append("累计 deadline 到期，停止后续候选")
+                break candidateAttempts
+            }
             let apiKey = try? keychain.getAPIKey(for: provider.id)
             let responseHeaders = buildAutoModelHeaders(
                 decision: decision,
@@ -1673,25 +1745,34 @@ public final class AutoModelEngine: ObservableObject {
             )
 
             let headerFlag = LockedFlag()
-            let result = await upstreamClient.executeChatCompletion(
-                provider: provider,
-                model: model,
-                apiKey: apiKey,
-                originalPayload: payload,
-                estimatedInputTokens: features.estimatedInputTokens,
-                stream: stream,
-                nativeResponsesPayload: nativeResponsesPayload,
-                resolvedEffort: decision.selectedEffort,
-                clientProvidedEffort: features.clientProvidedEffort,
-                secretsToRedact: secrets,
-                onStreamHeadersReady: {
-                    headerFlag.markTrue()
-                    if let onStreamHeadersReady {
-                        try await onStreamHeadersReady(responseHeaders)
-                    }
-                },
-                onStreamChunk: onStreamChunk
-            )
+            let attemptEstimatedInputTokens = features.estimatedInputTokens
+            let attemptSelectedEffort = decision.selectedEffort
+            let attemptClientProvidedEffort = features.clientProvidedEffort
+            let upstreamClient = self.upstreamClient
+            let deadlineCheckNow = DispatchTime.now().uptimeNanoseconds
+            let remainingNanos = requestDeadlineNanos > deadlineCheckNow
+                ? requestDeadlineNanos - deadlineCheckNow : 0
+            let result = await executeWithDeadline(nanoseconds: remainingNanos) {
+                await upstreamClient.executeChatCompletion(
+                    provider: provider,
+                    model: model,
+                    apiKey: apiKey,
+                    originalPayload: payload,
+                    estimatedInputTokens: attemptEstimatedInputTokens,
+                    stream: stream,
+                    nativeResponsesPayload: nativeResponsesPayload,
+                    resolvedEffort: attemptSelectedEffort,
+                    clientProvidedEffort: attemptClientProvidedEffort,
+                    secretsToRedact: secrets,
+                    onStreamHeadersReady: {
+                        headerFlag.markTrue()
+                        if let onStreamHeadersReady {
+                            try await onStreamHeadersReady(responseHeaders)
+                        }
+                    },
+                    onStreamChunk: onStreamChunk
+                )
+            }
             let hasEmittedStreamHeaders = headerFlag.value
 
             switch result {
@@ -1808,7 +1889,7 @@ public final class AutoModelEngine: ObservableObject {
                     endpointPath: endpointPath,
                     executionOrigin: executionOrigin(for: provider)
                 )
-                appendCallRecord(callRecord)
+                await appendCallRecord(callRecord)
 
                 return ExecutionOutcome(
                     httpStatusCode: completion.statusCode,
@@ -1834,13 +1915,19 @@ public final class AutoModelEngine: ObservableObject {
                     } else {
                         recordTransientCooldown(for: model.id, reason: persistedErrMsg)
                     }
-                case .httpError(let code, _, _):
+                case .httpError(let code, _, _, _):
                     if code == 402 || code == 404 || code == 410 {
                         let mappedAvail: ModelAvailabilityStatus = (code == 402) ? .insufficientCredits : (code == 410 ? .retired : .unavailable)
                         updateModelAvailability(modelID: model.id, status: mappedAvail, note: "运行时自动剔除：\(persistedErrMsg)", autoEvicted: true)
                     } else if code == 429 || code == 408 || code >= 500 {
                         recordTransientCooldown(for: model.id, reason: persistedErrMsg)
                     }
+                case .clientDisconnected:
+                    // The caller, not the provider, ended the request. Do not cooldown or retry another model.
+                    break
+                case .requestDeadlineExceeded:
+                    // This is the request-level budget, not evidence that this provider is unhealthy.
+                    break
                 case .invalidURL, .invalidResponse:
                     recordTransientCooldown(for: model.id, reason: persistedErrMsg)
                 }
@@ -1863,9 +1950,26 @@ public final class AutoModelEngine: ObservableObject {
                     errorMessage: persistedErrMsg
                 ))
 
+                if let seconds = upstreamErr.retryAfterSeconds {
+                    attempts[attempts.count - 1].retryAfterSeconds = seconds
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    let safeSeconds = min(seconds, Double((UInt64.max - now) / 1_000_000_000))
+                    retryNotBeforeByProviderID[provider.id] = now + UInt64(ceil(safeSeconds * 1_000_000_000))
+                }
+
+                // A client disconnect is terminal for this request. Retrying another provider would
+                // spend upstream capacity for a response nobody can receive.
+                if case .clientDisconnected = upstreamErr {
+                    break candidateAttempts
+                }
+                if case .requestDeadlineExceeded = upstreamErr {
+                    break candidateAttempts
+                }
+
                 // Once SSE headers/chunks have been emitted to the caller socket, never switch models mid-stream.
                 if stream && hasEmittedStreamHeaders {
-                    break
+                    decision.matchedRules.append("流式响应已开始，停止后续候选")
+                    break candidateAttempts
                 }
             }
         }
@@ -1908,7 +2012,7 @@ public final class AutoModelEngine: ObservableObject {
                 config.providers.first(where: { $0.id == providerID }).map { executionOrigin(for: $0) }
             }
         )
-        appendCallRecord(failedRecord)
+        await appendCallRecord(failedRecord)
 
         return ExecutionOutcome(
             httpStatusCode: finalStatus,
@@ -1918,6 +2022,31 @@ public final class AutoModelEngine: ObservableObject {
         )
     }
 
+    private func executeWithDeadline(
+        nanoseconds: UInt64,
+        operation: @escaping @Sendable () async -> Result<UpstreamCompletionResult, UpstreamError>
+    ) async -> Result<UpstreamCompletionResult, UpstreamError> {
+        guard nanoseconds > 0 else { return .failure(.requestDeadlineExceeded) }
+
+        return await withTaskGroup(of: Result<UpstreamCompletionResult, UpstreamError>.self) { group in
+            group.addTask {
+                await operation()
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                    return .failure(.requestDeadlineExceeded)
+                } catch {
+                    return .failure(.requestDeadlineExceeded)
+                }
+            }
+
+            let firstResult = await group.next() ?? .failure(.requestDeadlineExceeded)
+            group.cancelAll()
+            return firstResult
+        }
+    }
+
     // MARK: - Cost, Comparison & Helpers
 
     private func persistedUpstreamErrorSummary(for error: UpstreamError, detailedMessage: String) -> String {
@@ -1925,13 +2054,17 @@ public final class AutoModelEngine: ObservableObject {
         switch error {
         case .invalidURL:
             return "供应商 URL 无效"
+        case .clientDisconnected:
+            return "客户端已断开流式连接"
+        case .requestDeadlineExceeded:
+            return "请求达到累计 deadline"
         case .authError(let statusCode, _):
             return "上游鉴权失败 (HTTP \(statusCode))"
         case .modelUnavailable(let statusCode, _, _):
             return "上游模型不可用 (HTTP \(statusCode))"
         case .networkError:
             return "上游网络连接失败"
-        case .httpError(let statusCode, _, _):
+        case .httpError(let statusCode, _, _, _):
             return "上游返回 HTTP \(statusCode)"
         case .invalidResponse:
             return "上游响应格式异常"
@@ -2291,11 +2424,20 @@ public final class AutoModelEngine: ObservableObject {
         callHistory[index].comparison = comparison
     }
 
-    func persistCallHistory() {
-        try? persistence.saveHistory(callHistory)
+    func persistCallHistory() async {
+        persistence.enqueueCompletionSnapshot(config: config, history: callHistory,
+            ledger: budgetLedger, funnel: onboardingFunnel) { [weak self] result in
+            Task { @MainActor [weak self] in
+                if case .failure(let error) = result {
+                    self?.lastPersistenceError = "请求状态持久化失败：\(error.localizedDescription)"
+                } else if case .success = result {
+                    self?.lastPersistenceError = nil
+                }
+            }
+        }
     }
 
-    private func appendCallRecord(_ record: CallRecord) {
+    private func appendCallRecord(_ record: CallRecord) async {
         callHistory.insert(record, at: 0)
         if callHistory.count > 500 {
             callHistory = Array(callHistory.prefix(500))
@@ -2305,17 +2447,11 @@ public final class AutoModelEngine: ObservableObject {
            record.executionOrigin == .real,
            onboardingFunnel.isAwaitingFirstRealRoute {
             onboardingFunnel.recordRealSuccess(at: record.timestamp)
-            try? persistence.saveOnboardingFunnel(onboardingFunnel)
         }
         if !record.attempts.isEmpty {
             budgetLedger.record(record)
-            do {
-                try persistence.saveBudgetLedger(budgetLedger)
-            } catch {
-                lastPersistenceError = "预算账本持久化失败：\(error.localizedDescription)"
-            }
         }
-        try? persistence.saveHistory(callHistory)
+        await persistCallHistory()
     }
 
     private func openAIErrorJSON(message: String, type: String, code: String) -> Data {

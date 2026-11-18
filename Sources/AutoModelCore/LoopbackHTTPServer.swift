@@ -61,7 +61,8 @@ public final class HTTPConnectionWriter: @unchecked Sendable {
         close()
     }
 
-    public func startChunkedStream(statusCode: Int = 200, headers: [String: String] = [:]) {
+    @discardableResult
+    public func startChunkedStream(statusCode: Int = 200, headers: [String: String] = [:]) -> Bool {
         var allHeaders = headers
         allHeaders["Content-Type"] = "text/event-stream; charset=utf-8"
         allHeaders["Cache-Control"] = "no-cache"
@@ -69,7 +70,9 @@ public final class HTTPConnectionWriter: @unchecked Sendable {
         allHeaders["Transfer-Encoding"] = "chunked"
         allHeaders["Connection"] = "close"
         isChunked = true
-        sendRawHeaders(statusCode: statusCode, headers: allHeaders)
+        let sent = sendRawHeaders(statusCode: statusCode, headers: allHeaders)
+        if !sent { close() }
+        return sent
     }
 
     public func writeStreamChunk(_ data: Data) -> Bool {
@@ -113,11 +116,12 @@ public final class HTTPConnectionWriter: @unchecked Sendable {
         }
     }
 
-    private func sendRawHeaders(statusCode: Int, headers: [String: String]) {
+    @discardableResult
+    private func sendRawHeaders(statusCode: Int, headers: [String: String]) -> Bool {
         lock.lock()
         if headersSent || isClosed {
             lock.unlock()
-            return
+            return false
         }
         headersSent = true
         lock.unlock()
@@ -129,7 +133,7 @@ public final class HTTPConnectionWriter: @unchecked Sendable {
         lines.append("")
         lines.append("")
         let raw = lines.joined(separator: "\r\n")
-        _ = writeBytes(Data(raw.utf8))
+        return writeBytes(Data(raw.utf8))
     }
 
     @discardableResult

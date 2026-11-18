@@ -89,7 +89,7 @@ final class NativeResponsesTests: XCTestCase {
         let provider = ProviderConfig(name: "test", baseURL: "http://127.0.0.1:1", apiProtocol: .openAIChatCompletions)
         let model = ModelConfig(providerID: provider.id, modelID: "test")
         let result = await UpstreamClient().executeChatCompletion(provider: provider, model: model, apiKey: nil, originalPayload: [:], estimatedInputTokens: 0, stream: false, nativeResponsesPayload: ["input": "hi"])
-        guard case .failure(.httpError(let code, _, _)) = result else { return XCTFail("expected HTTP error") }
+        guard case .failure(.httpError(let code, _, _, _)) = result else { return XCTFail("expected HTTP error") }
         XCTAssertEqual(code, 400)
     }
 }

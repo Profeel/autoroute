@@ -113,6 +113,7 @@ final class P0SecurityTests: XCTestCase {
         ]
 
         let outcome = await engine.executeChatCompletion(payload: payload, source: .externalProxy)
+        try await store.flush()
         XCTAssertEqual(outcome.httpStatusCode, 400)
         XCTAssertTrue(String(decoding: outcome.responseBody, as: UTF8.self).contains(sentinel), "client can receive the detailed upstream error")
 
@@ -128,6 +129,7 @@ final class P0SecurityTests: XCTestCase {
 
         engine.setRecordRequestBody(true)
         let detailed = await engine.executeChatCompletion(payload: payload, source: .externalProxy)
+        try await store.flush()
         XCTAssertTrue(detailed.callRecord.errorMessage?.contains(sentinel) == true)
         XCTAssertTrue(try String(contentsOf: store.historyFileURL, encoding: .utf8).contains(sentinel))
     }
@@ -202,6 +204,7 @@ final class P0SecurityTests: XCTestCase {
         }
 
         let defaultResult = try await sendChat()
+        try await store.flush()
         XCTAssertEqual(defaultResult.1.statusCode, 200)
         XCTAssertNil(engine.callHistory.first?.requestPreview)
         XCTAssertNil(engine.callHistory.first?.responsePreview)
@@ -209,9 +212,11 @@ final class P0SecurityTests: XCTestCase {
 
         engine.setRecordRequestBody(true)
         _ = try await sendChat()
+        try await store.flush()
         XCTAssertEqual(engine.callHistory.first?.requestPreview?.contains("private-body-sentinel"), true)
         engine.setRecordRequestBody(false)
         _ = try await sendChat()
+        try await store.flush()
         XCTAssertNil(engine.callHistory.first?.requestPreview)
         XCTAssertNil(engine.callHistory.first?.responsePreview)
 

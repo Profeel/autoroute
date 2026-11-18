@@ -1,20 +1,33 @@
 import Foundation
 
+public struct ClientStreamDisconnectedError: Error, Sendable {
+    public init() {}
+}
+
 public enum UpstreamError: Error, LocalizedError, Sendable {
     case invalidURL(String)
+    case clientDisconnected
+    case requestDeadlineExceeded
     case authError(statusCode: Int, message: String)
     case modelUnavailable(statusCode: Int, message: String, availability: ModelAvailabilityStatus)
     case networkError(message: String)
-    case httpError(statusCode: Int, rawBody: Data, message: String)
+    case httpError(statusCode: Int, rawBody: Data, message: String, retryAfterSeconds: Double? = nil)
     case invalidResponse(message: String)
+
+    public var retryAfterSeconds: Double? {
+        if case .httpError(429, _, _, let delay) = self { return delay }
+        return nil
+    }
 
     public var statusCode: Int {
         switch self {
         case .invalidURL: return 400
+        case .clientDisconnected: return 499
+        case .requestDeadlineExceeded: return 504
         case .authError(let code, _): return code
         case .modelUnavailable(let code, _, _): return code
         case .networkError: return 502
-        case .httpError(let code, _, _): return code
+        case .httpError(let code, _, _, _): return code
         case .invalidResponse: return 502
         }
     }
@@ -23,13 +36,17 @@ public enum UpstreamError: Error, LocalizedError, Sendable {
         switch self {
         case .invalidURL(let url):
             return "无效的供应商 URL: \(url)"
+        case .clientDisconnected:
+            return "客户端已断开流式连接"
+        case .requestDeadlineExceeded:
+            return "请求达到累计上游 deadline"
         case .authError(_, let msg):
             return "鉴权失败 (API Key 无效或无权限): \(msg)"
         case .modelUnavailable(_, let msg, _):
             return "模型不可用: \(msg)"
         case .networkError(let msg):
             return "网络连接失败: \(msg)"
-        case .httpError(let code, _, let msg):
+        case .httpError(let code, _, let msg, _):
             return "上游返回 HTTP \(code): \(msg)"
         case .invalidResponse(let msg):
             return "上游响应格式异常: \(msg)"
@@ -271,7 +288,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 }
 
                 if !(200...299).contains(http.statusCode) {
-                    return .failure(classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact))
+                    return .failure(classifyHTTPError(response: http, data: data, secrets: secretsToRedact))
                 }
 
                 // Parse OpenAI response to extract assistant text, usage, and normalize model field
@@ -324,7 +341,7 @@ public final class UpstreamClient: @unchecked Sendable {
                         errorBytes.append(byte)
                         if errorBytes.count > 65_536 { break }
                     }
-                    return .failure(classifyHTTPError(statusCode: http.statusCode, data: errorBytes, secrets: secretsToRedact))
+                    return .failure(classifyHTTPError(response: http, data: errorBytes, secrets: secretsToRedact))
                 }
 
                 if let onStreamHeadersReady {
@@ -446,6 +463,12 @@ public final class UpstreamClient: @unchecked Sendable {
                     hasToolCalls: observedStreamToolCalls
                 ))
             }
+        } catch is ClientStreamDisconnectedError {
+            return .failure(.clientDisconnected)
+        } catch is CancellationError {
+            return .failure(.clientDisconnected)
+        } catch let error as URLError where error.code == .cancelled {
+            return .failure(.clientDisconnected)
         } catch {
             let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
             return .failure(.networkError(message: cleanMsg))
@@ -454,7 +477,25 @@ public final class UpstreamClient: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    private func classifyHTTPError(statusCode: Int, data: Data, secrets: [String]) -> UpstreamError {
+    static func parseRetryAfter(_ raw: String?, now: Date = Date()) -> Double? {
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        if value.allSatisfy({ $0.isASCII && $0.isNumber }) {
+            guard let seconds = Double(value), seconds.isFinite else { return nil }
+            return seconds
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: value) else { return nil }
+        return max(0, date.timeIntervalSince(now))
+    }
+
+    private func classifyHTTPError(response: HTTPURLResponse, data: Data, secrets: [String]) -> UpstreamError {
+        let statusCode = response.statusCode
+        let retryAfter = statusCode == 429
+            ? Self.parseRetryAfter(response.value(forHTTPHeaderField: "Retry-After"))
+            : nil
         let msg = extractErrorMessage(from: data, secrets: secrets) ?? "HTTP \(statusCode)"
         let lower = msg.lowercased()
         if statusCode == 401 || statusCode == 403 {
@@ -468,7 +509,7 @@ public final class UpstreamClient: @unchecked Sendable {
         if statusCode == 402 || hasBillingSignal || hasQuotaExhausted {
             return .modelUnavailable(statusCode: statusCode, message: msg, availability: .insufficientCredits)
         }
-        return .httpError(statusCode: statusCode, rawBody: data, message: msg)
+        return .httpError(statusCode: statusCode, rawBody: data, message: msg, retryAfterSeconds: retryAfter)
     }
 
     private func classifyProbeFailure(_ err: UpstreamError, latencyMs: Double, isCodex: Bool = false) -> ModelProbeResult {
@@ -492,7 +533,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 note: hint,
                 isTransientFailure: false
             )
-        case .httpError(let code, _, let msg):
+        case .httpError(let code, _, let msg, _):
             let isTransient = (code == 429 || code == 408 || code >= 500)
             let prefix = isTransient ? "测活瞬时限流/抖动" : "自动测活剔除"
             return ModelProbeResult(
@@ -508,6 +549,22 @@ public final class UpstreamClient: @unchecked Sendable {
                 availability: .unavailable,
                 latencyMs: latencyMs,
                 note: "测活瞬时网络/响应异常：\(msg)",
+                isTransientFailure: true
+            )
+        case .clientDisconnected:
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: .unavailable,
+                latencyMs: latencyMs,
+                note: "测活时客户端已断开连接",
+                isTransientFailure: true
+            )
+        case .requestDeadlineExceeded:
+            return ModelProbeResult(
+                isAvailable: false,
+                availability: .unavailable,
+                latencyMs: latencyMs,
+                note: "测活达到累计 deadline",
                 isTransientFailure: true
             )
         case .invalidURL(let url):
@@ -661,7 +718,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 )
             }
 
-            let err = classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact)
+            let err = classifyHTTPError(response: http, data: data, secrets: secretsToRedact)
             return classifyProbeFailure(err, latencyMs: latencyMs)
         } catch {
             let latencyMs = elapsedMs(since: start)
@@ -876,7 +933,7 @@ public final class UpstreamClient: @unchecked Sendable {
             guard (200...299).contains(http.statusCode) else {
                 var error = Data()
                 for try await byte in bytes { error.append(byte); if error.count > 65_536 { break } }
-                return .failure(classifyHTTPError(statusCode: http.statusCode, data: error, secrets: secretsToRedact))
+                return .failure(classifyHTTPError(response: http, data: error, secrets: secretsToRedact))
             }
             let isSSE = isCodex || stream || (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased().contains("text/event-stream")
             var observer = NativeResponsesObserver()
@@ -977,7 +1034,7 @@ public final class UpstreamClient: @unchecked Sendable {
                     errorBytes.append(byte)
                     if errorBytes.count > 65_536 { break }
                 }
-                return .failure(classifyHTTPError(statusCode: http.statusCode, data: errorBytes, secrets: secretsToRedact))
+                return .failure(classifyHTTPError(response: http, data: errorBytes, secrets: secretsToRedact))
             }
 
             // Non-streaming /v1/responses may return plain JSON instead of SSE
@@ -1087,6 +1144,12 @@ public final class UpstreamClient: @unchecked Sendable {
                 totalLatencyMs: totalMs,
                 hasToolCalls: translator.hasToolCalls
             ))
+        } catch is ClientStreamDisconnectedError {
+            return .failure(.clientDisconnected)
+        } catch is CancellationError {
+            return .failure(.clientDisconnected)
+        } catch let error as URLError where error.code == .cancelled {
+            return .failure(.clientDisconnected)
         } catch {
             let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
             return .failure(.networkError(message: cleanMsg))
@@ -1160,7 +1223,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 errData.append(byte)
                 if errData.count > 16_384 { break }
             }
-            let err = classifyHTTPError(statusCode: http.statusCode, data: errData, secrets: secretsToRedact)
+            let err = classifyHTTPError(response: http, data: errData, secrets: secretsToRedact)
             return classifyProbeFailure(err, latencyMs: latencyMs, isCodex: isCodex)
         } catch {
             let latencyMs = elapsedMs(since: start)
@@ -1206,7 +1269,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
             }
             if !(200...299).contains(http.statusCode) {
-                return .failure(classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact))
+                return .failure(classifyHTTPError(response: http, data: data, secrets: secretsToRedact))
             }
 
             let rawObj = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
@@ -1256,6 +1319,12 @@ public final class UpstreamClient: @unchecked Sendable {
                 totalLatencyMs: totalMs,
                 hasToolCalls: Self.responseContainsToolCalls(chatObj)
             ))
+        } catch is ClientStreamDisconnectedError {
+            return .failure(.clientDisconnected)
+        } catch is CancellationError {
+            return .failure(.clientDisconnected)
+        } catch let error as URLError where error.code == .cancelled {
+            return .failure(.clientDisconnected)
         } catch {
             let cleanMsg = SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)
             return .failure(.networkError(message: cleanMsg))
@@ -1299,7 +1368,7 @@ public final class UpstreamClient: @unchecked Sendable {
             if (200...299).contains(http.statusCode) {
                 return ModelProbeResult(isAvailable: true, availability: .available, latencyMs: latencyMs, note: "实测可用 (\(Int(latencyMs)) ms)")
             }
-            let err = classifyHTTPError(statusCode: http.statusCode, data: data, secrets: secretsToRedact)
+            let err = classifyHTTPError(response: http, data: data, secrets: secretsToRedact)
             return classifyProbeFailure(err, latencyMs: latencyMs)
         } catch {
             let latencyMs = elapsedMs(since: start)

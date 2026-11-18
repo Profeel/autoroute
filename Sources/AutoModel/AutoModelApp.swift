@@ -50,6 +50,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    private var terminationPending = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationPending else { return .terminateLater }
+        terminationPending = true
+        Task {
+            do {
+                try await engine.shutdown()
+                sender.reply(toApplicationShouldTerminate: true)
+            } catch {
+                terminationPending = false
+                let alert = NSAlert()
+                alert.messageText = "尚未安全保存，已取消退出"
+                alert.informativeText = engine.lastPersistenceError ?? "持久化失败，请修复后重试。"
+                alert.runModal()
+                sender.reply(toApplicationShouldTerminate: false)
+            }
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         engine.stopBackgroundTasks()
         engine.stopProxy()

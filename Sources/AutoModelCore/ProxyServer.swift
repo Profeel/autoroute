@@ -244,11 +244,15 @@ public final class ProxyServer: @unchecked Sendable {
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
             streamStarted.markStarted()
-            writer.startChunkedStream(statusCode: 200, headers: headers)
+            guard writer.startChunkedStream(statusCode: 200, headers: headers) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let chunkCallback: (@Sendable (Data) async throws -> Void)? = isStream ? { @Sendable chunkData in
-            _ = writer.writeStreamChunk(chunkData)
+            guard writer.writeStreamChunk(chunkData) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let outcome = await engine.executeChatCompletion(
@@ -306,12 +310,16 @@ public final class ProxyServer: @unchecked Sendable {
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
             streamStarted.markStarted()
-            writer.startChunkedStream(statusCode: 200, headers: headers)
+            guard writer.startChunkedStream(statusCode: 200, headers: headers) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let chunkCallback: (@Sendable (Data) async throws -> Void)? = isStream ? { @Sendable chunkData in
             for eventData in translator.translateChunk(chunkData) {
-                _ = writer.writeStreamChunk(eventData)
+                guard writer.writeStreamChunk(eventData) else {
+                    throw ClientStreamDisconnectedError()
+                }
             }
         } : nil
 
@@ -382,15 +390,21 @@ public final class ProxyServer: @unchecked Sendable {
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
             streamStarted.markStarted()
-            writer.startChunkedStream(statusCode: 200, headers: headers)
+            guard writer.startChunkedStream(statusCode: 200, headers: headers) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let chunkCallback: (@Sendable (Data) async throws -> Void)? = isStream ? { @Sendable chunkData in
             if useNativeResponses {
-                _ = writer.writeStreamChunk(chunkData)
+                guard writer.writeStreamChunk(chunkData) else {
+                    throw ClientStreamDisconnectedError()
+                }
             } else {
                 for eventData in translator.translateChunk(chunkData) {
-                    _ = writer.writeStreamChunk(eventData)
+                    guard writer.writeStreamChunk(eventData) else {
+                        throw ClientStreamDisconnectedError()
+                    }
                 }
             }
         } : nil

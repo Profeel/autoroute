@@ -440,6 +440,8 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
     public var maxOutputPricePerMillion: Double?
     public var enableSessionStickiness: Bool
     public var enableRetryOnUpstreamFailure: Bool
+    public var maxUpstreamAttempts: Int
+    public var maxRequestDurationSeconds: Double
     public var activeDeciderPluginID: String
 
     // Three-tier (Low / Medium / High) model configuration (primary + ordered failover backups)
@@ -466,6 +468,8 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         maxOutputPricePerMillion: Double? = nil,
         enableSessionStickiness: Bool = true,
         enableRetryOnUpstreamFailure: Bool = true,
+        maxUpstreamAttempts: Int = 3,
+        maxRequestDurationSeconds: Double = 120,
         activeDeciderPluginID: String = "builtin.deterministic.v1",
         lowTierModelID: UUID? = nil,
         mediumTierModelID: UUID? = nil,
@@ -489,6 +493,8 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         self.maxOutputPricePerMillion = maxOutputPricePerMillion
         self.enableSessionStickiness = enableSessionStickiness
         self.enableRetryOnUpstreamFailure = enableRetryOnUpstreamFailure
+        self.maxUpstreamAttempts = max(1, maxUpstreamAttempts)
+        self.maxRequestDurationSeconds = max(1, maxRequestDurationSeconds)
         self.activeDeciderPluginID = activeDeciderPluginID
         self.lowTierModelID = lowTierModelID
         self.mediumTierModelID = mediumTierModelID
@@ -508,7 +514,8 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case policyVersion, activeStrategy, pinnedModelID, fallbackModelID
         case maxInputPricePerMillion, maxOutputPricePerMillion
-        case enableSessionStickiness, enableRetryOnUpstreamFailure, activeDeciderPluginID
+        case enableSessionStickiness, enableRetryOnUpstreamFailure
+        case maxUpstreamAttempts, maxRequestDurationSeconds, activeDeciderPluginID
         case lowTierModelID, mediumTierModelID, highTierModelID
         case lowTierBackupModelIDs, mediumTierBackupModelIDs, highTierBackupModelIDs
         case autoConfigureTiers, preferTierMappingInAuto
@@ -526,6 +533,8 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         maxOutputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .maxOutputPricePerMillion)
         enableSessionStickiness = try c.decodeIfPresent(Bool.self, forKey: .enableSessionStickiness) ?? true
         enableRetryOnUpstreamFailure = try c.decodeIfPresent(Bool.self, forKey: .enableRetryOnUpstreamFailure) ?? true
+        maxUpstreamAttempts = max(1, try c.decodeIfPresent(Int.self, forKey: .maxUpstreamAttempts) ?? 3)
+        maxRequestDurationSeconds = max(1, try c.decodeIfPresent(Double.self, forKey: .maxRequestDurationSeconds) ?? 120)
         activeDeciderPluginID = try c.decodeIfPresent(String.self, forKey: .activeDeciderPluginID) ?? "builtin.deterministic.v1"
         lowTierModelID = try c.decodeIfPresent(UUID.self, forKey: .lowTierModelID)
         mediumTierModelID = try c.decodeIfPresent(UUID.self, forKey: .mediumTierModelID)
@@ -891,9 +900,15 @@ public enum AgentSubtaskCategory: String, Codable, CaseIterable, Sendable {
     }
 }
 
+public enum TokenEstimateConfidence: String, Codable, Sendable {
+    case medium
+    case low
+}
+
 public struct RequestFeatures: Codable, Equatable, Sendable {
     public var messageCount: Int
     public var estimatedInputTokens: Int
+    public var tokenEstimateConfidence: TokenEstimateConfidence
     public var requiresTools: Bool
     public var requiresVision: Bool
     public var requiresJSONMode: Bool
@@ -907,7 +922,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
     public var clientProvidedEffort: ReasoningEffort?
 
     enum CodingKeys: String, CodingKey {
-        case messageCount, estimatedInputTokens, requiresTools, requiresVision, requiresJSONMode
+        case messageCount, estimatedInputTokens, tokenEstimateConfidence, requiresTools, requiresVision, requiresJSONMode
         case isStreaming, detectedTaskType, conversationFingerprint, isMultiTurn
         case subtaskCategory, recommendedEffort, subtaskSummary, clientProvidedEffort
     }
@@ -915,6 +930,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
     public init(
         messageCount: Int,
         estimatedInputTokens: Int,
+        tokenEstimateConfidence: TokenEstimateConfidence = .medium,
         requiresTools: Bool,
         requiresVision: Bool,
         requiresJSONMode: Bool,
@@ -930,6 +946,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         let resolvedSubtask = subtaskCategory ?? detectedTaskType.defaultSubtaskCategory
         self.messageCount = messageCount
         self.estimatedInputTokens = estimatedInputTokens
+        self.tokenEstimateConfidence = tokenEstimateConfidence
         self.requiresTools = requiresTools
         self.requiresVision = requiresVision
         self.requiresJSONMode = requiresJSONMode
@@ -947,6 +964,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         messageCount = try c.decodeIfPresent(Int.self, forKey: .messageCount) ?? 1
         estimatedInputTokens = try c.decodeIfPresent(Int.self, forKey: .estimatedInputTokens) ?? 0
+        tokenEstimateConfidence = try c.decodeIfPresent(TokenEstimateConfidence.self, forKey: .tokenEstimateConfidence) ?? .medium
         requiresTools = try c.decodeIfPresent(Bool.self, forKey: .requiresTools) ?? false
         requiresVision = try c.decodeIfPresent(Bool.self, forKey: .requiresVision) ?? false
         requiresJSONMode = try c.decodeIfPresent(Bool.self, forKey: .requiresJSONMode) ?? false
@@ -1158,6 +1176,7 @@ public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable 
     public var costUSD: Double?
     public var costStatus: CostCalculationStatus
     public var errorMessage: String?
+    public var retryAfterSeconds: Double?
 
     public init(
         id: UUID = UUID(),

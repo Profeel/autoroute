@@ -45,7 +45,7 @@ public extension AutoModelEngine {
             return outcome.callRecord
         }
 
-        attachRealABComparisons(report: report, recordsBySession: recordsBySession, baselineModel: baselineModel)
+        await attachRealABComparisons(report: report, recordsBySession: recordsBySession, baselineModel: baselineModel)
         return report
     }
 
@@ -53,7 +53,7 @@ public extension AutoModelEngine {
         report: ABExperimentReport,
         recordsBySession: [String: CallRecord],
         baselineModel: ModelConfig
-    ) {
+    ) async {
         var changed = false
         for repetition in 0..<report.repetitions {
             guard let autoSample = report.samples.first(where: { $0.repetitionIndex == repetition && $0.side == .auto }),
@@ -99,7 +99,7 @@ public extension AutoModelEngine {
             changed = true
         }
         if changed {
-            persistCallHistory()
+            await persistCallHistory()
         }
     }
 }

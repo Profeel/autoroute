@@ -133,8 +133,32 @@ public enum RequestFeatureExtractor {
         } else {
             intentText = combinedText
         }
-        let estimatedInputTokens = estimateTokens(text: combinedText, messageCount: messages.count, hasTools: requiresTools, hasVision: requiresVision)
-        let intentTokens = estimateTokens(text: intentText, messageCount: min(2, messages.count), hasTools: requiresTools, hasVision: requiresVision)
+        let toolPayload = toolsArray ?? functionsArray
+        let toolTokenOverhead = toolPayload.map { estimateStructuredPayloadTokens($0) } ?? 0
+        let visionItemCount = messages.reduce(0) { count, message in
+            guard let parts = message["content"] as? [[String: Any]] else { return count }
+            return count + parts.reduce(0) { partCount, part in
+                let type = (part["type"] as? String) ?? ""
+                return partCount + ((type == "image_url" || type == "input_image" || part["image_url"] != nil) ? 1 : 0)
+            }
+        }
+        let visionTokenOverhead = visionItemCount * 768
+        let estimatedInputTokens = estimateTokens(
+            text: combinedText,
+            messageCount: messages.count,
+            hasTools: requiresTools,
+            hasVision: requiresVision,
+            toolTokenOverhead: toolTokenOverhead,
+            visionTokenOverhead: visionTokenOverhead
+        )
+        let intentTokens = estimateTokens(
+            text: intentText,
+            messageCount: min(2, messages.count),
+            hasTools: requiresTools,
+            hasVision: requiresVision,
+            toolTokenOverhead: toolTokenOverhead,
+            visionTokenOverhead: visionTokenOverhead
+        )
         let detectedTaskType = classifyIntent(
             text: intentText,
             estimatedTokens: estimatedInputTokens,
@@ -209,6 +233,7 @@ public enum RequestFeatureExtractor {
         return RequestFeatures(
             messageCount: messages.count,
             estimatedInputTokens: estimatedInputTokens,
+            tokenEstimateConfidence: (requiresTools || requiresVision) ? .low : .medium,
             requiresTools: requiresTools,
             requiresVision: requiresVision,
             requiresJSONMode: requiresJSONMode,
@@ -227,15 +252,55 @@ public enum RequestFeatureExtractor {
         text: String,
         messageCount: Int = 1,
         hasTools: Bool = false,
-        hasVision: Bool = false
+        hasVision: Bool = false,
+        toolTokenOverhead: Int = 0,
+        visionTokenOverhead: Int = 0
     ) -> Int {
-        // Practical mixed CJK/ASCII approximation: ~3.2 chars per token on average
-        let charCount = text.count
-        let baseTokens = max(1, Int(ceil(Double(charCount) / 3.2)))
+        let baseTokens = estimateTextTokens(text)
         let messageOverhead = max(0, messageCount) * 4
-        let toolOverhead = hasTools ? 250 : 0
-        let visionOverhead = hasVision ? 768 : 0
-        return baseTokens + messageOverhead + toolOverhead + visionOverhead
+        let toolOverhead = hasTools ? max(250, toolTokenOverhead) : 0
+        let visionOverhead = hasVision ? max(768, visionTokenOverhead) : 0
+        return max(1, baseTokens + messageOverhead + toolOverhead + visionOverhead)
+    }
+
+    private static func estimateTextTokens(_ text: String) -> Int {
+        var estimate = 0.0
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if isCJK(value) {
+                estimate += 1.5
+            } else if value > 0x7F {
+                // Emoji and other non-ASCII symbols are usually split into multiple tokens.
+                estimate += 2.0
+            } else if scalar.properties.isWhitespace {
+                estimate += 0.25
+            } else if isASCIIJsonOrCodePunctuation(value) {
+                estimate += 0.45
+            } else {
+                estimate += 0.30
+            }
+        }
+        return max(1, Int(ceil(estimate)))
+    }
+
+    private static func estimateStructuredPayloadTokens(_ payload: [Any]) -> Int {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            return 0
+        }
+        return estimateTextTokens(text)
+    }
+
+    private static func isCJK(_ value: UInt32) -> Bool {
+        (0x3400...0x4DBF).contains(value)
+            || (0x4E00...0x9FFF).contains(value)
+            || (0xF900...0xFAFF).contains(value)
+            || (0x20000...0x2FA1F).contains(value)
+    }
+
+    private static func isASCIIJsonOrCodePunctuation(_ value: UInt32) -> Bool {
+        "{}[]()<>:;,.'\"/=+-_*#|\\\\".unicodeScalars.contains { $0.value == value }
     }
 
     private static func classifyIntent(
@@ -1110,7 +1175,11 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             exclusions.append("请求包含图像内容，但模型未配置视觉能力")
         }
         if features.estimatedInputTokens > model.contextWindow {
-            exclusions.append("估算输入 \(features.estimatedInputTokens) tokens 超过上下文上限 \(model.contextWindow)")
+            let uncertaintyRatio = features.tokenEstimateConfidence == .low ? 0.15 : 0.08
+            let uncertaintySlack = max(256, Int(Double(model.contextWindow) * uncertaintyRatio))
+            if features.estimatedInputTokens > model.contextWindow + uncertaintySlack {
+                exclusions.append("估算输入 \(features.estimatedInputTokens) tokens 明确超过上下文上限 \(model.contextWindow)（含 \(Int(uncertaintyRatio * 100))% 估算缓冲）")
+            }
         }
 
         if !ignorePriceCap {

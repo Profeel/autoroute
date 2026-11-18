@@ -10,9 +10,15 @@ public final class LocalPersistenceStore: @unchecked Sendable {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private let fileManager = FileManager.default
-    private let queue = DispatchQueue(label: "org.automodel.persistence", qos: .utility)
+    private let queue: DispatchQueue
 
-    public init(baseDirectoryURL: URL? = nil) {
+    public convenience init(baseDirectoryURL: URL? = nil) {
+        self.init(baseDirectoryURL: baseDirectoryURL,
+            queue: DispatchQueue(label: "org.automodel.persistence", qos: .utility))
+    }
+
+    init(baseDirectoryURL: URL?, queue: DispatchQueue) {
+        self.queue = queue
         let resolvedDir: URL
         if let customDir = baseDirectoryURL {
             resolvedDir = customDir
@@ -142,9 +148,58 @@ public final class LocalPersistenceStore: @unchecked Sendable {
         }
     }
 
+    private var pendingWriteError: Error?
+
+    // Enqueue synchronously so MainActor snapshot order is also disk order.
+    // Encoding and atomic replacement both run on the store's existing serial queue.
+    func enqueueCompletionSnapshot(
+        config: AppConfigBundle, history: [CallRecord], ledger: BudgetLedger,
+        funnel: LocalOnboardingFunnelState,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        queue.async {
+            do {
+                try self.fileManager.createDirectory(at: self.baseDirectoryURL, withIntermediateDirectories: true)
+                // Ledger first: a later history/metrics failure must not erase billed usage.
+                try self.encoder.encode(ledger).write(to: self.budgetLedgerFileURL, options: .atomic)
+                try self.encoder.encode(Array(history.prefix(500))).write(to: self.historyFileURL, options: .atomic)
+                try self.encoder.encode(funnel).write(to: self.metricsFileURL, options: .atomic)
+                try self.encoder.encode(config).write(to: self.configFileURL, options: .atomic)
+                self.pendingWriteError = nil
+                completion(.success(()))
+            } catch {
+                self.pendingWriteError = error
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func enqueueConfig(_ config: AppConfigBundle, completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        queue.async {
+            do {
+                try self.fileManager.createDirectory(at: self.baseDirectoryURL, withIntermediateDirectories: true)
+                try self.encoder.encode(config).write(to: self.configFileURL, options: .atomic)
+                self.pendingWriteError = nil
+                completion(.success(()))
+            } catch {
+                self.pendingWriteError = error
+                completion(.failure(error))
+            }
+        }
+    }
+
+    public func flush() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                if let error = self.pendingWriteError { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            }
+        }
+    }
+
     /// Exports sanitized routing receipts without any API keys.
     public func exportReceiptsJSON(records: [CallRecord], secretsToRedact: [String]) throws -> Data {
-        let data = try encoder.encode(records)
+        let data = try queue.sync { try encoder.encode(records) }
         guard let raw = String(data: data, encoding: .utf8) else {
             return data
         }
