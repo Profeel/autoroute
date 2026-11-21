@@ -102,6 +102,7 @@ public enum ProtocolAdapters {
                         }
                     } else if bType == "tool_result" {
                         let toolUseID = (block["tool_use_id"] as? String) ?? ""
+                        let isError = (block["is_error"] as? Bool) ?? false
                         let resultText: String
                         if let str = block["content"] as? String {
                             resultText = str
@@ -110,10 +111,11 @@ public enum ProtocolAdapters {
                         } else {
                             resultText = ""
                         }
+                        let finalOutput = isError && !resultText.isEmpty ? "[Error]\n\(resultText)" : resultText
                         toolResultMessages.append([
                             "role": "tool",
                             "tool_call_id": toolUseID,
-                            "content": resultText
+                            "content": finalOutput
                         ])
                     }
                 }
@@ -159,6 +161,26 @@ public enum ProtocolAdapters {
                         "parameters": schema
                     ]
                 ] as [String: Any]
+            }
+        }
+        if let toolChoice = payload["tool_choice"] as? [String: Any],
+           let tcType = (toolChoice["type"] as? String)?.lowercased() {
+            switch tcType {
+            case "auto":
+                openAI["tool_choice"] = "auto"
+            case "any":
+                openAI["tool_choice"] = "required"
+            case "none":
+                openAI["tool_choice"] = "none"
+            case "tool":
+                if let name = toolChoice["name"] as? String, !name.isEmpty {
+                    openAI["tool_choice"] = [
+                        "type": "function",
+                        "function": ["name": name]
+                    ]
+                }
+            default:
+                break
             }
         }
 
@@ -243,6 +265,7 @@ public enum ProtocolAdapters {
 
     public static func responsesToChatRequest(_ payload: [String: Any]) -> Result<[String: Any], AutoModelEngine.ProxyRequestValidationError> {
         var messages: [[String: Any]] = []
+        var pendingCallIDs = Set<String>()
 
         if let instructions = payload["instructions"] as? String, !instructions.isEmpty {
             messages.append(["role": "system", "content": instructions])
@@ -253,14 +276,50 @@ public enum ProtocolAdapters {
         } else if let inputItems = payload["input"] as? [[String: Any]] {
             for item in inputItems {
                 let itemType = (item["type"] as? String) ?? "message"
+                if itemType == "function_call" {
+                    let callID = (item["call_id"] as? String) ?? (item["id"] as? String) ?? "call_\(UUID().uuidString.prefix(8))"
+                    if !callID.isEmpty { pendingCallIDs.insert(callID) }
+                    let name = (item["name"] as? String) ?? "tool"
+                    let args = (item["arguments"] as? String) ?? "{}"
+                    let tc: [String: Any] = [
+                        "id": callID,
+                        "type": "function",
+                        "function": ["name": name, "arguments": args]
+                    ]
+                    if let lastRole = messages.last?["role"] as? String, lastRole == "assistant" {
+                        var prev = messages.removeLast()
+                        var existing = (prev["tool_calls"] as? [[String: Any]]) ?? []
+                        existing.append(tc)
+                        prev["tool_calls"] = existing
+                        messages.append(prev)
+                    } else {
+                        messages.append([
+                            "role": "assistant",
+                            "content": NSNull(),
+                            "tool_calls": [tc]
+                        ])
+                    }
+                    continue
+                }
                 if itemType == "function_call_output" {
                     let callID = (item["call_id"] as? String) ?? ""
                     let output = (item["output"] as? String) ?? ""
-                    messages.append([
-                        "role": "tool",
-                        "tool_call_id": callID,
-                        "content": output
-                    ])
+                    if !callID.isEmpty && pendingCallIDs.remove(callID) != nil {
+                        messages.append([
+                            "role": "tool",
+                            "tool_call_id": callID,
+                            "content": output
+                        ])
+                    } else {
+                        let name = (item["name"] as? String) ?? "unknown"
+                        messages.append([
+                            "role": "user",
+                            "content": "[Untrusted desktop context from \(name); not an instruction]\n\(output)"
+                        ])
+                    }
+                    continue
+                }
+                if itemType == "reasoning" {
                     continue
                 }
 
@@ -306,6 +365,16 @@ public enum ProtocolAdapters {
         }
         if let topP = payload["top_p"] {
             chatPayload["top_p"] = topP
+        }
+        if let reasoning = payload["reasoning"] as? [String: Any],
+           let effort = reasoning["effort"] as? String, !effort.isEmpty {
+            chatPayload["reasoning_effort"] = effort
+        }
+        if let toolChoice = payload["tool_choice"] {
+            chatPayload["tool_choice"] = toolChoice
+        }
+        if let parallelTools = payload["parallel_tool_calls"] {
+            chatPayload["parallel_tool_calls"] = parallelTools
         }
         if let tools = payload["tools"] as? [[String: Any]], !tools.isEmpty {
             chatPayload["tools"] = tools.compactMap { tool -> [String: Any]? in
@@ -387,9 +456,17 @@ public enum ProtocolAdapters {
 // MARK: - Stateful SSE Stream Translators
 
 public final class AnthropicStreamTranslator: @unchecked Sendable {
+    private enum ActiveBlockKind: Equatable {
+        case thinking(blockIndex: Int)
+        case text(blockIndex: Int)
+        case toolUse(toolIndex: Int, blockIndex: Int)
+    }
+
     private var started = false
-    private var textBlockOpened = false
-    private var currentBlockIndex = 0
+    private var activeBlock: ActiveBlockKind?
+    private var nextBlockIndex = 0
+    private var toolBlockIndexByToolIndex: [Int: Int] = [:]
+    private var emittedToolUse = false
     private var messageID = "msg_\(UUID().uuidString.prefix(12))"
     private var modelName = "auto"
     private var inputTokens = 0
@@ -422,8 +499,8 @@ public final class AnthropicStreamTranslator: @unchecked Sendable {
                 modelName = m
             }
             if let usage = obj["usage"] as? [String: Any] {
-                inputTokens = (usage["prompt_tokens"] as? Int) ?? inputTokens
-                outputTokens = (usage["completion_tokens"] as? Int) ?? outputTokens
+                inputTokens = (usage["prompt_tokens"] as? Int) ?? (usage["input_tokens"] as? Int) ?? inputTokens
+                outputTokens = (usage["completion_tokens"] as? Int) ?? (usage["output_tokens"] as? Int) ?? outputTokens
             }
 
             if !started {
@@ -447,24 +524,91 @@ public final class AnthropicStreamTranslator: @unchecked Sendable {
             if let reason = first["finish_reason"] as? String {
                 if reason == "length" { stopReason = "max_tokens" }
                 else if reason == "tool_calls" { stopReason = "tool_use" }
-                else { stopReason = "end_turn" }
+                else { stopReason = emittedToolUse ? "tool_use" : "end_turn" }
             }
 
-            if let delta = first["delta"] as? [String: Any] {
-                if let contentDelta = delta["content"] as? String, !contentDelta.isEmpty {
-                    if !textBlockOpened {
-                        textBlockOpened = true
+            guard let delta = first["delta"] as? [String: Any] else { continue }
+
+            if let reasoningDelta = (delta["reasoning_content"] as? String) ?? (delta["reasoning"] as? String),
+               !reasoningDelta.isEmpty {
+                let blockIdx: Int
+                if case .thinking(let idx) = activeBlock {
+                    blockIdx = idx
+                } else {
+                    outEvents.append(contentsOf: closeActiveBlockIfNeeded())
+                    blockIdx = nextBlockIndex
+                    nextBlockIndex += 1
+                    activeBlock = .thinking(blockIndex: blockIdx)
+                    outEvents.append(sseEvent(name: "content_block_start", payload: [
+                        "type": "content_block_start",
+                        "index": blockIdx,
+                        "content_block": ["type": "thinking", "thinking": ""]
+                    ]))
+                }
+                outEvents.append(sseEvent(name: "content_block_delta", payload: [
+                    "type": "content_block_delta",
+                    "index": blockIdx,
+                    "delta": ["type": "thinking_delta", "thinking": reasoningDelta]
+                ]))
+            }
+
+            if let contentDelta = delta["content"] as? String, !contentDelta.isEmpty {
+                let blockIdx: Int
+                if case .text(let idx) = activeBlock {
+                    blockIdx = idx
+                } else {
+                    outEvents.append(contentsOf: closeActiveBlockIfNeeded())
+                    blockIdx = nextBlockIndex
+                    nextBlockIndex += 1
+                    activeBlock = .text(blockIndex: blockIdx)
+                    outEvents.append(sseEvent(name: "content_block_start", payload: [
+                        "type": "content_block_start",
+                        "index": blockIdx,
+                        "content_block": ["type": "text", "text": ""]
+                    ]))
+                }
+                outEvents.append(sseEvent(name: "content_block_delta", payload: [
+                    "type": "content_block_delta",
+                    "index": blockIdx,
+                    "delta": ["type": "text_delta", "text": contentDelta]
+                ]))
+            }
+
+            if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
+                for tc in toolCalls {
+                    let toolIndex = (tc["index"] as? Int) ?? 0
+                    let fn = tc["function"] as? [String: Any]
+                    let blockIdx: Int
+                    if let existingIdx = toolBlockIndexByToolIndex[toolIndex] {
+                        blockIdx = existingIdx
+                    } else {
+                        outEvents.append(contentsOf: closeActiveBlockIfNeeded())
+                        blockIdx = nextBlockIndex
+                        nextBlockIndex += 1
+                        toolBlockIndexByToolIndex[toolIndex] = blockIdx
+                        activeBlock = .toolUse(toolIndex: toolIndex, blockIndex: blockIdx)
+                        emittedToolUse = true
+                        let callID = (tc["id"] as? String) ?? "toolu_\(UUID().uuidString.prefix(8))"
+                        let name = (fn?["name"] as? String) ?? "tool"
                         outEvents.append(sseEvent(name: "content_block_start", payload: [
                             "type": "content_block_start",
-                            "index": currentBlockIndex,
-                            "content_block": ["type": "text", "text": ""]
+                            "index": blockIdx,
+                            "content_block": [
+                                "type": "tool_use",
+                                "id": callID,
+                                "name": name,
+                                "input": [:] as [String: Any]
+                            ]
                         ]))
                     }
-                    outEvents.append(sseEvent(name: "content_block_delta", payload: [
-                        "type": "content_block_delta",
-                        "index": currentBlockIndex,
-                        "delta": ["type": "text_delta", "text": contentDelta]
-                    ]))
+
+                    if let argDelta = fn?["arguments"] as? String, !argDelta.isEmpty {
+                        outEvents.append(sseEvent(name: "content_block_delta", payload: [
+                            "type": "content_block_delta",
+                            "index": blockIdx,
+                            "delta": ["type": "input_json_delta", "partial_json": argDelta]
+                        ]))
+                    }
                 }
             }
         }
@@ -491,19 +635,29 @@ public final class AnthropicStreamTranslator: @unchecked Sendable {
                 ]
             ]))
         }
-        if textBlockOpened {
-            events.append(sseEvent(name: "content_block_stop", payload: [
-                "type": "content_block_stop",
-                "index": currentBlockIndex
-            ]))
-        }
+        events.append(contentsOf: closeActiveBlockIfNeeded())
+        let resolvedStopReason = (stopReason == "end_turn" && emittedToolUse) ? "tool_use" : stopReason
         events.append(sseEvent(name: "message_delta", payload: [
             "type": "message_delta",
-            "delta": ["stop_reason": stopReason, "stop_sequence": NSNull()],
+            "delta": ["stop_reason": resolvedStopReason, "stop_sequence": NSNull()],
             "usage": ["output_tokens": outputTokens]
         ]))
         events.append(sseEvent(name: "message_stop", payload: ["type": "message_stop"]))
         return events
+    }
+
+    private func closeActiveBlockIfNeeded() -> [Data] {
+        guard let active = activeBlock else { return [] }
+        activeBlock = nil
+        let idx: Int
+        switch active {
+        case .thinking(let i), .text(let i), .toolUse(_, let i):
+            idx = i
+        }
+        return [sseEvent(name: "content_block_stop", payload: [
+            "type": "content_block_stop",
+            "index": idx
+        ])]
     }
 
     private func sseEvent(name: String, payload: [String: Any]) -> Data {
@@ -514,63 +668,183 @@ public final class AnthropicStreamTranslator: @unchecked Sendable {
 }
 
 public final class ResponsesStreamTranslator: @unchecked Sendable {
+    private struct PendingToolCall {
+        let index: Int
+        let outputIndex: Int
+        let itemID: String
+        var callID: String
+        var name: String
+        var arguments: String
+        var addedEmitted: Bool
+    }
+
     private var started = false
     private var fullText = ""
+    private var textOutputIndex: Int? = nil
+    private var nextOutputIndex = 0
     private var responseID = "resp_\(UUID().uuidString.prefix(12))"
     private var itemID = "msg_\(UUID().uuidString.prefix(10))"
     private var modelName = "auto"
     private var finished = false
+    private var lineBuffer = ""
+    private var toolCallsByIndex: [Int: PendingToolCall] = [:]
+    private var latestUsage: [String: Any]? = nil
 
     public init() {}
 
     public func translateChunk(_ openAISSEChunk: Data) -> [Data] {
         guard let text = String(data: openAISSEChunk, encoding: .utf8) else { return [] }
+        lineBuffer += text
         var outEvents: [Data] = []
 
-        for rawLine in text.components(separatedBy: .newlines) {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("data:") else { continue }
-            let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+        while let newlineIdx = lineBuffer.firstIndex(of: "\n") {
+            let rawLine = String(lineBuffer[..<newlineIdx])
+            lineBuffer = String(lineBuffer[lineBuffer.index(after: newlineIdx)...])
+            outEvents.append(contentsOf: processLine(rawLine))
+        }
+        return outEvents
+    }
 
-            if payload == "[DONE]" {
-                outEvents.append(contentsOf: finishEvents())
-                continue
-            }
+    private func processLine(_ rawLine: String) -> [Data] {
+        let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("data:") else { return [] }
+        let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
 
-            guard let data = payload.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-            if let m = obj["model"] as? String, !m.isEmpty {
-                modelName = m
-            }
+        if payload == "[DONE]" {
+            return finishEvents()
+        }
 
-            if !started {
-                started = true
-                outEvents.append(sseEvent(name: "response.created", payload: [
-                    "type": "response.created",
-                    "response": ["id": responseID, "object": "response", "status": "in_progress", "model": modelName]
-                ]))
+        guard let data = payload.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        var outEvents: [Data] = []
+
+        if let m = obj["model"] as? String, !m.isEmpty {
+            modelName = m
+        }
+        if let usage = obj["usage"] as? [String: Any] {
+            let inTok = (usage["prompt_tokens"] as? Int) ?? (usage["input_tokens"] as? Int) ?? 0
+            let outTok = (usage["completion_tokens"] as? Int) ?? (usage["output_tokens"] as? Int) ?? 0
+            let totalTok = (usage["total_tokens"] as? Int) ?? (inTok + outTok)
+            latestUsage = [
+                "input_tokens": inTok,
+                "output_tokens": outTok,
+                "total_tokens": totalTok
+            ]
+        }
+
+        if !started {
+            started = true
+            outEvents.append(sseEvent(name: "response.created", payload: [
+                "type": "response.created",
+                "response": ["id": responseID, "object": "response", "status": "in_progress", "model": modelName]
+            ]))
+        }
+
+        guard let choices = obj["choices"] as? [[String: Any]],
+              let delta = choices.first?["delta"] as? [String: Any] else {
+            return outEvents
+        }
+
+        if let contentDelta = delta["content"] as? String, !contentDelta.isEmpty {
+            if textOutputIndex == nil {
+                let idx = nextOutputIndex
+                nextOutputIndex += 1
+                textOutputIndex = idx
                 outEvents.append(sseEvent(name: "response.output_item.added", payload: [
                     "type": "response.output_item.added",
-                    "output_index": 0,
+                    "output_index": idx,
                     "item": ["id": itemID, "type": "message", "role": "assistant", "status": "in_progress", "content": []]
                 ]))
             }
+            let outIdx = textOutputIndex ?? 0
+            fullText += contentDelta
+            outEvents.append(sseEvent(name: "response.output_text.delta", payload: [
+                "type": "response.output_text.delta",
+                "item_id": itemID,
+                "output_index": outIdx,
+                "content_index": 0,
+                "delta": contentDelta
+            ]))
+        }
 
-            if let choices = obj["choices"] as? [[String: Any]],
-               let delta = choices.first?["delta"] as? [String: Any],
-               let contentDelta = delta["content"] as? String, !contentDelta.isEmpty {
-                fullText += contentDelta
-                outEvents.append(sseEvent(name: "response.output_text.delta", payload: [
-                    "type": "response.output_text.delta",
-                    "item_id": itemID,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": contentDelta
-                ]))
+        if let toolCallDeltas = delta["tool_calls"] as? [[String: Any]] {
+            for tcDelta in toolCallDeltas {
+                let tcIndex = (tcDelta["index"] as? Int) ?? 0
+                let fn = tcDelta["function"] as? [String: Any] ?? [:]
+                let incomingID = tcDelta["id"] as? String
+                let incomingName = fn["name"] as? String
+                let incomingArgs = fn["arguments"] as? String
+
+                var pending = toolCallsByIndex[tcIndex] ?? {
+                    let assignedOutIdx = nextOutputIndex
+                    nextOutputIndex += 1
+                    let cid = (incomingID?.isEmpty == false) ? incomingID! : "call_\(tcIndex)_\(UUID().uuidString.prefix(8))"
+                    let fid = "fc_\(cid)"
+                    return PendingToolCall(
+                        index: tcIndex,
+                        outputIndex: assignedOutIdx,
+                        itemID: fid,
+                        callID: cid,
+                        name: "",
+                        arguments: "",
+                        addedEmitted: false
+                    )
+                }()
+
+                if let incomingID, !incomingID.isEmpty {
+                    pending.callID = incomingID
+                }
+                if let incomingName, !incomingName.isEmpty {
+                    pending.name += incomingName
+                }
+
+                if !pending.addedEmitted && !pending.name.isEmpty {
+                    pending.addedEmitted = true
+                    outEvents.append(sseEvent(name: "response.output_item.added", payload: [
+                        "type": "response.output_item.added",
+                        "output_index": pending.outputIndex,
+                        "item": [
+                            "id": pending.itemID,
+                            "type": "function_call",
+                            "call_id": pending.callID,
+                            "name": pending.name,
+                            "arguments": "",
+                            "status": "in_progress"
+                        ]
+                    ]))
+                }
+
+                if let incomingArgs, !incomingArgs.isEmpty {
+                    if !pending.addedEmitted {
+                        pending.addedEmitted = true
+                        outEvents.append(sseEvent(name: "response.output_item.added", payload: [
+                            "type": "response.output_item.added",
+                            "output_index": pending.outputIndex,
+                            "item": [
+                                "id": pending.itemID,
+                                "type": "function_call",
+                                "call_id": pending.callID,
+                                "name": pending.name.isEmpty ? "tool" : pending.name,
+                                "arguments": "",
+                                "status": "in_progress"
+                            ]
+                        ]))
+                    }
+                    pending.arguments += incomingArgs
+                    outEvents.append(sseEvent(name: "response.function_call_arguments.delta", payload: [
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": pending.itemID,
+                        "output_index": pending.outputIndex,
+                        "delta": incomingArgs
+                    ]))
+                }
+
+                toolCallsByIndex[tcIndex] = pending
             }
         }
+
         return outEvents
     }
 
@@ -578,28 +852,86 @@ public final class ResponsesStreamTranslator: @unchecked Sendable {
         guard !finished else { return [] }
         finished = true
         var events: [Data] = []
-        events.append(sseEvent(name: "response.output_text.done", payload: [
-            "type": "response.output_text.done",
-            "item_id": itemID,
-            "output_index": 0,
-            "content_index": 0,
-            "text": fullText
-        ]))
+
+        if !lineBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let leftover = lineBuffer
+            lineBuffer = ""
+            if leftover.trimmingCharacters(in: .whitespaces) != "data: [DONE]" {
+                events.append(contentsOf: processLine(leftover))
+            }
+        }
+
+        if !started {
+            started = true
+            events.append(sseEvent(name: "response.created", payload: [
+                "type": "response.created",
+                "response": ["id": responseID, "object": "response", "status": "in_progress", "model": modelName]
+            ]))
+        }
+
+        var outputItems: [[String: Any]] = []
+
+        if let textIdx = textOutputIndex {
+            events.append(sseEvent(name: "response.output_text.done", payload: [
+                "type": "response.output_text.done",
+                "item_id": itemID,
+                "output_index": textIdx,
+                "content_index": 0,
+                "text": fullText
+            ]))
+            let msgItem: [String: Any] = [
+                "id": itemID,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [["type": "output_text", "text": fullText, "annotations": []]]
+            ]
+            events.append(sseEvent(name: "response.output_item.done", payload: [
+                "type": "response.output_item.done",
+                "output_index": textIdx,
+                "item": msgItem
+            ]))
+            outputItems.append(msgItem)
+        }
+
+        for pending in toolCallsByIndex.values.sorted(by: { $0.outputIndex < $1.outputIndex }) {
+            let finalName = pending.name.isEmpty ? "tool" : pending.name
+            events.append(sseEvent(name: "response.function_call_arguments.done", payload: [
+                "type": "response.function_call_arguments.done",
+                "item_id": pending.itemID,
+                "output_index": pending.outputIndex,
+                "arguments": pending.arguments
+            ]))
+            let fcItem: [String: Any] = [
+                "id": pending.itemID,
+                "type": "function_call",
+                "call_id": pending.callID,
+                "name": finalName,
+                "arguments": pending.arguments,
+                "status": "completed"
+            ]
+            events.append(sseEvent(name: "response.output_item.done", payload: [
+                "type": "response.output_item.done",
+                "output_index": pending.outputIndex,
+                "item": fcItem
+            ]))
+            outputItems.append(fcItem)
+        }
+
+        var responsePayload: [String: Any] = [
+            "id": responseID,
+            "object": "response",
+            "status": "completed",
+            "model": modelName,
+            "output": outputItems
+        ]
+        if let latestUsage {
+            responsePayload["usage"] = latestUsage
+        }
+
         events.append(sseEvent(name: "response.completed", payload: [
             "type": "response.completed",
-            "response": [
-                "id": responseID,
-                "object": "response",
-                "status": "completed",
-                "model": modelName,
-                "output": [[
-                    "id": itemID,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [["type": "output_text", "text": fullText, "annotations": []]]
-                ]]
-            ]
+            "response": responsePayload
         ]))
         return events
     }
@@ -722,6 +1054,12 @@ public extension ProtocolAdapters {
         if let maxTokens = (payload["max_completion_tokens"] as? Int) ?? (payload["max_tokens"] as? Int), store != false {
             out["max_output_tokens"] = maxTokens
         }
+        if let effort = (payload["reasoning_effort"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !effort.isEmpty {
+            out["reasoning"] = ["effort": effort]
+        } else if let reasoning = payload["reasoning"] as? [String: Any], !reasoning.isEmpty {
+            out["reasoning"] = reasoning
+        }
         if let tools = payload["tools"] as? [[String: Any]], !tools.isEmpty {
             out["tools"] = tools.compactMap { tool -> [String: Any]? in
                 guard (tool["type"] as? String) == "function" else { return nil }
@@ -735,6 +1073,19 @@ public extension ProtocolAdapters {
                 }
                 return tool
             }
+        }
+        if let toolChoiceStr = payload["tool_choice"] as? String {
+            out["tool_choice"] = toolChoiceStr
+        } else if let toolChoiceDict = payload["tool_choice"] as? [String: Any] {
+            if let fn = toolChoiceDict["function"] as? [String: Any],
+               let name = fn["name"] as? String, !name.isEmpty {
+                out["tool_choice"] = ["type": "function", "name": name]
+            } else if let type = toolChoiceDict["type"] as? String, type != "function" {
+                out["tool_choice"] = type
+            }
+        }
+        if let parallel = payload["parallel_tool_calls"] as? Bool {
+            out["parallel_tool_calls"] = parallel
         }
         return out
     }
@@ -920,10 +1271,19 @@ public final class ResponsesUpstreamStreamTranslator: @unchecked Sendable {
     public private(set) var completedResponseObject: [String: Any]?
     public private(set) var errorMessage: String?
 
+    public var hasToolCalls: Bool {
+        if !toolIndexByItemID.isEmpty { return true }
+        if let outputItems = completedResponseObject?["output"] as? [[String: Any]] {
+            return outputItems.contains { ($0["type"] as? String) == "function_call" }
+        }
+        return false
+    }
+
     private let modelName: String
     private let completionID = "chatcmpl-\(UUID().uuidString.prefix(12))"
     private var lineBuffer = ""
     private var toolIndexByItemID: [String: Int] = [:]
+    private var emittedArgumentsItemIDs: Set<String> = []
     private var nextToolIndex = 0
     private var sentDone = false
 
@@ -986,6 +1346,7 @@ public final class ResponsesUpstreamStreamTranslator: @unchecked Sendable {
                 if let itemID = obj["item_id"] as? String,
                    let delta = obj["delta"] as? String,
                    let idx = toolIndexByItemID[itemID] {
+                    emittedArgumentsItemIDs.insert(itemID)
                     outChunks.append(chatChunk(delta: [
                         "tool_calls": [[
                             "index": idx,
@@ -993,13 +1354,26 @@ public final class ResponsesUpstreamStreamTranslator: @unchecked Sendable {
                         ]]
                     ]))
                 }
+            case "response.function_call_arguments.done":
+                if let itemID = obj["item_id"] as? String,
+                   let fullArgs = obj["arguments"] as? String,
+                   !fullArgs.isEmpty,
+                   !emittedArgumentsItemIDs.contains(itemID),
+                   let idx = toolIndexByItemID[itemID] {
+                    emittedArgumentsItemIDs.insert(itemID)
+                    outChunks.append(chatChunk(delta: [
+                        "tool_calls": [[
+                            "index": idx,
+                            "function": ["arguments": fullArgs]
+                        ]]
+                    ]))
+                }
             case "response.completed":
                 if let resp = obj["response"] as? [String: Any] {
                     completedResponseObject = resp
-                    if let u = resp["usage"] as? [String: Any] {
-                        let inTok = (u["input_tokens"] as? Int) ?? 0
-                        let outTok = (u["output_tokens"] as? Int) ?? 0
-                        usage = TokenUsage(promptTokens: inTok, completionTokens: outTok, totalTokens: (u["total_tokens"] as? Int) ?? (inTok + outTok))
+                    if let u = resp["usage"] as? [String: Any],
+                       let parsed = TokenUsage.parse(from: u) {
+                        usage = parsed
                     }
                     if fullText.isEmpty {
                         let chatObj = ProtocolAdapters.responsesJSONToChatCompletion(resp, fallbackModel: modelName)

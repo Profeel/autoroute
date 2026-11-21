@@ -8,6 +8,7 @@ struct RoutingReceiptView: View {
     var sessionImpact: RoutingImpactSummary? = nil
     var onSelectRecord: ((UUID) -> Void)? = nil
 
+    @State private var showSubtaskTable = false
     @State private var showRawAudit = false
     @State private var showPayloads = false
     @State private var hoveredTurn: Int? = nil
@@ -43,6 +44,8 @@ struct RoutingReceiptView: View {
         let turnCount: Int
         let totalDurationMs: Double
         let totalTokens: Int
+        let totalCostUSD: Double
+        let hasCostData: Bool
         let color: Color
     }
 
@@ -150,6 +153,8 @@ struct RoutingReceiptView: View {
         var counts: [String: Int] = [:]
         var durations: [String: Double] = [:]
         var tokens: [String: Int] = [:]
+        var costs: [String: Double] = [:]
+        var pricedFlags: [String: Bool] = [:]
 
         for item in effectiveTimeline {
             let name = shortModelName(item.executedModelShortLabel)
@@ -161,6 +166,10 @@ struct RoutingReceiptView: View {
             counts[key, default: 0] += 1
             durations[key, default: 0] += item.totalCompletionMs
             tokens[key, default: 0] += (item.finalUsage?.totalTokens ?? 0)
+            if let cost = item.totalCostUSD {
+                costs[key, default: 0] += cost
+                pricedFlags[key] = true
+            }
         }
 
         return order.map { key in
@@ -171,6 +180,8 @@ struct RoutingReceiptView: View {
                 turnCount: counts[key] ?? 0,
                 totalDurationMs: durations[key] ?? 0,
                 totalTokens: tokens[key] ?? 0,
+                totalCostUSD: costs[key] ?? 0,
+                hasCostData: pricedFlags[key] ?? false,
                 color: colorForModel(display)
             )
         }
@@ -191,14 +202,13 @@ struct RoutingReceiptView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 compactHeaderStrip
-                routingPathDiagramCard
-                subtaskEffortTableCard
                 unifiedSessionChartCard
+                modelSharePieChartsCard
                 rawDetailsDisclosure
             }
-            .padding(16)
+            .padding(14)
         }
         .background(Color(.windowBackgroundColor))
     }
@@ -257,7 +267,12 @@ struct RoutingReceiptView: View {
                     kpiTile(
                         title: "本轮 Tokens",
                         value: record.finalUsage.map { formatTokens($0.totalTokens) } ?? "—",
-                        sub: record.finalUsage.map { "\($0.promptTokens)入 / \($0.completionTokens)出" } ?? "无用量"
+                        sub: record.finalUsage.map { usage in
+                            if let rate = usage.cacheHitRate {
+                                return "\(usage.promptTokens)入 / \(usage.completionTokens)出 · 缓存 \(Int((rate * 100).rounded()))%"
+                            }
+                            return "\(usage.promptTokens)入 / \(usage.completionTokens)出"
+                        } ?? "无用量"
                     )
                     Divider().frame(height: 26)
                     kpiTile(
@@ -355,209 +370,7 @@ struct RoutingReceiptView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: - 2. Merged Visual Routing Path Diagram
-
-    private var routingPathDiagramCard: some View {
-        let segments = mergedPathSegments
-        let activeSegmentID = segments.first(where: { $0.containsRecord(record.id) })?.id ?? segments.last?.id
-        return Group {
-            if segments.count <= 1, let onlySeg = segments.first {
-                let segColor = colorForModel(onlySeg.shortModel)
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 8) {
-                            Label(record.displayClientAgent, systemImage: agentSymbol(record.displayClientAgent))
-                                .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(Color.accentColor.opacity(0.1))
-                                .foregroundStyle(Color.accentColor)
-                                .clipShape(Capsule())
-
-                            Image(systemName: "arrow.right")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(.secondary)
-
-                            HStack(spacing: 6) {
-                                Circle().fill(segColor).frame(width: 7, height: 7)
-                                Text("\(onlySeg.turnRangeLabel) (\(onlySeg.records.count)轮)")
-                                    .font(.caption2.weight(.bold).monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                Text(onlySeg.shortModel)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(segColor)
-                                effortPill(onlySeg.effort)
-                                Text("· \(AutoModelFormatter.formatMs(onlySeg.totalDurationMs)) · \(formatTokens(onlySeg.totalTokens)) tok")
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(segColor.opacity(0.1))
-                            .clipShape(Capsule())
-
-                            Spacer()
-
-                            Text(onlySeg.subtaskCategory.displayName)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.12))
-                                .clipShape(Capsule())
-                        }
-                    }
-                    .padding(.vertical, 2)
-                }
-            } else {
-                GroupBox {
-                    ScrollViewReader { proxy in
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                VStack(spacing: 4) {
-                                    Image(systemName: agentSymbol(record.displayClientAgent))
-                                        .font(.title3)
-                                        .foregroundStyle(Color.accentColor)
-                                    Text(record.displayClientAgent)
-                                        .font(.caption.weight(.semibold))
-                                        .lineLimit(1)
-                                    Text(record.hasConversationFingerprint ? record.shortSessionLabel : "请求")
-                                        .font(.caption2.monospaced())
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(Color.accentColor.opacity(0.1))
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .stroke(Color.accentColor.opacity(0.35), lineWidth: 1)
-                                )
-
-                                ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
-                                    let prev = index > 0 ? segments[index - 1] : nil
-                                    segmentConnector(previous: prev, current: segment)
-                                    segmentNode(segment)
-                                        .id(segment.id)
-                                }
-                            }
-                            .padding(.vertical, 4)
-                            .padding(.horizontal, 2)
-                        }
-                        .onAppear {
-                            if let targetID = activeSegmentID ?? segments.last?.id {
-                                DispatchQueue.main.async {
-                                    proxy.scrollTo(targetID, anchor: .trailing)
-                                }
-                            }
-                        }
-                        .onChange(of: segments.count) { _, _ in
-                            if let lastID = segments.last?.id {
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    proxy.scrollTo(lastID, anchor: .trailing)
-                                }
-                            }
-                        }
-                        .onChange(of: record.id) { _, _ in
-                            if let targetID = activeSegmentID ?? segments.last?.id {
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    proxy.scrollTo(targetID, anchor: .trailing)
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    HStack {
-                        Label("调用路径", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
-                            .font(.subheadline.weight(.semibold))
-                        Spacer()
-                        Text("\(segments.count) 段 · 切换 \(max(0, segments.count - 1)) 次 · 已自动定位当前切换")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-    }
-
-    private func segmentConnector(previous: MergedPathSegment?, current: MergedPathSegment) -> some View {
-        let label = previous == nil ? "开始" : "切"
-        let color: Color = previous == nil ? .secondary : colorForModel(current.shortModel)
-        return VStack(spacing: 2) {
-            Text(label)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(color)
-            Image(systemName: "arrow.right")
-                .font(.caption.weight(.bold))
-                .foregroundStyle(color)
-        }
-        .frame(minWidth: 24)
-    }
-
-    private func segmentNode(_ segment: MergedPathSegment) -> some View {
-        let isSelected = segment.containsRecord(record.id)
-        let color = colorForModel(segment.shortModel)
-        let turnCount = segment.records.count
-
-        return Button {
-            if let latestInSeg = segment.records.last {
-                onSelectRecord?(latestInSeg.id)
-            }
-        } label: {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 5) {
-                    Text(segment.turnRangeLabel)
-                        .font(.caption2.weight(.bold).monospacedDigit())
-                        .foregroundStyle(isSelected ? color : .secondary)
-
-                    if turnCount > 1 {
-                        Text("\(turnCount)轮")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(color.opacity(0.15))
-                            .foregroundStyle(color)
-                            .clipShape(Capsule())
-                    }
-
-                    Spacer()
-
-                    effortPill(segment.effort)
-
-                    Circle()
-                        .fill(segment.hasFailure ? Color.orange : Color.green)
-                        .frame(width: 6, height: 6)
-                }
-
-                Text(segment.shortModel)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-
-                Text("\(segment.subtaskCategory.displayName) · \(segment.subtaskSummary)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                HStack(spacing: 6) {
-                    Text(AutoModelFormatter.formatMs(segment.totalDurationMs))
-                    Text("·")
-                    Text(segment.totalTokens > 0 ? "\(formatTokens(segment.totalTokens)) tok" : "—")
-                }
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .frame(minWidth: 168, maxWidth: 220, alignment: .leading)
-            .background(isSelected ? color.opacity(0.13) : Color(.controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(isSelected ? color : color.opacity(0.32), lineWidth: isSelected ? 1.8 : 1)
-            )
-        }
-        .buttonStyle(.plain)
-    }
+    // MARK: - 2. Subtask & Effort Routing Table (Expanded on demand)
 
     private var subtaskEffortTableCard: some View {
         let segments = mergedPathSegments
@@ -686,261 +499,27 @@ struct RoutingReceiptView: View {
 
         return GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                // Active / Hovered Turn Readout Bar (zero overlap!)
-                HStack(spacing: 10) {
-                    let activeShort = shortModelName(activeItem.executedModelShortLabel)
-                    let activeColor = colorForModel(activeShort)
-                    Circle().fill(activeColor).frame(width: 8, height: 8)
-                    Text("T\(activeTurn)")
-                        .font(.caption.weight(.bold).monospacedDigit())
-                    Text(activeShort)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(activeColor)
-                    Text("·")
-                        .foregroundStyle(.secondary)
-                    Text("Token \(activeItem.finalUsage.map { formatTokens($0.totalTokens) } ?? "—")")
-                        .font(.caption.monospacedDigit())
-                    Text("·")
-                        .foregroundStyle(.secondary)
-                    Text("耗时 \(AutoModelFormatter.formatMs(activeItem.totalCompletionMs))")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.orange)
+                activeTurnReadoutBar(activeItem: activeItem, activeTurn: activeTurn)
 
-                    Spacer()
-
-                    HStack(spacing: 10) {
-                        HStack(spacing: 4) {
-                            RoundedRectangle(cornerRadius: 2).fill(Color.accentColor).frame(width: 12, height: 3)
-                            Text("Token (k)")
-                        }
-                        HStack(spacing: 4) {
-                            RoundedRectangle(cornerRadius: 2).fill(Color.orange.opacity(0.7)).frame(width: 8, height: 8)
-                            Text("耗时 (s)")
-                        }
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(Color(.controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-
-                // Reserved non-overlapping strip for all model switch nodes
-                if segments.count > 1 {
-                    let switchSegments = Array(segments.dropFirst())
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            Text("切换节点:")
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(.secondary)
-                            ForEach(switchSegments) { seg in
-                                let swColor = colorForModel(seg.shortModel)
-                                let isActiveSwitch = activeTurn >= seg.startTurn && activeTurn <= seg.endTurn
-                                Button {
-                                    if let target = seg.records.first {
-                                        onSelectRecord?(target.id)
-                                    }
-                                } label: {
-                                    Text("T\(seg.startTurn)→\(seg.shortModel)")
-                                        .font(.caption2.weight(.semibold).monospacedDigit())
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(swColor.opacity(isActiveSwitch ? 0.22 : 0.12))
-                                        .foregroundStyle(swColor)
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 4)
-                                                .strokeBorder(swColor.opacity(isActiveSwitch ? 0.65 : 0.25), lineWidth: 1)
-                                        )
-                                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
+                if !segments.isEmpty {
+                    stagePathBar(segments: segments, activeTurn: activeTurn)
                 }
 
                 if timeline.count >= 2 {
-                    let labeledSwitchTurns = nonOverlappingSwitchTurns(segments: segments, totalTurns: timeline.count)
-                    Chart {
-                        // 1) Colored model-phase background bands
-                        ForEach(segments) { seg in
-                            let bandColor = colorForModel(seg.shortModel)
-                            RectangleMark(
-                                xStart: .value("开始", Double(seg.startTurn) - 0.5),
-                                xEnd: .value("结束", Double(seg.endTurn) + 0.5),
-                                yStart: .value("底", 0.0),
-                                yEnd: .value("顶", maxTokensK * 1.22)
-                            )
-                            .foregroundStyle(bandColor.opacity(0.08))
-                        }
-
-                        // 2) Model switch vertical markers (non-overlapping top annotations)
-                        ForEach(Array(segments.dropFirst())) { seg in
-                            let switchColor = colorForModel(seg.shortModel)
-                            let showLabel = labeledSwitchTurns.contains(seg.startTurn)
-                            RuleMark(x: .value("切换", Double(seg.startTurn) - 0.5))
-                                .foregroundStyle(switchColor.opacity(0.75))
-                                .lineStyle(StrokeStyle(lineWidth: 1.4, dash: [4, 3]))
-                                .annotation(position: .top, alignment: .leading, spacing: 2) {
-                                    if showLabel {
-                                        Text("T\(seg.startTurn)→\(seg.shortModel)")
-                                            .font(.caption2.weight(.semibold))
-                                            .padding(.horizontal, 4)
-                                            .padding(.vertical, 1)
-                                            .background(switchColor.opacity(0.16))
-                                            .foregroundStyle(switchColor)
-                                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                                    } else {
-                                        Circle()
-                                            .fill(switchColor)
-                                            .frame(width: 5, height: 5)
-                                    }
-                                }
-                        }
-
-                        // 3) Latency bars (normalized onto chart height in orange)
-                        ForEach(Array(timeline.enumerated()), id: \.element.id) { index, item in
-                            let turn = index + 1
-                            let latencyScaled = (item.totalCompletionMs / 1000.0) / maxLatencySec * (maxTokensK * 0.85)
-                            BarMark(
-                                x: .value("轮次", turn),
-                                y: .value("耗时归一化", latencyScaled),
-                                width: timeline.count > 40 ? .fixed(3) : .automatic
-                            )
-                            .foregroundStyle(Color.orange.opacity(0.32))
-                        }
-
-                        // 4) Token consumption line + points colored by model
-                        ForEach(Array(timeline.enumerated()), id: \.element.id) { index, item in
-                            let turn = index + 1
-                            let tokK = Double(item.finalUsage?.totalTokens ?? 0) / 1000.0
-                            let shortName = shortModelName(item.executedModelShortLabel)
-                            let modelColor = colorForModel(shortName)
-
-                            LineMark(
-                                x: .value("轮次", turn),
-                                y: .value("Tokens (k)", tokK)
-                            )
-                            .foregroundStyle(Color.accentColor)
-                            .lineStyle(StrokeStyle(lineWidth: 2))
-                            .interpolationMethod(.catmullRom)
-
-                            PointMark(
-                                x: .value("轮次", turn),
-                                y: .value("Tokens (k)", tokK)
-                            )
-                            .foregroundStyle(modelColor)
-                            .symbolSize(turn == activeTurn ? 105 : (timeline.count > 30 ? 28 : 50))
-                        }
-
-                        // 5) Active/selected turn rule
-                        RuleMark(x: .value("当前", activeTurn))
-                            .foregroundStyle(Color.primary.opacity(0.35))
-                            .lineStyle(StrokeStyle(lineWidth: 1))
-                    }
-                    .chartXScale(domain: 0.5...(Double(timeline.count) + 0.5))
-                    .chartYScale(domain: 0...(maxTokensK * 1.25))
-                    .chartXAxis {
-                        AxisMarks(values: .automatic(desiredCount: min(8, timeline.count))) { val in
-                            AxisGridLine()
-                            AxisValueLabel {
-                                if let t = val.as(Int.self), t >= 1, t <= timeline.count {
-                                    Text("T\(t)")
-                                        .font(.caption2.monospacedDigit())
-                                }
-                            }
-                        }
-                    }
-                    .chartYAxisLabel("k tokens")
-                    .chartOverlay { proxy in
-                        GeometryReader { geo in
-                            Rectangle()
-                                .fill(.clear)
-                                .contentShape(Rectangle())
-                                .onContinuousHover { phase in
-                                    switch phase {
-                                    case .active(let location):
-                                        if let plotFrame = proxy.plotFrame {
-                                            let origin = geo[plotFrame].origin
-                                            let relX = location.x - origin.x
-                                            if let turnVal: Double = proxy.value(atX: relX) {
-                                                let clamped = min(max(1, Int(turnVal.rounded())), timeline.count)
-                                                hoveredTurn = clamped
-                                            }
-                                        }
-                                    case .ended:
-                                        hoveredTurn = nil
-                                    }
-                                }
-                                .onTapGesture { location in
-                                    if let plotFrame = proxy.plotFrame {
-                                        let origin = geo[plotFrame].origin
-                                        let relX = location.x - origin.x
-                                        if let turnVal: Double = proxy.value(atX: relX) {
-                                            let clamped = min(max(1, Int(turnVal.rounded())), timeline.count)
-                                            onSelectRecord?(timeline[clamped - 1].id)
-                                        }
-                                    }
-                                }
-                        }
-                    }
-                    .frame(height: 210)
-                    .padding(.top, 6)
+                    sessionTimelineChart(
+                        timeline: timeline,
+                        segments: segments,
+                        maxTokensK: maxTokensK,
+                        maxLatencySec: maxLatencySec,
+                        activeTurn: activeTurn
+                    )
                 } else {
-                    // Single-turn clean comparison bar
-                    let tokK = Double(record.finalUsage?.totalTokens ?? 0) / 1000.0
-                    let sec = record.totalCompletionMs / 1000.0
-                    HStack(spacing: 16) {
-                        Chart {
-                            BarMark(x: .value("指标", "输入"), y: .value("数量", record.finalUsage?.promptTokens ?? 0))
-                                .foregroundStyle(Color.blue)
-                            BarMark(x: .value("指标", "输出"), y: .value("数量", record.finalUsage?.completionTokens ?? 0))
-                                .foregroundStyle(Color.green)
-                        }
-                        .frame(height: 120)
-
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Token: \(formatTokens(Int(tokK * 1000)))")
-                            Text("耗时: \(String(format: "%.2f s", sec))")
-                        }
-                        .font(.caption.monospacedDigit())
-                        .frame(width: 140, alignment: .leading)
-                    }
+                    singleTurnBar
                 }
 
                 Divider()
 
-                // Per-Model Summary Strip (Short name + turns + duration + tokens)
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(stats) { stat in
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(stat.color)
-                                    .frame(width: 8, height: 8)
-                                Text(stat.shortModel)
-                                    .font(.caption.weight(.semibold))
-                                Text("\(stat.turnCount)轮")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                Text("·")
-                                    .foregroundStyle(.secondary)
-                                Text(AutoModelFormatter.formatMs(stat.totalDurationMs))
-                                    .font(.caption2.monospacedDigit())
-                                Text("·")
-                                    .foregroundStyle(.secondary)
-                                Text("\(formatTokens(stat.totalTokens)) tok")
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(stat.color.opacity(0.1))
-                            .clipShape(Capsule())
-                        }
-                    }
-                }
+                modelSummaryStrip(stats: stats)
             }
             .padding(4)
         } label: {
@@ -955,10 +534,451 @@ struct RoutingReceiptView: View {
         }
     }
 
+    private func activeTurnReadoutBar(activeItem: CallRecord, activeTurn: Int) -> some View {
+        let activeShort = shortModelName(activeItem.executedModelShortLabel)
+        let activeColor = colorForModel(activeShort)
+        return HStack(spacing: 10) {
+            Circle().fill(activeColor).frame(width: 8, height: 8)
+            Text("T\(activeTurn)")
+                .font(.caption.weight(.bold).monospacedDigit())
+            Text(activeShort)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(activeColor)
+            Text("·")
+                .foregroundStyle(.secondary)
+            Text("Token \(activeItem.finalUsage.map { formatTokens($0.totalTokens) } ?? "—")")
+                .font(.caption.monospacedDigit())
+            Text("·")
+                .foregroundStyle(.secondary)
+            Text("耗时 \(AutoModelFormatter.formatMs(activeItem.totalCompletionMs))")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.orange)
+
+            Spacer()
+
+            HStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.accentColor).frame(width: 12, height: 3)
+                    Text("Token (k)")
+                }
+                HStack(spacing: 4) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.orange.opacity(0.7)).frame(width: 8, height: 8)
+                    Text("耗时 (s)")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color(.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func stagePathBar(segments: [MergedPathSegment], activeTurn: Int) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 5) {
+                ForEach(Array(segments.enumerated()), id: \.element.id) { idx, seg in
+                    if idx > 0 {
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.secondary)
+                    }
+                    let swColor = colorForModel(seg.shortModel)
+                    let isActiveStage = activeTurn >= seg.startTurn && activeTurn <= seg.endTurn
+                    Button {
+                        if let target = seg.records.first {
+                            onSelectRecord?(target.id)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Circle().fill(swColor).frame(width: 6, height: 6)
+                            Text(seg.turnRangeLabel)
+                                .font(.caption2.weight(.bold).monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Text(seg.shortModel)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(swColor)
+                            effortPill(seg.effort)
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(swColor.opacity(isActiveStage ? 0.16 : 0.08))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .strokeBorder(swColor.opacity(isActiveStage ? 0.65 : 0.22), lineWidth: 1)
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
+                    .help("\(seg.subtaskCategory.displayName)：\(seg.reasonNote)")
+                }
+            }
+        }
+    }
+
+    private func sessionTimelineChart(
+        timeline: [CallRecord],
+        segments: [MergedPathSegment],
+        maxTokensK: Double,
+        maxLatencySec: Double,
+        activeTurn: Int
+    ) -> some View {
+        let labeledSwitchTurns = nonOverlappingSwitchTurns(segments: segments, totalTurns: timeline.count)
+        let indexedTimeline = Array(timeline.enumerated())
+
+        return Chart {
+            // 1) Colored model-phase background bands
+            ForEach(segments) { seg in
+                let bandColor = colorForModel(seg.shortModel)
+                RectangleMark(
+                    xStart: .value("开始", Double(seg.startTurn) - 0.5),
+                    xEnd: .value("结束", Double(seg.endTurn) + 0.5),
+                    yStart: .value("底", 0.0),
+                    yEnd: .value("顶", maxTokensK * 1.22)
+                )
+                .foregroundStyle(bandColor.opacity(0.08))
+            }
+
+            // 2) Model switch vertical markers (non-overlapping top annotations)
+            ForEach(Array(segments.dropFirst())) { seg in
+                let switchColor = colorForModel(seg.shortModel)
+                let showLabel = labeledSwitchTurns.contains(seg.startTurn)
+                RuleMark(x: .value("切换", Double(seg.startTurn) - 0.5))
+                    .foregroundStyle(switchColor.opacity(0.75))
+                    .lineStyle(StrokeStyle(lineWidth: 1.4, dash: [4, 3]))
+                    .annotation(position: .top, alignment: .leading, spacing: 2) {
+                        if showLabel {
+                            Text("T\(seg.startTurn)→\(seg.shortModel)")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(switchColor.opacity(0.16))
+                                .foregroundStyle(switchColor)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        } else {
+                            Circle()
+                                .fill(switchColor)
+                                .frame(width: 5, height: 5)
+                        }
+                    }
+            }
+
+            // 3) Latency bars (normalized onto chart height in orange)
+            ForEach(indexedTimeline, id: \.element.id) { index, item in
+                let turn = index + 1
+                let latencyScaled = (item.totalCompletionMs / 1000.0) / maxLatencySec * (maxTokensK * 0.85)
+                BarMark(
+                    x: .value("轮次", turn),
+                    y: .value("耗时归一化", latencyScaled),
+                    width: timeline.count > 40 ? .fixed(3) : .automatic
+                )
+                .foregroundStyle(Color.orange.opacity(0.32))
+            }
+
+            // 4) Token consumption line + points colored by model
+            ForEach(indexedTimeline, id: \.element.id) { index, item in
+                let turn = index + 1
+                let tokK = Double(item.finalUsage?.totalTokens ?? 0) / 1000.0
+                let shortName = shortModelName(item.executedModelShortLabel)
+                let modelColor = colorForModel(shortName)
+
+                LineMark(
+                    x: .value("轮次", turn),
+                    y: .value("Tokens (k)", tokK)
+                )
+                .foregroundStyle(Color.accentColor)
+                .lineStyle(StrokeStyle(lineWidth: 2))
+                .interpolationMethod(.catmullRom)
+
+                PointMark(
+                    x: .value("轮次", turn),
+                    y: .value("Tokens (k)", tokK)
+                )
+                .foregroundStyle(modelColor)
+                .symbolSize(turn == activeTurn ? 105 : (timeline.count > 30 ? 28 : 50))
+            }
+
+            // 5) Active/selected turn rule
+            RuleMark(x: .value("当前", activeTurn))
+                .foregroundStyle(Color.primary.opacity(0.35))
+                .lineStyle(StrokeStyle(lineWidth: 1))
+        }
+        .chartXScale(domain: 0.5...(Double(timeline.count) + 0.5))
+        .chartYScale(domain: 0...(maxTokensK * 1.25))
+        .chartXAxis {
+            AxisMarks(values: .automatic(desiredCount: min(8, timeline.count))) { val in
+                AxisGridLine()
+                AxisValueLabel {
+                    if let t = val.as(Int.self), t >= 1, t <= timeline.count {
+                        Text("T\(t)")
+                            .font(.caption2.monospacedDigit())
+                    }
+                }
+            }
+        }
+        .chartYAxisLabel("k tokens")
+        .chartOverlay { proxy in
+            GeometryReader { geo in
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let location):
+                            if let plotFrame = proxy.plotFrame {
+                                let origin = geo[plotFrame].origin
+                                let relX = location.x - origin.x
+                                if let turnVal: Double = proxy.value(atX: relX) {
+                                    let clamped = min(max(1, Int(turnVal.rounded())), timeline.count)
+                                    hoveredTurn = clamped
+                                }
+                            }
+                        case .ended:
+                            hoveredTurn = nil
+                        }
+                    }
+                    .onTapGesture { location in
+                        if let plotFrame = proxy.plotFrame {
+                            let origin = geo[plotFrame].origin
+                            let relX = location.x - origin.x
+                            if let turnVal: Double = proxy.value(atX: relX) {
+                                let clamped = min(max(1, Int(turnVal.rounded())), timeline.count)
+                                onSelectRecord?(timeline[clamped - 1].id)
+                            }
+                        }
+                    }
+            }
+        }
+        .frame(height: 210)
+        .padding(.top, 6)
+    }
+
+    private var singleTurnBar: some View {
+        let tokK = Double(record.finalUsage?.totalTokens ?? 0) / 1000.0
+        let sec = record.totalCompletionMs / 1000.0
+        return HStack(spacing: 16) {
+            Chart {
+                BarMark(x: .value("指标", "输入"), y: .value("数量", record.finalUsage?.promptTokens ?? 0))
+                    .foregroundStyle(Color.blue)
+                BarMark(x: .value("指标", "输出"), y: .value("数量", record.finalUsage?.completionTokens ?? 0))
+                    .foregroundStyle(Color.green)
+            }
+            .frame(height: 120)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Token: \(formatTokens(Int(tokK * 1000)))")
+                Text("耗时: \(String(format: "%.2f s", sec))")
+            }
+            .font(.caption.monospacedDigit())
+            .frame(width: 140, alignment: .leading)
+        }
+    }
+
+    private func modelSummaryStrip(stats: [ModelAggregateStat]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(stats) { stat in
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(stat.color)
+                            .frame(width: 8, height: 8)
+                        Text(stat.shortModel)
+                            .font(.caption.weight(.semibold))
+                        Text("\(stat.turnCount)轮")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text("·")
+                            .foregroundStyle(.secondary)
+                        Text(AutoModelFormatter.formatMs(stat.totalDurationMs))
+                            .font(.caption2.monospacedDigit())
+                        Text("·")
+                            .foregroundStyle(.secondary)
+                        Text("\(formatTokens(stat.totalTokens)) tok")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(stat.color.opacity(0.1))
+                    .clipShape(Capsule())
+                }
+            }
+        }
+    }
+
+    // MARK: - 3b. Per-Model Share Pie Charts (Tokens / Cost / Runtime)
+
+    private struct PieSliceItem: Identifiable {
+        let id: String
+        let label: String
+        let value: Double
+        let color: Color
+    }
+
+    private var modelSharePieChartsCard: some View {
+        let stats = modelAggregateStats
+        let totalTok = max(0, totalSessionTokens)
+        let totalMs = max(0.0, totalSessionDurationMs)
+        let pricedCostSum = stats.filter(\.hasCostData).map(\.totalCostUSD).reduce(0, +)
+        let hasAnyPricedModel = stats.contains(where: { $0.hasCostData })
+
+        let tokenSlices = stats
+            .filter { $0.totalTokens > 0 }
+            .map { PieSliceItem(id: "tok-\($0.id)", label: $0.shortModel, value: Double($0.totalTokens), color: $0.color) }
+        let costSlices = stats
+            .filter { $0.hasCostData && $0.totalCostUSD > 0 }
+            .map { PieSliceItem(id: "cost-\($0.id)", label: $0.shortModel, value: $0.totalCostUSD, color: $0.color) }
+        let durationSlices = stats
+            .filter { $0.totalDurationMs > 0 }
+            .map { PieSliceItem(id: "dur-\($0.id)", label: $0.shortModel, value: $0.totalDurationMs, color: $0.color) }
+
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 12) {
+                    shareDonutTile(
+                        title: "Token 占比",
+                        centerLabel: totalTok > 0 ? formatTokens(totalTok) : "无用量",
+                        slices: tokenSlices,
+                        emptyText: "无 Token"
+                    )
+                    Divider().frame(height: 112)
+                    shareDonutTile(
+                        title: "费用占比",
+                        centerLabel: hasAnyPricedModel ? AutoModelFormatter.formatUSD(pricedCostSum) : "未计价",
+                        slices: costSlices,
+                        emptyText: hasAnyPricedModel ? "$0" : "未配单价"
+                    )
+                    Divider().frame(height: 112)
+                    shareDonutTile(
+                        title: "运行时长占比",
+                        centerLabel: AutoModelFormatter.formatMs(totalMs),
+                        slices: durationSlices,
+                        emptyText: "无耗时"
+                    )
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(stats) { stat in
+                        let tokPct = totalTok > 0 ? (Double(stat.totalTokens) / Double(totalTok)) * 100.0 : 0.0
+                        let durPct = totalMs > 0 ? (stat.totalDurationMs / totalMs) * 100.0 : 0.0
+                        let costText: String = {
+                            guard stat.hasCostData else { return "未配单价" }
+                            if pricedCostSum > 0 {
+                                let pct = (stat.totalCostUSD / pricedCostSum) * 100.0
+                                return String(format: "%@ (%.1f%%)", AutoModelFormatter.formatUSD(stat.totalCostUSD), pct)
+                            }
+                            return AutoModelFormatter.formatUSD(stat.totalCostUSD)
+                        }()
+
+                        HStack(spacing: 8) {
+                            HStack(spacing: 5) {
+                                Circle().fill(stat.color).frame(width: 7, height: 7)
+                                Text(stat.shortModel)
+                                    .font(.caption.weight(.semibold))
+                                    .lineLimit(1)
+                                Text("· \(stat.turnCount)轮")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(minWidth: 130, alignment: .leading)
+
+                            Spacer(minLength: 6)
+
+                            Text(totalTok > 0 ? String(format: "Token %@ (%.1f%%)", formatTokens(stat.totalTokens), tokPct) : "Token —")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.primary)
+                                .frame(width: 136, alignment: .trailing)
+
+                            Text("费用 \(costText)")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(stat.hasCostData ? .green : .secondary)
+                                .frame(width: 144, alignment: .trailing)
+
+                            Text(totalMs > 0 ? String(format: "耗时 %@ (%.1f%%)", AutoModelFormatter.formatMs(stat.totalDurationMs), durPct) : "耗时 —")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.orange)
+                                .frame(width: 130, alignment: .trailing)
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(stat.color.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                    }
+                }
+            }
+            .padding(4)
+        } label: {
+            HStack {
+                Label("不同模型占比分布（Token / 费用 / 运行时长）", systemImage: "chart.pie.fill")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("共 \(stats.count) 个模型 · \(effectiveTimeline.count) 轮")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func shareDonutTile(
+        title: String,
+        centerLabel: String,
+        slices: [PieSliceItem],
+        emptyText: String
+    ) -> some View {
+        VStack(spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            ZStack {
+                if slices.isEmpty {
+                    Circle()
+                        .stroke(Color.secondary.opacity(0.22), lineWidth: 12)
+                        .frame(width: 82, height: 82)
+                    Text(emptyText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Chart(slices) { slice in
+                        SectorMark(
+                            angle: .value("数值", slice.value),
+                            innerRadius: .ratio(0.58),
+                            angularInset: 1.5
+                        )
+                        .cornerRadius(3)
+                        .foregroundStyle(slice.color)
+                    }
+                    .chartLegend(.hidden)
+                    .frame(width: 92, height: 92)
+
+                    Text(centerLabel)
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(width: 50)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
     // MARK: - 4. Collapsed Raw Details
 
     private var rawDetailsDisclosure: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
+            GroupBox {
+                DisclosureGroup("子任务与 Effort 路由明细 (\(mergedPathSegments.count) 段)", isExpanded: $showSubtaskTable) {
+                    subtaskEffortTableCard
+                        .padding(.top, 6)
+                }
+                .font(.caption.weight(.medium))
+                .padding(4)
+            }
+
             GroupBox {
                 DisclosureGroup("路由规则与候选模型 (\(record.decision.candidateEvaluations.count) 个)", isExpanded: $showRawAudit) {
                     VStack(alignment: .leading, spacing: 8) {

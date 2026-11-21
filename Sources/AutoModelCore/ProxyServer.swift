@@ -40,27 +40,35 @@ public final class ProxyServer: @unchecked Sendable {
         guard let engine else {
             writer.sendJSON(
                 statusCode: 503,
-                body: errorJSON(message: "Auto Model engine is shutting down", type: "server_error", code: "engine_unavailable")
+                body: errorJSON(message: "AutoRoute engine is shutting down", type: "server_error", code: "engine_unavailable")
             )
             return
         }
 
-        if req.method == "OPTIONS" {
+        let securityContext = await MainActor.run { (engine.localAPIToken, engine.config.proxySettings.port, engine.localModelAPIKey) }
+        if let rejection = LocalAPIRequestSecurity.rejection(
+            for: req,
+            port: securityContext.1,
+            token: securityContext.0,
+            modelAPIKey: securityContext.2
+        ) {
             writer.sendJSON(
-                statusCode: 204,
-                headers: [
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, anthropic-version, X-AutoModel-Session"
-                ],
-                body: Data()
+                statusCode: rejection.statusCode,
+                headers: ["WWW-Authenticate": "Bearer realm=\"AutoRoute local API\""],
+                body: errorJSON(message: rejection.message, type: "authentication_error", code: rejection.code)
             )
+            return
+        }
+
+        // Authenticated preflight is acknowledged without granting browser CORS access.
+        if req.method == "OPTIONS" {
+            writer.sendJSON(statusCode: 204, body: Data())
             return
         }
 
         switch (req.method, req.path) {
         case ("GET", "/health"), ("GET", "/v1/health"):
-            await handleHealth(engine: engine, writer: writer)
+            handleMinimalHealth(writer: writer)
 
         case ("GET", "/v1/models"):
             await handleListModels(engine: engine, writer: writer)
@@ -78,7 +86,7 @@ public final class ProxyServer: @unchecked Sendable {
             writer.sendJSON(
                 statusCode: 501,
                 body: errorJSON(
-                    message: "Auto Model 暂未实现 Embeddings API (/v1/embeddings)。",
+                    message: "AutoRoute 暂未实现 Embeddings API (/v1/embeddings)。",
                     type: "not_implemented_error",
                     code: "unsupported_endpoint"
                 )
@@ -117,6 +125,11 @@ public final class ProxyServer: @unchecked Sendable {
         }
     }
 
+    private func handleMinimalHealth(writer: HTTPConnectionWriter) {
+        let data = (try? JSONSerialization.data(withJSONObject: ["status": "ok", "app": "AutoRoute"], options: [.sortedKeys])) ?? Data()
+        writer.sendJSON(statusCode: 200, body: data)
+    }
+
     private func handleHealth(engine: AutoModelEngine, writer: HTTPConnectionWriter) async {
         let info = await MainActor.run { () -> [String: Any] in
             var tiersDict: [String: Any] = [:]
@@ -130,9 +143,10 @@ public final class ProxyServer: @unchecked Sendable {
                     ]
                 }
             }
+            let todayUsage = engine.todayUsageSummary()
             return [
                 "status": "ok",
-                "app": "Auto Model",
+                "app": "AutoRoute",
                 "bind": "127.0.0.1",
                 "port": engine.config.proxySettings.port,
                 "active_strategy": engine.config.policy.activeStrategy.rawValue,
@@ -141,6 +155,8 @@ public final class ProxyServer: @unchecked Sendable {
                 "provider_count": engine.config.providers.count,
                 "model_count": engine.config.models.count,
                 "receipt_count": engine.callHistory.count,
+                "today_call_count": todayUsage.callCount,
+                "today_tokens": todayUsage.totalTokens,
                 "tiers": tiersDict
             ]
         }
@@ -178,6 +194,17 @@ public final class ProxyServer: @unchecked Sendable {
                     "owned_by": "automodel-tier"
                 ]
             ]
+            for kind in AgentKind.allCases {
+                let alias = "auto/agent/\(kind.rawValue)"
+                for suffix in ["", "/low", "/medium", "/high"] {
+                    items.append([
+                        "id": "\(alias)\(suffix)",
+                        "object": "model",
+                        "created": nowEpoch,
+                        "owned_by": "autoroute-agent"
+                    ])
+                }
+            }
             for model in engine.config.models where model.isEnabled && !model.isAutoEvicted && model.availabilityStatus == .available {
                 let provider = providersByID[model.providerID]
                 if provider?.isEnabled == true && provider?.healthStatus != .authError && provider?.healthStatus != .networkError {
@@ -221,13 +248,15 @@ public final class ProxyServer: @unchecked Sendable {
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
             streamStarted.markStarted()
-            var merged = headers
-            merged["Access-Control-Allow-Origin"] = "*"
-            writer.startChunkedStream(statusCode: 200, headers: merged)
+            guard writer.startChunkedStream(statusCode: 200, headers: headers) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let chunkCallback: (@Sendable (Data) async throws -> Void)? = isStream ? { @Sendable chunkData in
-            _ = writer.writeStreamChunk(chunkData)
+            guard writer.writeStreamChunk(chunkData) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let outcome = await engine.executeChatCompletion(
@@ -236,6 +265,8 @@ public final class ProxyServer: @unchecked Sendable {
             sessionHeader: sessionHeader,
             clientName: clientName,
             endpointPath: "/v1/chat/completions",
+            agentHeader: req.header("X-AutoModel-Agent"),
+            clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
             onStreamChunk: chunkCallback
         )
@@ -243,8 +274,7 @@ public final class ProxyServer: @unchecked Sendable {
         if isStream && streamStarted.wasStarted {
             writer.finishStream()
         } else {
-            var headers = outcome.headers
-            headers["Access-Control-Allow-Origin"] = "*"
+            let headers = outcome.headers
             writer.sendJSON(
                 statusCode: outcome.httpStatusCode,
                 headers: headers,
@@ -281,18 +311,31 @@ public final class ProxyServer: @unchecked Sendable {
         let isStream = (openAIPayload["stream"] as? Bool) ?? false
         let sessionHeader = req.header("X-AutoModel-Session")
         let streamStarted = StreamFlagBox()
+        let nativeAnthropicStream = StreamFlagBox()
         let translator = AnthropicStreamTranslator()
+        let passthroughHeaders = NativeAnthropicRouting.passthroughHeaders(from: req)
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
+            if headers["X-AutoModel-Wire-Format"] == "anthropic-native" {
+                nativeAnthropicStream.markStarted()
+            }
             streamStarted.markStarted()
-            var merged = headers
-            merged["Access-Control-Allow-Origin"] = "*"
-            writer.startChunkedStream(statusCode: 200, headers: merged)
+            guard writer.startChunkedStream(statusCode: 200, headers: headers) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let chunkCallback: (@Sendable (Data) async throws -> Void)? = isStream ? { @Sendable chunkData in
-            for eventData in translator.translateChunk(chunkData) {
-                _ = writer.writeStreamChunk(eventData)
+            if nativeAnthropicStream.wasStarted {
+                guard writer.writeStreamChunk(chunkData) else {
+                    throw ClientStreamDisconnectedError()
+                }
+            } else {
+                for eventData in translator.translateChunk(chunkData) {
+                    guard writer.writeStreamChunk(eventData) else {
+                        throw ClientStreamDisconnectedError()
+                    }
+                }
             }
         } : nil
 
@@ -302,15 +345,24 @@ public final class ProxyServer: @unchecked Sendable {
             sessionHeader: sessionHeader,
             clientName: detectClientAgent(req: req, endpointPath: "/v1/messages", payload: openAIPayload),
             endpointPath: "/v1/messages",
+            agentHeader: req.header("X-AutoModel-Agent"),
+            nativeAnthropicPayload: rawJSON,
+            nativeAnthropicHeaders: passthroughHeaders,
+            clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
             onStreamChunk: chunkCallback
         )
 
+        let isNativeAnthropicResponse = outcome.headers["X-AutoModel-Wire-Format"] == "anthropic-native"
         if isStream && streamStarted.wasStarted {
-            for tailEvent in translator.finishEvents() {
-                _ = writer.writeStreamChunk(tailEvent)
+            if !nativeAnthropicStream.wasStarted {
+                for tailEvent in translator.finishEvents() {
+                    _ = writer.writeStreamChunk(tailEvent)
+                }
             }
             writer.finishStream()
+        } else if isNativeAnthropicResponse {
+            writer.sendJSON(statusCode: outcome.httpStatusCode, headers: outcome.headers, body: outcome.responseBody)
         } else if outcome.httpStatusCode == 200,
                   let openAIObj = try? JSONSerialization.jsonObject(with: outcome.responseBody) as? [String: Any] {
             let anthropicObj = ProtocolAdapters.openAIToAnthropicResponse(
@@ -318,12 +370,10 @@ public final class ProxyServer: @unchecked Sendable {
                 fallbackModel: outcome.callRecord.executedModelID ?? "auto"
             )
             let outData = (try? JSONSerialization.data(withJSONObject: anthropicObj, options: [])) ?? outcome.responseBody
-            var headers = outcome.headers
-            headers["Access-Control-Allow-Origin"] = "*"
+            let headers = outcome.headers
             writer.sendJSON(statusCode: 200, headers: headers, body: outData)
         } else {
-            var headers = outcome.headers
-            headers["Access-Control-Allow-Origin"] = "*"
+            let headers = outcome.headers
             writer.sendJSON(statusCode: outcome.httpStatusCode, headers: headers, body: outcome.responseBody)
         }
     }
@@ -341,15 +391,20 @@ public final class ProxyServer: @unchecked Sendable {
             return
         }
 
+        let useNativeResponses = NativeResponsesRouting.isRequired(rawJSON)
         let openAIPayload: [String: Any]
-        switch ProtocolAdapters.responsesToChatRequest(rawJSON) {
-        case .success(let converted):
-            openAIPayload = converted
-        case .failure(let err):
-            if case .badRequest(let status, let code, let message) = err {
-                writer.sendJSON(statusCode: status, body: errorJSON(message: message, type: "invalid_request_error", code: code))
+        if useNativeResponses {
+            openAIPayload = NativeResponsesRouting.routingPayload(rawJSON)
+        } else {
+            switch ProtocolAdapters.responsesToChatRequest(rawJSON) {
+            case .success(let converted):
+                openAIPayload = converted
+            case .failure(let err):
+                if case .badRequest(let status, let code, let message) = err {
+                    writer.sendJSON(statusCode: status, body: errorJSON(message: message, type: "invalid_request_error", code: code))
+                }
+                return
             }
-            return
         }
 
         let isStream = (openAIPayload["stream"] as? Bool) ?? false
@@ -359,14 +414,22 @@ public final class ProxyServer: @unchecked Sendable {
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
             streamStarted.markStarted()
-            var merged = headers
-            merged["Access-Control-Allow-Origin"] = "*"
-            writer.startChunkedStream(statusCode: 200, headers: merged)
+            guard writer.startChunkedStream(statusCode: 200, headers: headers) else {
+                throw ClientStreamDisconnectedError()
+            }
         } : nil
 
         let chunkCallback: (@Sendable (Data) async throws -> Void)? = isStream ? { @Sendable chunkData in
-            for eventData in translator.translateChunk(chunkData) {
-                _ = writer.writeStreamChunk(eventData)
+            if useNativeResponses {
+                guard writer.writeStreamChunk(chunkData) else {
+                    throw ClientStreamDisconnectedError()
+                }
+            } else {
+                for eventData in translator.translateChunk(chunkData) {
+                    guard writer.writeStreamChunk(eventData) else {
+                        throw ClientStreamDisconnectedError()
+                    }
+                }
             }
         } : nil
 
@@ -376,15 +439,22 @@ public final class ProxyServer: @unchecked Sendable {
             sessionHeader: sessionHeader,
             clientName: detectClientAgent(req: req, endpointPath: "/v1/responses", payload: openAIPayload),
             endpointPath: "/v1/responses",
+            agentHeader: req.header("X-AutoModel-Agent"),
+            nativeResponsesPayload: useNativeResponses ? NativeResponsesRouting.wirePayload(rawJSON) : nil,
+            clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
             onStreamChunk: chunkCallback
         )
 
         if isStream && streamStarted.wasStarted {
-            for tailEvent in translator.finishEvents() {
-                _ = writer.writeStreamChunk(tailEvent)
+            if !useNativeResponses {
+                for tailEvent in translator.finishEvents() {
+                    _ = writer.writeStreamChunk(tailEvent)
+                }
             }
             writer.finishStream()
+        } else if useNativeResponses {
+            writer.sendJSON(statusCode: outcome.httpStatusCode, headers: outcome.headers, body: outcome.responseBody)
         } else if outcome.httpStatusCode == 200,
                   let openAIObj = try? JSONSerialization.jsonObject(with: outcome.responseBody) as? [String: Any] {
             let responsesObj = ProtocolAdapters.chatToResponsesResponse(
@@ -392,12 +462,10 @@ public final class ProxyServer: @unchecked Sendable {
                 fallbackModel: outcome.callRecord.executedModelID ?? "auto"
             )
             let outData = (try? JSONSerialization.data(withJSONObject: responsesObj, options: [])) ?? outcome.responseBody
-            var headers = outcome.headers
-            headers["Access-Control-Allow-Origin"] = "*"
+            let headers = outcome.headers
             writer.sendJSON(statusCode: 200, headers: headers, body: outData)
         } else {
-            var headers = outcome.headers
-            headers["Access-Control-Allow-Origin"] = "*"
+            let headers = outcome.headers
             writer.sendJSON(statusCode: outcome.httpStatusCode, headers: headers, body: outcome.responseBody)
         }
     }
@@ -586,6 +654,7 @@ public final class ProxyServer: @unchecked Sendable {
                 let lower = trimmed.lowercased()
                 if lower.contains("hermes") { return "Hermes Agent" }
                 if lower.contains("openclaw") { return "OpenClaw" }
+                if lower.contains("deepseek") || lower == "dsh" { return "DeepSeek Harness" }
                 return trimmed
             }
         }
@@ -593,12 +662,14 @@ public final class ProxyServer: @unchecked Sendable {
         if referer.contains("hermes") { return "Hermes Agent" }
         if referer.contains("openclaw") { return "OpenClaw" }
         if referer.contains("opencode") { return "OpenCode" }
+        if referer.contains("deepseek") { return "DeepSeek Harness" }
 
         let ua = (req.header("User-Agent") ?? "").lowercased()
         if ua.contains("claude") { return "Claude Code" }
         if ua.contains("codex") { return "Codex" }
         if ua.contains("opencode") { return "OpenCode" }
         if ua.contains("hermes") { return "Hermes Agent" }
+        if ua.contains("deepseek-harness") || ua.contains("deepseek harness") || ua.contains("dsh/") { return "DeepSeek Harness" }
         if ua.contains("openclaw") { return "OpenClaw" }
         if ua.contains("cursor") { return "Cursor" }
         if ua.contains("cline") || ua.contains("roo") { return "Cline" }

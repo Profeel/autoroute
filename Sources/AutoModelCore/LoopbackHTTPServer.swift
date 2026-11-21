@@ -42,26 +42,44 @@ public enum LoopbackServerError: Error, LocalizedError, Equatable, Sendable {
 
 public final class HTTPConnectionWriter: @unchecked Sendable {
     private let fd: Int32
+    private let keepAlive: Bool
     private let lock = NSLock()
     private var headersSent = false
     private var isClosed = false
     private var isChunked = false
 
-    init(fd: Int32) {
+    init(fd: Int32, keepAlive: Bool = false) {
         self.fd = fd
+        self.keepAlive = keepAlive
+    }
+
+    var didClose: Bool {
+        lock.withLock { isClosed }
+    }
+
+    var didSendResponse: Bool {
+        lock.withLock { headersSent }
     }
 
     public func sendJSON(statusCode: Int, headers: [String: String] = [:], body: Data) {
         var allHeaders = headers
         allHeaders["Content-Type"] = allHeaders["Content-Type"] ?? "application/json; charset=utf-8"
         allHeaders["Content-Length"] = "\(body.count)"
-        allHeaders["Connection"] = "close"
-        sendRawHeaders(statusCode: statusCode, headers: allHeaders)
-        writeBytes(body)
-        close()
+        let shouldKeepAlive = keepAlive && allHeaders["Connection"]?.lowercased() != "close"
+        if shouldKeepAlive {
+            allHeaders["Connection"] = "keep-alive"
+            allHeaders["Keep-Alive"] = "timeout=15, max=100"
+        } else {
+            allHeaders["Connection"] = "close"
+        }
+        let headerOK = sendRawHeaders(statusCode: statusCode, headers: allHeaders, trailingBody: body)
+        if !shouldKeepAlive || !headerOK {
+            close()
+        }
     }
 
-    public func startChunkedStream(statusCode: Int = 200, headers: [String: String] = [:]) {
+    @discardableResult
+    public func startChunkedStream(statusCode: Int = 200, headers: [String: String] = [:]) -> Bool {
         var allHeaders = headers
         allHeaders["Content-Type"] = "text/event-stream; charset=utf-8"
         allHeaders["Cache-Control"] = "no-cache"
@@ -69,7 +87,9 @@ public final class HTTPConnectionWriter: @unchecked Sendable {
         allHeaders["Transfer-Encoding"] = "chunked"
         allHeaders["Connection"] = "close"
         isChunked = true
-        sendRawHeaders(statusCode: statusCode, headers: allHeaders)
+        let sent = sendRawHeaders(statusCode: statusCode, headers: allHeaders)
+        if !sent { close() }
+        return sent
     }
 
     public func writeStreamChunk(_ data: Data) -> Bool {
@@ -113,11 +133,12 @@ public final class HTTPConnectionWriter: @unchecked Sendable {
         }
     }
 
-    private func sendRawHeaders(statusCode: Int, headers: [String: String]) {
+    @discardableResult
+    private func sendRawHeaders(statusCode: Int, headers: [String: String], trailingBody: Data? = nil) -> Bool {
         lock.lock()
         if headersSent || isClosed {
             lock.unlock()
-            return
+            return false
         }
         headersSent = true
         lock.unlock()
@@ -129,7 +150,13 @@ public final class HTTPConnectionWriter: @unchecked Sendable {
         lines.append("")
         lines.append("")
         let raw = lines.joined(separator: "\r\n")
-        _ = writeBytes(Data(raw.utf8))
+        if let trailingBody, !trailingBody.isEmpty {
+            var packet = Data(capacity: raw.utf8.count + trailingBody.count)
+            packet.append(contentsOf: raw.utf8)
+            packet.append(trailingBody)
+            return writeBytes(packet)
+        }
+        return writeBytes(Data(raw.utf8))
     }
 
     @discardableResult
@@ -179,6 +206,7 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var runningPort: Int?
     private var acceptSource: DispatchSourceRead?
+    private var activeClientFDs: Set<Int32> = []
     private let acceptQueue = DispatchQueue(label: "org.automodel.http.accept", qos: .userInitiated)
     private let requestHandler: RequestHandler
 
@@ -285,14 +313,19 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
     }
 
     public func stop() {
-        let sourceToCancel: DispatchSourceRead? = stateLock.withLock {
+        let (sourceToCancel, fdsToShutdown): (DispatchSourceRead?, [Int32]) = stateLock.withLock {
             let src = acceptSource
             acceptSource = nil
             listenFD = -1
             runningPort = nil
-            return src
+            let fds = Array(activeClientFDs)
+            activeClientFDs.removeAll()
+            return (src, fds)
         }
         sourceToCancel?.cancel()
+        for clientFD in fdsToShutdown {
+            _ = Darwin.shutdown(clientFD, SHUT_RDWR)
+        }
     }
 
     public static func isLoopbackPortOccupied(_ port: Int) -> Bool {
@@ -351,53 +384,110 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
             setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
             let handler = self.requestHandler
-            Task.detached(priority: .userInitiated) {
-                await Self.handleClientSocket(fd: clientFD, handler: handler)
+            stateLock.withLock { _ = activeClientFDs.insert(clientFD) }
+            Task.detached(priority: .userInitiated) { [weak self] in
+                await Self.handleClientSocket(
+                    fd: clientFD,
+                    handler: handler,
+                    onBeforeClose: { [weak self] closedFD in
+                        self?.stateLock.withLock { _ = self?.activeClientFDs.remove(closedFD) }
+                    }
+                )
             }
         }
     }
 
-    private static func handleClientSocket(fd: Int32, handler: @escaping RequestHandler) async {
-        let writer = HTTPConnectionWriter(fd: fd)
-        guard let req = readHTTPRequest(fd: fd) else {
-            writer.sendJSON(
-                statusCode: 400,
-                body: Data(#"{"error":{"message":"Malformed HTTP request","type":"invalid_request_error"}}"#.utf8)
-            )
-            return
-        }
-        await handler(req, writer)
+    private enum HTTPReadResult {
+        case request(HTTPRequestMessage, keepAlive: Bool)
+        case eof
+        case malformed
     }
 
-    private static func readHTTPRequest(fd: Int32) -> HTTPRequestMessage? {
-        var buffer = Data()
+    private static func handleClientSocket(
+        fd: Int32,
+        handler: @escaping RequestHandler,
+        onBeforeClose: @escaping @Sendable (Int32) -> Void
+    ) async {
+        var carryOver = Data()
+        let maxRequestsPerConnection = 100
+        var handledCount = 0
+
+        while handledCount < maxRequestsPerConnection {
+            // recv can wait for the next keep-alive request. Leave Swift's
+            // cooperative executor available to run the handlers of other clients.
+            let buffered = carryOver
+            let (readResult, remaining) = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    var bytes = buffered
+                    let result = readHTTPRequest(fd: fd, carryOver: &bytes)
+                    continuation.resume(returning: (result, bytes))
+                }
+            }
+            carryOver = remaining
+            switch readResult {
+            case .eof:
+                onBeforeClose(fd)
+                Darwin.close(fd)
+                return
+            case .malformed:
+                let writer = HTTPConnectionWriter(fd: fd, keepAlive: false)
+                onBeforeClose(fd)
+                writer.sendJSON(
+                    statusCode: 400,
+                    body: Data(#"{"error":{"message":"Malformed HTTP request","type":"invalid_request_error"}}"#.utf8)
+                )
+                return
+            case .request(let req, let clientWantsKeepAlive):
+                handledCount += 1
+                let allowKeepAlive = clientWantsKeepAlive && handledCount < maxRequestsPerConnection
+                let writer = HTTPConnectionWriter(fd: fd, keepAlive: allowKeepAlive)
+                await handler(req, writer)
+                if writer.didClose {
+                    onBeforeClose(fd)
+                    return
+                }
+                if !allowKeepAlive || !writer.didSendResponse {
+                    onBeforeClose(fd)
+                    writer.close()
+                    return
+                }
+            }
+        }
+        onBeforeClose(fd)
+        Darwin.close(fd)
+    }
+
+    private static func readHTTPRequest(fd: Int32, carryOver: inout Data) -> HTTPReadResult {
+        var buffer = carryOver
+        carryOver.removeAll(keepingCapacity: true)
         var chunk = [UInt8](repeating: 0, count: 16_384)
         let separator = Data("\r\n\r\n".utf8)
-        var headerEndRange: Range<Data.Index>?
+        var headerEndRange = buffer.range(of: separator)
 
         while headerEndRange == nil {
             let n = Darwin.recv(fd, &chunk, chunk.count, 0)
             if n <= 0 {
                 if n < 0 && errno == EINTR { continue }
-                return nil
+                return buffer.isEmpty ? .eof : .malformed
             }
             buffer.append(contentsOf: chunk[0..<n])
             headerEndRange = buffer.range(of: separator)
             if buffer.count > 1_048_576 {
-                return nil
+                return .malformed
             }
         }
 
-        guard let headerEnd = headerEndRange else { return nil }
-        let headerData = buffer[..<headerEnd.lowerBound]
-        guard let headerString = String(data: headerData, encoding: .utf8) else { return nil }
+        guard let headerEnd = headerEndRange else { return .malformed }
+        let headerData = buffer[buffer.startIndex..<headerEnd.lowerBound]
+        guard let headerString = String(data: headerData, encoding: .utf8) else { return .malformed }
         let lines = headerString.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return nil }
+        guard let requestLine = lines.first else { return .malformed }
         let parts = requestLine.split(separator: " ", maxSplits: 2)
-        guard parts.count >= 2 else { return nil }
+        guard parts.count >= 2 else { return .malformed }
 
         let method = String(parts[0]).uppercased()
         let rawTarget = String(parts[1])
+        let httpVersion = parts.count >= 3 ? String(parts[2]).uppercased() : "HTTP/1.1"
         let targetComponents = rawTarget.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
         let path = String(targetComponents[0])
         let query = targetComponents.count > 1 ? String(targetComponents[1]) : ""
@@ -411,64 +501,123 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
             }
         }
 
-        var bodyData = Data(buffer[headerEnd.upperBound...])
-        let contentLength = headers.first(where: { $0.key.lowercased() == "content-length" }).flatMap { Int($0.value) } ?? 0
+        let connectionHeader = headers.first(where: { $0.key.lowercased() == "connection" })?.value.lowercased()
+        let keepAlive: Bool
+        if httpVersion == "HTTP/1.0" {
+            keepAlive = (connectionHeader == "keep-alive")
+        } else {
+            keepAlive = (connectionHeader != "close")
+        }
 
-        if contentLength > 0 {
-            let maxBody = 32 * 1024 * 1024
-            guard contentLength <= maxBody else { return nil }
-            while bodyData.count < contentLength {
+        var remaining = Data(buffer[headerEnd.upperBound...])
+        let contentLengthHeader = headers.first(where: { $0.key.lowercased() == "content-length" })?.value
+        let isChunkedRequest = headers.first(where: { $0.key.lowercased() == "transfer-encoding" })?
+            .value.lowercased().contains("chunked") == true
+        let maxBody = 32 * 1024 * 1024
+        var bodyData = Data()
+
+        if isChunkedRequest {
+            guard let decoded = readChunkedBody(fd: fd, buffer: &remaining, maxBodyBytes: maxBody) else {
+                return .malformed
+            }
+            bodyData = decoded
+            carryOver = remaining.isEmpty ? Data() : Data(remaining)
+        } else if let contentLengthStr = contentLengthHeader {
+            guard let contentLength = Int(contentLengthStr), contentLength >= 0, contentLength <= maxBody else {
+                return .malformed
+            }
+            while remaining.count < contentLength {
                 let n = Darwin.recv(fd, &chunk, chunk.count, 0)
                 if n <= 0 {
                     if n < 0 && errno == EINTR { continue }
-                    break
+                    return .malformed
                 }
-                bodyData.append(contentsOf: chunk[0..<n])
+                remaining.append(contentsOf: chunk[0..<n])
             }
-            if bodyData.count > contentLength {
-                bodyData = bodyData.prefix(contentLength)
+            bodyData = Data(remaining.prefix(contentLength))
+            if remaining.count > contentLength {
+                carryOver = Data(remaining.dropFirst(contentLength))
             }
-        } else if headers.first(where: { $0.key.lowercased() == "transfer-encoding" })?.value.lowercased().contains("chunked") == true {
-            bodyData = readRemainingChunkedBody(fd: fd, initial: bodyData)
+        } else {
+            carryOver = remaining.isEmpty ? Data() : Data(remaining)
         }
 
-        return HTTPRequestMessage(
-            method: method,
-            path: path,
-            query: query,
-            headers: headers,
-            body: bodyData
+        return .request(
+            HTTPRequestMessage(
+                method: method,
+                path: path,
+                query: query,
+                headers: headers,
+                body: bodyData
+            ),
+            keepAlive: keepAlive
         )
     }
 
-    private static func readRemainingChunkedBody(fd: Int32, initial: Data) -> Data {
-        var raw = initial
-        var chunk = [UInt8](repeating: 0, count: 16_384)
-        let endMarker = Data("0\r\n\r\n".utf8)
-        while raw.range(of: endMarker) == nil {
-            let n = Darwin.recv(fd, &chunk, chunk.count, 0)
-            if n <= 0 { break }
-            raw.append(contentsOf: chunk[0..<n])
-            if raw.count > 32 * 1024 * 1024 { break }
+    private static func readChunkedBody(fd: Int32, buffer: inout Data, maxBodyBytes: Int) -> Data? {
+        var decoded = Data()
+        var recvChunk = [UInt8](repeating: 0, count: 16_384)
+        let crlf = Data("\r\n".utf8)
+
+        func fillMore() -> Bool {
+            let n = Darwin.recv(fd, &recvChunk, recvChunk.count, 0)
+            if n < 0 && errno == EINTR { return fillMore() }
+            guard n > 0 else { return false }
+            buffer.append(contentsOf: recvChunk[0..<n])
+            return true
         }
 
-        // Decode HTTP chunked framing
-        var decoded = Data()
-        var idx = raw.startIndex
-        while idx < raw.endIndex {
-            guard let crlf = raw[idx...].range(of: Data("\r\n".utf8)),
-                  let sizeStr = String(data: raw[idx..<crlf.lowerBound], encoding: .utf8)?
-                    .split(separator: ";").first?
-                    .trimmingCharacters(in: .whitespaces),
-                  let size = Int(sizeStr, radix: 16) else {
-                break
+        while true {
+            var lineRange = buffer.range(of: crlf)
+            while lineRange == nil {
+                if buffer.count > maxBodyBytes + 65_536 { return nil }
+                guard fillMore() else { return nil }
+                lineRange = buffer.range(of: crlf)
             }
-            idx = crlf.upperBound
-            if size == 0 { break }
-            let endIdx = min(raw.endIndex, idx + size)
-            decoded.append(raw[idx..<endIdx])
-            idx = min(raw.endIndex, endIdx + 2)
+            guard let crlfRange = lineRange else { return nil }
+            let sizeLineData = buffer[buffer.startIndex..<crlfRange.lowerBound]
+            buffer.removeSubrange(buffer.startIndex..<crlfRange.upperBound)
+
+            guard let sizeLine = String(data: sizeLineData, encoding: .utf8),
+                  let sizeToken = sizeLine.split(separator: ";", maxSplits: 1).first?
+                    .trimmingCharacters(in: .whitespaces),
+                  let chunkSize = Int(sizeToken, radix: 16),
+                  chunkSize >= 0 else {
+                return nil
+            }
+
+            if chunkSize == 0 {
+                // Consume optional trailer headers up to the final CRLF.
+                if buffer.starts(with: crlf) {
+                    buffer.removeFirst(2)
+                    return decoded
+                }
+                let trailerEnd = Data("\r\n\r\n".utf8)
+                var endRange = buffer.range(of: trailerEnd)
+                while endRange == nil {
+                    if buffer.starts(with: crlf) {
+                        buffer.removeFirst(2)
+                        return decoded
+                    }
+                    if buffer.count > 65_536 { return nil }
+                    guard fillMore() else { return nil }
+                    endRange = buffer.range(of: trailerEnd)
+                }
+                if let endRange {
+                    buffer.removeSubrange(buffer.startIndex..<endRange.upperBound)
+                }
+                return decoded
+            }
+
+            guard decoded.count + chunkSize <= maxBodyBytes else { return nil }
+            let needed = chunkSize + 2 // chunk payload + trailing CRLF
+            while buffer.count < needed {
+                guard fillMore() else { return nil }
+            }
+            decoded.append(buffer.prefix(chunkSize))
+            let trailing = buffer[buffer.index(buffer.startIndex, offsetBy: chunkSize)..<buffer.index(buffer.startIndex, offsetBy: needed)]
+            guard trailing == crlf else { return nil }
+            buffer.removeFirst(needed)
         }
-        return decoded
     }
 }

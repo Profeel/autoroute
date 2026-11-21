@@ -7,11 +7,18 @@ public struct ModelRuntimeMetrics: Sendable {
     public var averageLatencyMs: Double
     public var successRate: Double
     public var sampleCount: Int
+    public var cooldownUntil: Date?
 
-    public init(averageLatencyMs: Double, successRate: Double, sampleCount: Int) {
+    public init(
+        averageLatencyMs: Double,
+        successRate: Double,
+        sampleCount: Int,
+        cooldownUntil: Date? = nil
+    ) {
         self.averageLatencyMs = averageLatencyMs
         self.successRate = successRate
         self.sampleCount = sampleCount
+        self.cooldownUntil = cooldownUntil
     }
 }
 
@@ -22,6 +29,8 @@ public struct RoutingContext: Sendable {
     public var models: [ModelConfig]
     public var policy: RoutingPolicyConfig
     public var stickyModelID: UUID?
+    public var consecutiveRoutineTurns: Int
+    public var escalateNextTurn: Bool
     public var runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics]
 
     public init(
@@ -31,6 +40,8 @@ public struct RoutingContext: Sendable {
         models: [ModelConfig],
         policy: RoutingPolicyConfig,
         stickyModelID: UUID? = nil,
+        consecutiveRoutineTurns: Int = 0,
+        escalateNextTurn: Bool = false,
         runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics] = [:]
     ) {
         self.requestedModel = requestedModel
@@ -39,6 +50,8 @@ public struct RoutingContext: Sendable {
         self.models = models
         self.policy = policy
         self.stickyModelID = stickyModelID
+        self.consecutiveRoutineTurns = consecutiveRoutineTurns
+        self.escalateNextTurn = escalateNextTurn
         self.runtimeMetricsByModelID = runtimeMetricsByModelID
     }
 }
@@ -69,6 +82,7 @@ public enum RequestFeatureExtractor {
         var requiresVision = false
         var combinedTextParts: [String] = []
         var userTextParts: [String] = []
+        var assistantTextParts: [String] = []
         var nonSystemTextParts: [String] = []
         var firstSystemOrUserParts: [String] = []
 
@@ -94,6 +108,8 @@ public enum RequestFeatureExtractor {
                 combinedTextParts.append(textForMessage)
                 if role == "user" {
                     userTextParts.append(textForMessage)
+                } else if role == "assistant" {
+                    assistantTextParts.append(textForMessage)
                 }
                 if role != "system" {
                     nonSystemTextParts.append(textForMessage)
@@ -117,8 +133,32 @@ public enum RequestFeatureExtractor {
         } else {
             intentText = combinedText
         }
-        let estimatedInputTokens = estimateTokens(text: combinedText, messageCount: messages.count, hasTools: requiresTools, hasVision: requiresVision)
-        let intentTokens = estimateTokens(text: intentText, messageCount: min(2, messages.count), hasTools: requiresTools, hasVision: requiresVision)
+        let toolPayload = toolsArray ?? functionsArray
+        let toolTokenOverhead = toolPayload.map { estimateStructuredPayloadTokens($0) } ?? 0
+        let visionItemCount = messages.reduce(0) { count, message in
+            guard let parts = message["content"] as? [[String: Any]] else { return count }
+            return count + parts.reduce(0) { partCount, part in
+                let type = (part["type"] as? String) ?? ""
+                return partCount + ((type == "image_url" || type == "input_image" || part["image_url"] != nil) ? 1 : 0)
+            }
+        }
+        let visionTokenOverhead = visionItemCount * 768
+        let estimatedInputTokens = estimateTokens(
+            text: combinedText,
+            messageCount: messages.count,
+            hasTools: requiresTools,
+            hasVision: requiresVision,
+            toolTokenOverhead: toolTokenOverhead,
+            visionTokenOverhead: visionTokenOverhead
+        )
+        let intentTokens = estimateTokens(
+            text: intentText,
+            messageCount: min(2, messages.count),
+            hasTools: requiresTools,
+            hasVision: requiresVision,
+            toolTokenOverhead: toolTokenOverhead,
+            visionTokenOverhead: visionTokenOverhead
+        )
         let detectedTaskType = classifyIntent(
             text: intentText,
             estimatedTokens: estimatedInputTokens,
@@ -127,21 +167,44 @@ public enum RequestFeatureExtractor {
             requiresVision: requiresVision
         )
 
-        let explicitEffortStr = (payload["reasoning_effort"] as? String)
-            ?? ((payload["reasoning"] as? [String: Any])?["effort"] as? String)
-        let explicitEffort = explicitEffortStr.flatMap { ReasoningEffort(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+        let clientProvidedEffort: ReasoningEffort? = {
+            let raw = (payload["reasoning_effort"] as? String)
+                ?? ((payload["reasoning"] as? [String: Any])?["effort"] as? String)
+            guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  !trimmed.isEmpty else {
+                return nil
+            }
+            return ReasoningEffort(rawValue: trimmed)
+        }()
+
+        let latestMessageRole = ((messages.last?["role"] as? String) ?? "").lowercased()
+        let recentToolNames = extractRecentAssistantToolNames(from: messages)
+        let trailingToolOutputs = extractTrailingToolOutputs(from: messages)
+        let latestSubtaskSource = userTextParts.last ?? nonSystemTextParts.last ?? ""
+        // Anthropic can place tool results and user text in the same message. Its adapter
+        // emits the tool result immediately before the normalized user message.
+        let isUserTurnBoundary = latestMessageRole == "user"
+            && (messages.dropLast().last?["role"] as? String) != "tool"
         let (subtaskCategory, recommendedEffort) = classifySubtaskAndEffort(
-            text: intentText,
+            text: latestSubtaskSource,
+            latestMessageRole: latestMessageRole,
+            recentToolNames: recentToolNames,
+            trailingToolOutputs: trailingToolOutputs,
             estimatedTokens: estimatedInputTokens,
-            intentTokens: intentTokens,
+            intentTokens: estimateTextTokens(latestSubtaskSource),
             requiresTools: requiresTools,
-            requiresVision: requiresVision,
-            explicitEffort: explicitEffort
+            requiresVision: requiresVision
         )
-        let latestSubtaskSource = userTextParts.last ?? nonSystemTextParts.last ?? combinedText
-        let subtaskSummary = extractSubtaskSummary(from: latestSubtaskSource, fallbackCategory: subtaskCategory)
+        let subtaskSummary = extractSubtaskSummary(
+            from: latestSubtaskSource,
+            latestMessageRole: latestMessageRole,
+            recentToolNames: recentToolNames,
+            fallbackCategory: subtaskCategory,
+            effort: recommendedEffort
+        )
 
         let isMultiTurn = messages.count >= 3
+        let firstAssistant = assistantTextParts.first?.trimmingCharacters(in: .whitespacesAndNewlines)
         let fingerprint: String?
         if let explicitSession = sessionHeader?.trimmingCharacters(in: .whitespacesAndNewlines), !explicitSession.isEmpty {
             fingerprint = explicitSession
@@ -150,9 +213,19 @@ public enum RequestFeatureExtractor {
         } else if let firstUser = userTextParts.first?.trimmingCharacters(in: .whitespacesAndNewlines), !firstUser.isEmpty {
             // Anchor on the first user turn so dynamic system prompt updates (time/memory/skills)
             // inside agents like Hermes do not split a single conversation into multiple sessions.
-            let seed = "user:\(firstUser.prefix(500))"
-            let digest = SHA256.hash(data: Data(seed.utf8))
-            fingerprint = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+            // For very short generic openings ("hi", "你好"), disambiguate with the first assistant turn
+            // so unrelated single-word chats do not collide on the same sticky bucket.
+            if firstUser.count >= 12 {
+                let seed = "user:\(firstUser.prefix(500))"
+                let digest = SHA256.hash(data: Data(seed.utf8))
+                fingerprint = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+            } else if let firstAssistant, !firstAssistant.isEmpty {
+                let seed = "user:\(firstUser)|assistant:\(firstAssistant.prefix(200))"
+                let digest = SHA256.hash(data: Data(seed.utf8))
+                fingerprint = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+            } else {
+                fingerprint = nil
+            }
         } else if !firstSystemOrUserParts.isEmpty {
             let seed = firstSystemOrUserParts.joined(separator: "|")
             let digest = SHA256.hash(data: Data(seed.utf8))
@@ -164,6 +237,7 @@ public enum RequestFeatureExtractor {
         return RequestFeatures(
             messageCount: messages.count,
             estimatedInputTokens: estimatedInputTokens,
+            tokenEstimateConfidence: (requiresTools || requiresVision) ? .low : .medium,
             requiresTools: requiresTools,
             requiresVision: requiresVision,
             requiresJSONMode: requiresJSONMode,
@@ -173,7 +247,9 @@ public enum RequestFeatureExtractor {
             isMultiTurn: isMultiTurn,
             subtaskCategory: subtaskCategory,
             recommendedEffort: recommendedEffort,
-            subtaskSummary: subtaskSummary
+            subtaskSummary: subtaskSummary,
+            clientProvidedEffort: clientProvidedEffort,
+            isUserTurnBoundary: isUserTurnBoundary
         )
     }
 
@@ -181,15 +257,55 @@ public enum RequestFeatureExtractor {
         text: String,
         messageCount: Int = 1,
         hasTools: Bool = false,
-        hasVision: Bool = false
+        hasVision: Bool = false,
+        toolTokenOverhead: Int = 0,
+        visionTokenOverhead: Int = 0
     ) -> Int {
-        // Practical mixed CJK/ASCII approximation: ~3.2 chars per token on average
-        let charCount = text.count
-        let baseTokens = max(1, Int(ceil(Double(charCount) / 3.2)))
+        let baseTokens = estimateTextTokens(text)
         let messageOverhead = max(0, messageCount) * 4
-        let toolOverhead = hasTools ? 250 : 0
-        let visionOverhead = hasVision ? 768 : 0
-        return baseTokens + messageOverhead + toolOverhead + visionOverhead
+        let toolOverhead = hasTools ? max(250, toolTokenOverhead) : 0
+        let visionOverhead = hasVision ? max(768, visionTokenOverhead) : 0
+        return max(1, baseTokens + messageOverhead + toolOverhead + visionOverhead)
+    }
+
+    private static func estimateTextTokens(_ text: String) -> Int {
+        var estimate = 0.0
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if isCJK(value) {
+                estimate += 1.5
+            } else if value > 0x7F {
+                // Emoji and other non-ASCII symbols are usually split into multiple tokens.
+                estimate += 2.0
+            } else if scalar.properties.isWhitespace {
+                estimate += 0.25
+            } else if isASCIIJsonOrCodePunctuation(value) {
+                estimate += 0.45
+            } else {
+                estimate += 0.30
+            }
+        }
+        return max(1, Int(ceil(estimate)))
+    }
+
+    private static func estimateStructuredPayloadTokens(_ payload: [Any]) -> Int {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            return 0
+        }
+        return estimateTextTokens(text)
+    }
+
+    private static func isCJK(_ value: UInt32) -> Bool {
+        (0x3400...0x4DBF).contains(value)
+            || (0x4E00...0x9FFF).contains(value)
+            || (0xF900...0xFAFF).contains(value)
+            || (0x20000...0x2FA1F).contains(value)
+    }
+
+    private static func isASCIIJsonOrCodePunctuation(_ value: UInt32) -> Bool {
+        "{}[]()<>:;,.'\"/=+-_*#|\\\\".unicodeScalars.contains { $0.value == value }
     }
 
     private static func classifyIntent(
@@ -233,68 +349,167 @@ public enum RequestFeatureExtractor {
         return .generalChat
     }
 
+    private static func extractRecentAssistantToolNames(from messages: [[String: Any]]) -> [String] {
+        for msg in messages.reversed() {
+            let role = ((msg["role"] as? String) ?? "").lowercased()
+            if role == "user" { break }
+            if role == "assistant", let toolCalls = msg["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+                return toolCalls.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+            }
+        }
+        return []
+    }
+
+    private static func extractTrailingToolOutputs(from messages: [[String: Any]]) -> [String] {
+        var outputs: [String] = []
+        for msg in messages.reversed() {
+            let role = ((msg["role"] as? String) ?? "").lowercased()
+            if role == "tool" {
+                if let str = msg["content"] as? String, !str.isEmpty {
+                    outputs.append(String(str.prefix(600)))
+                }
+            } else if role == "user" || role == "assistant" {
+                break
+            }
+        }
+        return outputs.reversed()
+    }
+
     private static func classifySubtaskAndEffort(
         text: String,
+        latestMessageRole: String = "user",
+        recentToolNames: [String] = [],
+        trailingToolOutputs: [String] = [],
         estimatedTokens: Int,
         intentTokens: Int,
         requiresTools: Bool,
-        requiresVision: Bool,
-        explicitEffort: ReasoningEffort?
+        requiresVision: Bool
     ) -> (AgentSubtaskCategory, ReasoningEffort) {
         let lower = text.lowercased()
 
+        // 1. Dynamic tool-loop step classification when the agent is continuing after tool calls/results
+        if latestMessageRole == "tool" || (!trailingToolOutputs.isEmpty && latestMessageRole != "user") {
+            let toolNamesLower = recentToolNames.map { $0.lowercased() }
+            let joinedOutputsLower = trailingToolOutputs.joined(separator: "\n").lowercased()
+
+            let toolErrorSignals = [
+                "traceback", "exception", "timed out", "timeout", "error:", "\"error\"",
+                "failed:", "not found", "403 forbidden", "status 403", "status 500",
+                "selector not found", "报错", "失败", "超时"
+            ]
+            if toolErrorSignals.contains(where: { joinedOutputsLower.contains($0) }) {
+                // Keep on Medium tier (.toolOrchestration) while boosting effort to high for error recovery
+                return (.toolOrchestration, .high)
+            }
+
+            let lightweightReadTools = [
+                "read_file", "view_file", "grep", "glob", "find", "list_dir", "ls", "search", "fetch"
+            ]
+            let lightweightBrowserTools = [
+                "ego", "browser", "snapshot", "click", "scroll", "hover", "navigate", "open_url", "screenshot", "wait", "press_key"
+            ]
+            let allLightRead = !toolNamesLower.isEmpty && toolNamesLower.allSatisfy { name in
+                lightweightReadTools.contains(where: { name.contains($0) })
+            }
+            if allLightRead {
+                return (.explorationSearch, .low)
+            }
+
+            let allLightBrowser = !toolNamesLower.isEmpty && toolNamesLower.allSatisfy { name in
+                lightweightBrowserTools.contains(where: { name.contains($0) })
+                    || lightweightReadTools.contains(where: { name.contains($0) })
+            }
+            if allLightBrowser {
+                // Routine ego-lite / browser execution stays on Medium tier while dropping effort to low
+                return (.toolOrchestration, .low)
+            }
+
+            return (.toolOrchestration, .medium)
+        }
+
         let debugSignals = [
-            "stack trace", "traceback", "exception", "crash", "deadlock", "root cause", "debug",
-            "报错", "崩溃", "死锁", "根因", "排查", "为什么失败", "无法编译", "error:", "failed"
+            "stack trace", "traceback", "deadlock", "root cause", "segfault", "intermittent failure",
+            "崩溃", "死锁", "根因", "偶发故障", "为什么失败", "无法编译"
         ]
         if debugSignals.contains(where: { lower.contains($0) }) {
-            return (.deepDebugging, explicitEffort ?? .max)
+            return (.deepDebugging, .high)
         }
 
         let planningSignals = [
-            "architecture", "design", "tradeoff", "migration plan", "compare", "step by step",
-            "refactor plan", "架构", "设计方案", "规划", "迁移计划", "方案对比", "利弊", "重构方案", "深度分析"
+            "architecture", "system design", "migration", "major refactor", "cross-service", "performance optimiz",
+            "deep research", "quantitative analysis", "tradeoff", "架构", "系统设计", "迁移", "大规模重构",
+            "跨模块", "性能优化", "深度分析", "深度研究", "定量分析", "方案对比", "重构方案"
         ]
-        if planningSignals.contains(where: { lower.contains($0) }) || estimatedTokens >= 24_000 {
-            return (.architecturePlanning, explicitEffort ?? .high)
+        if planningSignals.contains(where: { lower.contains($0) }) || estimatedTokens >= 120_000 {
+            return (.architecturePlanning, .high)
+        }
+        if requiresVision || intentTokens >= 1_500 {
+            return (.generalEngineering, .medium)
         }
 
-        let summarySignals = [
-            "summarize", "summary", "compact", "tl;dr", "translate", "title", "condense",
-            "摘要", "总结", "压缩", "提炼", "翻译", "生成标题"
+        let browserSignals = [
+            "ego-lite", "ego_lite", "ego-browser", "浏览器", "打开网页", "访问网页", "抓取网页", "x.com"
         ]
-        if summarySignals.contains(where: { lower.contains($0) }) && intentTokens < 600 {
-            return (.summarizationCompaction, explicitEffort ?? .low)
+        if browserSignals.contains(where: { lower.contains($0) }) {
+            return (.toolOrchestration, .medium)
         }
 
-        let exploreSignals = [
-            "grep", "glob", "read_file", "find_by_name", "list_dir", "search", "locate", "what is",
-            "where is", "查找", "检索", "定位", "列出", "读取", "搜索", "看看"
+        let reviewSignals = [
+            "code review", "review the", "audit", "verify", "git diff", "final check",
+            "审核", "审查", "复核", "验收", "门禁", "最终检查", "校对"
         ]
-        if exploreSignals.contains(where: { lower.contains($0) }) && intentTokens < 300 {
-            return (.explorationSearch, explicitEffort ?? .low)
+        if reviewSignals.contains(where: { lower.contains($0) }) {
+            return (requiresTools ? .toolOrchestration : .routineCoding, .high)
         }
 
-        if requiresTools {
-            return (.toolOrchestration, explicitEffort ?? .medium)
+        var instruction = lower.trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["please ", "请", "帮我"] where instruction.hasPrefix(prefix) {
+            instruction = String(instruction.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
         }
-
-        let codingSignals = [
-            "```", "func ", "def ", "class ", "import ", "struct ", "select ", "swift", "python",
-            "typescript", "javascript", "rust", "refactor", "implement", "write test", "unit test",
-            "单元测试", "重构", "代码", "实现", "函数", "接口", "sql"
+        let transformPrefixes = [
+            "summarize ", "summarise ", "compact ", "tl;dr", "translate ", "condense ", "classify ", "tag ", "extract ",
+            "摘要", "总结", "压缩", "提炼", "翻译", "生成标题", "分类", "打标签", "提取", "从以下"
         ]
-        if codingSignals.contains(where: { lower.contains($0) }) || requiresVision {
-            return (.routineCoding, explicitEffort ?? .medium)
+        if intentTokens < 600, transformPrefixes.contains(where: { instruction.hasPrefix($0) }),
+           !instruction.hasPrefix("从以下") || instruction.contains("提取") {
+            return (.summarizationCompaction, .low)
         }
 
-        if intentTokens < 100 {
-            return (.explorationSearch, explicitEffort ?? .low)
+        let lookupPrefixes = [
+            "grep ", "glob ", "read_file ", "find_by_name ", "list_dir ", "search for ", "locate ", "where is ",
+            "查找", "检索", "列出", "读取", "搜索"
+        ]
+        if intentTokens < 300, lookupPrefixes.contains(where: { instruction.hasPrefix($0) }) {
+            return (.explorationSearch, .low)
         }
-        return (.routineCoding, explicitEffort ?? .medium)
+
+        let scopedSignals = [
+            "fix the typo", "fix this typo", "bug fix", "implement", "write test", "write a test", "unit test",
+            "write a ", "draft ", "spec-driven", "refactor this ", "重构这段", "单元测试", "拼写错误", "修复这个",
+            "实现", "撰写", "写一", "文档", "表格", "幻灯片"
+        ]
+        if scopedSignals.contains(where: { lower.contains($0) }) {
+            return (.routineCoding, .medium)
+        }
+        if ["hello", "hi", "hey", "thanks", "你好", "谢谢"].contains(instruction) {
+            return (.explorationSearch, .low)
+        }
+        return (.generalEngineering, .medium)
     }
 
-    private static func extractSubtaskSummary(from text: String, fallbackCategory: AgentSubtaskCategory) -> String {
+    private static func extractSubtaskSummary(
+        from text: String,
+        latestMessageRole: String = "user",
+        recentToolNames: [String] = [],
+        fallbackCategory: AgentSubtaskCategory,
+        effort: ReasoningEffort = .medium
+    ) -> String {
+        if (latestMessageRole == "tool" || !recentToolNames.isEmpty) && latestMessageRole != "user",
+           !recentToolNames.isEmpty {
+            let uniqueNames = Array(NSOrderedSet(array: recentToolNames)).compactMap { $0 as? String }
+            let joined = uniqueNames.prefix(2).joined(separator: ", ")
+            return "工具步: \(joined) (\(effort.rawValue))"
+        }
         let lines = text
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -369,6 +584,12 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                 break
             }
         }
+        if matchedModel == nil, requestedModel.hasPrefix("codex/") {
+            let stripped = String(requestedModel.dropFirst("codex/".count))
+            matchedModel = context.models.first(where: { m in
+                m.modelID == stripped && providersByID[m.providerID]?.apiProtocol == .codexChatGPT
+            })
+        }
 
         guard let model = matchedModel else {
             let ms = elapsedMs(since: startTime)
@@ -393,6 +614,63 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
 
         let ms = elapsedMs(since: startTime)
         let provider = providersByID[model.providerID]
+        let canonicalID = CanonicalModelNormalizer.canonicalID(for: model)
+
+        if context.policy.enableAutoSameModelGrouping, !canonicalID.isEmpty {
+            let groupMatches: [(ModelConfig, ProviderConfig, CandidateEvaluation)] = context.models.compactMap { candidate in
+                guard CanonicalModelNormalizer.canonicalID(for: candidate) == canonicalID,
+                      let candProvider = providersByID[candidate.providerID] else {
+                    return nil
+                }
+                let eval = evaluateHardConstraints(
+                    model: candidate,
+                    provider: candProvider,
+                    features: context.features,
+                    policy: context.policy,
+                    ignorePriceCap: true
+                )
+                guard eval.passedHardConstraints else { return nil }
+                return (candidate, candProvider, eval)
+            }
+            .sorted { lhs, rhs in
+                if lhs.0.id == model.id && rhs.0.id != model.id { return true }
+                if rhs.0.id == model.id && lhs.0.id != model.id { return false }
+                let lLat = lhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                let rLat = rhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                if lLat != rLat { return lLat < rLat }
+                return lhs.1.name < rhs.1.name
+            }
+
+            if let primaryMatch = groupMatches.first {
+                let peerIDs = groupMatches.dropFirst().map(\.0.id)
+                var rules = evaluation.passedHardConstraints
+                    ? ["显式指定模型，直接转发到 \(primaryMatch.1.name) / \(primaryMatch.0.modelID)"]
+                    : ["原通道 \(provider?.name ?? "") 不可用，同模型自动分组切换至健康通道 \(primaryMatch.1.name) / \(primaryMatch.0.modelID)"]
+                if !peerIDs.isEmpty {
+                    rules.append("同模型自动分组「\(canonicalID)」已挂载 \(groupMatches.count) 个健康通道")
+                }
+                return RoutingDecision(
+                    requestedModel: requestedModel,
+                    isAutoRouted: !peerIDs.isEmpty || primaryMatch.0.id != model.id,
+                    selectedModelUUID: primaryMatch.0.id,
+                    selectedModelID: primaryMatch.0.modelID,
+                    selectedDisplayName: primaryMatch.0.displayName,
+                    selectedProviderID: primaryMatch.1.id,
+                    selectedProviderName: primaryMatch.1.name,
+                    orderedFallbackCandidateIDs: peerIDs,
+                    candidateEvaluations: groupMatches.map(\.2),
+                    matchedRules: rules,
+                    strategyName: "显式指定模型",
+                    policyVersion: context.policy.policyVersion,
+                    deciderPluginID: pluginID,
+                    decisionDurationMs: ms,
+                    selectedEffort: context.features.recommendedEffort,
+                    subtaskCategory: context.features.subtaskCategory,
+                    routingReasonNote: "指定模型「\(primaryMatch.0.displayName)」· 通道 \(primaryMatch.1.name)",
+                    canonicalGroupID: canonicalID
+                )
+            }
+        }
 
         if !evaluation.passedHardConstraints {
             return RoutingDecision(
@@ -452,7 +730,7 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         }
 
         let subtask = context.features.subtaskCategory
-        let targetEffort = Self.resolvedEffort(
+        let targetEffort = context.features.clientProvidedEffort ?? Self.resolvedEffort(
             recommended: context.features.recommendedEffort,
             explicitTier: explicitTier,
             strategy: context.policy.activeStrategy
@@ -461,14 +739,20 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         var evaluations: [CandidateEvaluation] = []
         var passingModels: [(ModelConfig, ProviderConfig, Double, [String])] = []
 
+        let stickyProviderID = context.stickyModelID.flatMap { sid in
+            context.models.first(where: { $0.id == sid })?.providerID
+        }
+
         for model in context.models {
             let provider = providersByID[model.providerID]
+            let metrics = context.runtimeMetricsByModelID[model.id]
             var eval = evaluateHardConstraints(
                 model: model,
                 provider: provider,
                 features: context.features,
                 policy: context.policy,
-                ignorePriceCap: explicitTier != nil
+                ignorePriceCap: explicitTier != nil,
+                runtimeMetrics: metrics
             )
 
             if eval.passedHardConstraints, let validProvider = provider {
@@ -477,7 +761,8 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                     features: context.features,
                     strategy: scoringStrategy,
                     targetEffort: targetEffort,
-                    runtimeMetrics: context.runtimeMetricsByModelID[model.id]
+                    runtimeMetrics: metrics,
+                    preferredProviderID: stickyProviderID
                 )
                 eval.score = score
                 eval.scoreBreakdown = breakdown
@@ -524,7 +809,7 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         matchedRules.append("思考程度路由: effort=\(targetEffort.rawValue) (\(targetEffort.displayName))")
         let hasReasoningCandidate = sorted.contains { $0.0.capabilities.contains(.reasoning) || $0.0.defaultRole == .complexReasoning }
         if targetEffort.requiresDeepReasoning && hasReasoningCandidate {
-            matchedRules.append("思考程度筛选 [effort=\(targetEffort.rawValue)]：自动筛选具备深度推理 (reasoning) 能力的模型")
+            matchedRules.append("思考程度筛选 [effort=\(targetEffort.rawValue)]：评分优先考虑具备深度推理 (reasoning) 能力的模型")
         }
         if context.features.requiresTools {
             matchedRules.append("硬约束: 要求支持工具调用 (tools)")
@@ -537,67 +822,208 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         var selectedTuple = sorted[0]
         var reasonNote = "\(subtask.displayName) · 思考程度 \(targetEffort.rawValue)：\(subtask.defaultRationale)"
 
+        let baseTier = Self.targetTierForAuto(
+            task: context.features.detectedTaskType,
+            subtask: subtask,
+            effort: targetEffort,
+            strategy: context.policy.activeStrategy
+        )
+        let canSwitchPhase = context.features.isUserTurnBoundary != false
+        let shouldRescue = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis && context.escalateNextTurn
+        let targetTier: ModelTier = {
+            guard shouldRescue else { return baseTier }
+            switch baseTier {
+            case .low: return .medium
+            case .medium, .high: return .high
+            }
+        }()
+
+        let configuredTierIDSet = Set([ModelTier.low, .medium, .high].flatMap { context.policy.modelIDs(for: $0) })
+        let hasConfiguredPool = !configuredTierIDSet.isEmpty || context.policy.fallbackModelID != nil
+        let enforceStrictTierPool = context.policy.strictThreeTierPoolOnly
+            && (context.policy.preferTierMappingInAuto || explicitTier != nil)
+            && hasConfiguredPool
+        var effectiveTier = explicitTier ?? targetTier
+
+        let stickyTuple = context.stickyModelID.flatMap { sid in sorted.first(where: { $0.0.id == sid }) }
+        let tierOrder = ModelTier.allCases
+        let stickyTiers: [ModelTier] = stickyTuple.map { sticky in
+            let canonicalID = CanonicalModelNormalizer.canonicalID(for: sticky.0)
+            return tierOrder.filter { tier in
+                let ids = context.policy.modelIDs(for: tier)
+                if ids.contains(sticky.0.id) { return true }
+                guard context.policy.enableAutoSameModelGrouping else { return false }
+                return !canonicalID.isEmpty && context.models.contains {
+                    ids.contains($0.id) && CanonicalModelNormalizer.canonicalID(for: $0) == canonicalID
+                }
+            }
+        } ?? []
+        let targetIndex = tierOrder.firstIndex(of: targetTier) ?? 0
+        let stickyTier = stickyTiers.contains(targetTier) ? targetTier : stickyTiers.last
+        let stickyTierIndex = stickyTier.flatMap { tierOrder.firstIndex(of: $0) }
+        let tierPoolIDs = context.policy.modelIDs(for: targetTier)
+        let resolvedTierCandidate = Self.resolveTierCandidate(
+            poolIDs: tierPoolIDs,
+            sorted: sorted,
+            allModels: context.models,
+            enableSameModelGrouping: context.policy.enableAutoSameModelGrouping
+        )
+        let canFollowTaskTier = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
+            && context.policy.activeStrategy == .balanced && context.policy.preferTierMappingInAuto
+            && resolvedTierCandidate != nil
+        let stickyNeedsTierUpgrade = canFollowTaskTier
+            && (stickyTierIndex ?? -1) < targetIndex
+        let stickyNeedsEscalateToReasoning = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
+            && (!context.policy.preferTierMappingInAuto || context.policy.modelIDs(for: targetTier).isEmpty)
+            && context.policy.activeStrategy != .costFirst && targetEffort.requiresDeepReasoning
+            && hasReasoningCandidate && (stickyTuple.map {
+                !$0.0.capabilities.contains(.reasoning) && $0.0.defaultRole != .complexReasoning
+            } ?? false)
+        let stickyNeedsToolRescue = shouldRescue && !stickyTiers.contains(targetTier)
+        let stickyShouldDowngrade = canFollowTaskTier && !context.escalateNextTurn && !targetEffort.requiresDeepReasoning
+            && (stickyTierIndex ?? -1) > targetIndex && context.consecutiveRoutineTurns >= 2
+
         if let explicitTier {
-            if let configuredID = context.policy.modelID(for: explicitTier),
-               let tierTuple = sorted.first(where: { $0.0.id == configuredID }) {
-                selectedTuple = tierTuple
-                matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：请求「\(context.requestedModel)」-> 选用配置的\(explicitTier.shortName)模型「\(tierTuple.0.displayName)」")
+            let tierPoolIDs = context.policy.modelIDs(for: explicitTier)
+            if let tierTuple = Self.resolveTierCandidate(
+                poolIDs: tierPoolIDs,
+                sorted: sorted,
+                allModels: context.models,
+                enableSameModelGrouping: context.policy.enableAutoSameModelGrouping
+            ) {
+                selectedTuple = tierTuple.tuple
+                let isPrimary = tierTuple.tuple.0.id == tierPoolIDs.first
+                if tierTuple.viaSameModelGroup {
+                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：主通道冷却中，同模型自动分组切换至「\(tierTuple.tuple.1.name) / \(tierTuple.tuple.0.displayName)」")
+                } else {
+                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：请求「\(context.requestedModel)」-> 选用配置的\(explicitTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.tuple.0.displayName)」")
+                }
                 reasonNote = "显式指定 \(explicitTier.shortName) 档 · effort=\(targetEffort.rawValue)"
-            } else if let configuredID = context.policy.modelID(for: explicitTier),
-                      let blockedModel = context.models.first(where: { $0.id == configuredID }) {
-                selectedTuple = sorted[0]
-                matchedRules.append("显式请求 [\(explicitTier.shortName)] 的配置模型「\(blockedModel.displayName)」未通过硬约束，已自动回退到「\(selectedTuple.0.displayName)」")
-                reasonNote = "原配置模型受限，自动改用「\(selectedTuple.0.displayName)」"
+            } else if let controlledFallback = selectControlledFallback(
+                for: explicitTier,
+                policy: context.policy,
+                sorted: sorted,
+                enforceStrictTierPool: enforceStrictTierPool
+            ) {
+                selectedTuple = controlledFallback.tuple
+                matchedRules.append("显式档位 [\(explicitTier.shortName)] 主备模型均受限，\(controlledFallback.ruleDescription)「\(selectedTuple.0.displayName)」")
+                reasonNote = "原\(explicitTier.shortName)档受限，按受控回退选用「\(selectedTuple.0.displayName)」"
+            } else if enforceStrictTierPool {
+                let ms = elapsedMs(since: startTime)
+                let msg = "显式档位「\(explicitTier.displayName)」及三档受控回退池内暂无满足当前硬约束的可用模型。"
+                return RoutingDecision(
+                    requestedModel: context.requestedModel,
+                    isAutoRouted: true,
+                    candidateEvaluations: evaluations,
+                    matchedRules: matchedRules + ["严格三档池模式下，\(explicitTier.shortName)档与允许回退池均无可用模型"],
+                    strategyName: strategyLabel,
+                    policyVersion: context.policy.policyVersion,
+                    deciderPluginID: pluginID,
+                    decisionDurationMs: ms,
+                    errorSummary: msg,
+                    selectedEffort: targetEffort,
+                    subtaskCategory: subtask,
+                    routingReasonNote: msg
+                )
             } else {
                 selectedTuple = sorted[0]
                 matchedRules.append("显式档位路由 [\(explicitTier.displayName)] 尚未指定模型，按档位偏好评分选中「\(selectedTuple.0.displayName)」")
                 reasonNote = "按 \(explicitTier.shortName) 档位偏好评分 + effort=\(targetEffort.rawValue)"
             }
-        } else if let pinnedID = context.policy.pinnedModelID {
-            if let pinnedTuple = sorted.first(where: { $0.0.id == pinnedID }) {
-                selectedTuple = pinnedTuple
-                matchedRules.append("命中固定模型规则: 用户已固定「\(pinnedTuple.0.displayName)」")
-                reasonNote = "命中用户固定模型规则「\(pinnedTuple.0.displayName)」· effort=\(targetEffort.rawValue)"
-            } else if let pinnedModel = context.models.first(where: { $0.id == pinnedID }) {
-                matchedRules.append("固定模型「\(pinnedModel.displayName)」未通过硬约束，已自动回退按策略选择")
-            }
+        } else if let pinnedID = context.policy.pinnedModelID,
+                  let pinnedTuple = sorted.first(where: { $0.0.id == pinnedID }) {
+            selectedTuple = pinnedTuple
+            matchedRules.append("命中固定模型规则: 用户已固定「\(pinnedTuple.0.displayName)」")
+            reasonNote = "命中用户固定模型规则「\(pinnedTuple.0.displayName)」· effort=\(targetEffort.rawValue)"
         } else if context.policy.enableSessionStickiness,
                   context.features.isMultiTurn,
-                  let stickyID = context.stickyModelID,
-                  let stickyTuple = sorted.first(where: { $0.0.id == stickyID }),
-                  !(context.policy.activeStrategy != .costFirst
-                    && targetEffort.requiresDeepReasoning
-                    && !stickyTuple.0.capabilities.contains(.reasoning)
-                    && stickyTuple.0.defaultRole != .complexReasoning
-                    && hasReasoningCandidate) {
-            // Preserve prompt cache in multi-turn conversations unless subtask escalates to deep reasoning under non-costFirst
+                  let stickyTuple,
+                  !stickyNeedsTierUpgrade,
+                  !stickyNeedsEscalateToReasoning,
+                  !stickyNeedsToolRescue,
+                  !stickyShouldDowngrade {
             selectedTuple = stickyTuple
+            effectiveTier = stickyTier ?? effectiveTier
             matchedRules.append("命中多轮会话粘性: 保持与同会话上一轮一致的「\(stickyTuple.0.displayName)」以保留缓存收益")
             reasonNote = "保持会话缓存稳定 (粘性) · \(subtask.displayName) · effort=\(targetEffort.rawValue)"
         } else {
             let stickyWasEscalated = context.policy.enableSessionStickiness
-                && context.features.isMultiTurn
-                && context.stickyModelID != nil
-                && context.policy.activeStrategy != .costFirst
-                && targetEffort.requiresDeepReasoning
-                && hasReasoningCandidate
+                && context.features.isMultiTurn && stickyTuple != nil
+                && (stickyNeedsTierUpgrade || stickyNeedsEscalateToReasoning || stickyNeedsToolRescue)
 
-            let targetTier = Self.targetTierForAuto(task: context.features.detectedTaskType, subtask: subtask, effort: targetEffort, strategy: context.policy.activeStrategy)
-            if context.policy.preferTierMappingInAuto,
-               let tierModelID = context.policy.modelID(for: targetTier),
-               let tierTuple = sorted.first(where: { $0.0.id == tierModelID }) {
+            if context.policy.preferTierMappingInAuto, let resolved = resolvedTierCandidate {
+                let tierTuple = resolved.tuple
                 selectedTuple = tierTuple
-                matchedRules.append("三档路由命中 [\(targetTier.displayName)]：任务「\(subtask.displayName)」(effort=\(targetEffort.rawValue)) + 策略「\(context.policy.activeStrategy.displayName)」-> 选用\(targetTier.shortName)模型「\(tierTuple.0.displayName)」")
-                reasonNote = stickyWasEscalated
-                    ? "子任务升级为「\(subtask.displayName)」(effort=\(targetEffort.rawValue))，自动切换高阶推理模型"
-                    : "识别「\(subtask.displayName)」+ effort=\(targetEffort.rawValue)，命中\(targetTier.shortName)模型"
+                let isPrimary = tierTuple.0.id == tierPoolIDs.first
+                if resolved.viaSameModelGroup {
+                    matchedRules.append("三档路由命中 [\(targetTier.displayName)]：主通道不可用，同模型自动分组切换至「\(tierTuple.1.name) / \(tierTuple.0.displayName)」")
+                } else {
+                    matchedRules.append("三档路由命中 [\(targetTier.displayName)]：任务「\(subtask.displayName)」(effort=\(targetEffort.rawValue)) + 策略「\(context.policy.activeStrategy.displayName)」-> 选用\(targetTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.0.displayName)」")
+                }
+                if stickyShouldDowngrade {
+                    reasonNote = "连续常规任务，降档至「\(tierTuple.0.displayName)」"
+                    matchedRules.append("防抖降档：连续 \(context.consecutiveRoutineTurns) 轮常规任务，切换至\(targetTier.shortName)")
+                } else if stickyNeedsToolRescue {
+                    reasonNote = "连续无有效工具调用/空转，自动升档破局至「\(tierTuple.0.displayName)」"
+                    matchedRules.append("语义软升级：检测到前序轮次工具调用空转，自动升至「\(tierTuple.0.displayName)」")
+                } else if stickyWasEscalated {
+                    reasonNote = "子任务升级为「\(subtask.displayName)」(effort=\(targetEffort.rawValue))，切换至\(targetTier.shortName)模型"
+                } else {
+                    reasonNote = "识别「\(subtask.displayName)」+ effort=\(targetEffort.rawValue)，命中\(targetTier.shortName)\(isPrimary ? "" : "备选")模型"
+                }
             } else if context.policy.preferTierMappingInAuto,
                       let tierModelID = context.policy.modelID(for: targetTier),
                       let blockedModel = context.models.first(where: { $0.id == tierModelID }) {
-                selectedTuple = sorted[0]
-                matchedRules.append("目标档位 [\(targetTier.shortName)] 的模型「\(blockedModel.displayName)」未满足本请求硬约束，已自动改用评分最高的可用候选「\(selectedTuple.0.displayName)」(\(String(format: "%.1f", selectedTuple.2)) 分)")
-                reasonNote = "「\(subtask.displayName)」(effort=\(targetEffort.rawValue)) 经能力/思考程度筛选后最优"
+                if let controlledFallback = selectControlledFallback(
+                    for: targetTier,
+                    policy: context.policy,
+                    sorted: sorted,
+                    enforceStrictTierPool: enforceStrictTierPool
+                ) {
+                    selectedTuple = controlledFallback.tuple
+                    matchedRules.append("目标档位 [\(targetTier.shortName)] 的模型「\(blockedModel.displayName)」未满足本请求硬约束，\(controlledFallback.ruleDescription)「\(selectedTuple.0.displayName)」")
+                    reasonNote = "「\(subtask.displayName)」(effort=\(targetEffort.rawValue)) 改用受控回退候选"
+                } else {
+                    let ms = elapsedMs(since: startTime)
+                    let msg = "严格三档池模式下，目标档位「\(targetTier.displayName)」及允许回退池内暂无满足当前硬约束的可用模型。"
+                    return RoutingDecision(
+                        requestedModel: context.requestedModel,
+                        isAutoRouted: true,
+                        candidateEvaluations: evaluations,
+                        matchedRules: matchedRules + ["严格三档池过滤后无可用档位模型"],
+                        strategyName: strategyLabel,
+                        policyVersion: context.policy.policyVersion,
+                        deciderPluginID: pluginID,
+                        decisionDurationMs: ms,
+                        errorSummary: msg,
+                        selectedEffort: targetEffort,
+                        subtaskCategory: subtask,
+                        routingReasonNote: msg
+                    )
+                }
             } else {
+                if enforceStrictTierPool {
+                    if let strictFirst = sorted.first(where: { configuredTierIDSet.contains($0.0.id) || $0.0.id == context.policy.fallbackModelID }) {
+                        selectedTuple = strictFirst
+                    } else {
+                        let ms = elapsedMs(since: startTime)
+                        let msg = "严格三档池模式下，已配置三档及兜底模型均不满足当前硬约束。"
+                        return RoutingDecision(
+                            requestedModel: context.requestedModel,
+                            isAutoRouted: true,
+                            candidateEvaluations: evaluations,
+                            matchedRules: matchedRules + ["严格三档池内无可用模型"],
+                            strategyName: strategyLabel,
+                            policyVersion: context.policy.policyVersion,
+                            deciderPluginID: pluginID,
+                            decisionDurationMs: ms,
+                            errorSummary: msg,
+                            selectedEffort: targetEffort,
+                            subtaskCategory: subtask,
+                            routingReasonNote: msg
+                        )
+                    }
+                }
                 matchedRules.append("综合评分最高: 「\(selectedTuple.0.displayName)」(\(String(format: "%.1f", selectedTuple.2)) 分)")
                 reasonNote = stickyWasEscalated
                     ? "子任务升级为「\(subtask.displayName)」(effort=\(targetEffort.rawValue))，经推理能力筛选切换"
@@ -605,15 +1031,69 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             }
         }
 
-        // Build ordered fallback candidate IDs for optional retry on upstream failure
+        // Build ordered fallback candidate IDs:
+        // 0. Same-canonical-model healthy channels across other providers (when enableAutoSameModelGrouping is on)
+        // 1. Same-tier backup models (prefer same provider for prompt-cache continuity)
+        // 2. Explicit global fallback model
+        // 3. Adjacent configured tiers' primary+backup pools
+        // 4. Remaining healthy candidates (omitted when strictThreeTierPoolOnly is enabled)
         var fallbackIDs: [UUID] = []
+        let activeProviderID = selectedTuple.1.id
+        let selectedCanonicalID = CanonicalModelNormalizer.canonicalID(for: selectedTuple.0)
+        if context.policy.enableAutoSameModelGrouping, !selectedCanonicalID.isEmpty {
+            let sameGroupPeers = sorted
+                .filter {
+                    $0.0.id != selectedTuple.0.id
+                        && CanonicalModelNormalizer.canonicalID(for: $0.0) == selectedCanonicalID
+                }
+                .sorted { lhs, rhs in
+                    let lLat = lhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                    let rLat = rhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                    if lLat != rLat { return lLat < rLat }
+                    return lhs.2 > rhs.2
+                }
+            for peer in sameGroupPeers where !fallbackIDs.contains(peer.0.id) {
+                fallbackIDs.append(peer.0.id)
+            }
+            if !sameGroupPeers.isEmpty {
+                matchedRules.append("同模型自动分组「\(selectedCanonicalID)」已挂载 \(sameGroupPeers.count + 1) 个可用通道")
+            }
+        }
+        if context.policy.preferTierMappingInAuto || explicitTier != nil {
+            let sameTierBackups = context.policy.modelIDs(for: effectiveTier)
+                .filter { $0 != selectedTuple.0.id }
+                .compactMap { tid in sorted.first(where: { $0.0.id == tid }) }
+                .sorted { lhs, rhs in
+                    let lSame = lhs.1.id == activeProviderID
+                    let rSame = rhs.1.id == activeProviderID
+                    if lSame != rSame { return lSame }
+                    return false
+                }
+            for candidate in sameTierBackups where !fallbackIDs.contains(candidate.0.id) {
+                fallbackIDs.append(candidate.0.id)
+            }
+        }
         if let configuredFallbackID = context.policy.fallbackModelID,
            configuredFallbackID != selectedTuple.0.id,
+           !fallbackIDs.contains(configuredFallbackID),
            sorted.contains(where: { $0.0.id == configuredFallbackID }) {
             fallbackIDs.append(configuredFallbackID)
         }
-        for item in sorted where item.0.id != selectedTuple.0.id && !fallbackIDs.contains(item.0.id) {
-            fallbackIDs.append(item.0.id)
+        if context.policy.preferTierMappingInAuto || explicitTier != nil {
+            for tier in Self.orderedAdjacentTiers(for: effectiveTier) {
+                for tid in context.policy.modelIDs(for: tier) where tid != selectedTuple.0.id && !fallbackIDs.contains(tid) {
+                    if sorted.contains(where: { $0.0.id == tid }) {
+                        fallbackIDs.append(tid)
+                    }
+                }
+            }
+        }
+        if !enforceStrictTierPool {
+            for item in sorted where item.0.id != selectedTuple.0.id && !fallbackIDs.contains(item.0.id) {
+                fallbackIDs.append(item.0.id)
+            }
+        } else {
+            matchedRules.append("已开启「严格仅限三档及备选」，回退队列不越界选用其他模型")
         }
 
         let ms = elapsedMs(since: startTime)
@@ -635,8 +1115,71 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             decisionDurationMs: ms,
             selectedEffort: targetEffort,
             subtaskCategory: subtask,
-            routingReasonNote: reasonNote
+            routingReasonNote: reasonNote,
+            canonicalGroupID: context.policy.enableAutoSameModelGrouping && !selectedCanonicalID.isEmpty ? selectedCanonicalID : nil
         )
+    }
+
+    private static func resolveTierCandidate(
+        poolIDs: [UUID],
+        sorted: [(ModelConfig, ProviderConfig, Double, [String])],
+        allModels: [ModelConfig],
+        enableSameModelGrouping: Bool
+    ) -> (tuple: (ModelConfig, ProviderConfig, Double, [String]), viaSameModelGroup: Bool)? {
+        for tid in poolIDs {
+            if let direct = sorted.first(where: { $0.0.id == tid }) {
+                return (direct, false)
+            }
+            if enableSameModelGrouping,
+               let targetModel = allModels.first(where: { $0.id == tid }) {
+                let canonical = CanonicalModelNormalizer.canonicalID(for: targetModel)
+                if !canonical.isEmpty {
+                    let peers = sorted
+                        .filter { CanonicalModelNormalizer.canonicalID(for: $0.0) == canonical }
+                        .sorted { lhs, rhs in
+                            let lLat = lhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                            let rLat = rhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                            if lLat != rLat { return lLat < rLat }
+                            return lhs.2 > rhs.2
+                        }
+                    if let peer = peers.first {
+                        return (peer, true)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func orderedAdjacentTiers(for tier: ModelTier) -> [ModelTier] {
+        switch tier {
+        case .high: return [.medium, .low]
+        case .medium: return [.high, .low]
+        case .low: return [.medium, .high]
+        }
+    }
+
+    private func selectControlledFallback(
+        for tier: ModelTier,
+        policy: RoutingPolicyConfig,
+        sorted: [(ModelConfig, ProviderConfig, Double, [String])],
+        enforceStrictTierPool: Bool
+    ) -> (tuple: (ModelConfig, ProviderConfig, Double, [String]), ruleDescription: String)? {
+        if let fallbackID = policy.fallbackModelID,
+           let fallbackTuple = sorted.first(where: { $0.0.id == fallbackID }) {
+            return (fallbackTuple, "已改用全局兜底模型")
+        }
+        for adjacentTier in Self.orderedAdjacentTiers(for: tier) {
+            if let peerTuple = policy.modelIDs(for: adjacentTier)
+                .compactMap({ pid in sorted.first(where: { $0.0.id == pid }) })
+                .first {
+                return (peerTuple, "已按受控相邻档位 [\(adjacentTier.shortName)] 改用")
+            }
+        }
+        if !enforceStrictTierPool, let firstSorted = sorted.first {
+            return (firstSorted, "已按综合评分自动回退至")
+        }
+        return nil
     }
 
     public static func resolvedEffort(
@@ -673,8 +1216,10 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             case .costFirst:
                 return .low
             case .balanced:
-                if effort.requiresDeepReasoning { return .high }
+                // Let subtask category govern the tier so routine/review/tool-recovery steps
+                // can boost reasoning effort on Medium tier without needlessly escalating to High flagship.
                 if let subtask { return subtask.recommendedTier }
+                if effort.requiresDeepReasoning { return .high }
             case .qualityFirst:
                 if effort == .low { return .medium }
                 return .high
@@ -707,7 +1252,8 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         provider: ProviderConfig?,
         features: RequestFeatures,
         policy: RoutingPolicyConfig,
-        ignorePriceCap: Bool
+        ignorePriceCap: Bool,
+        runtimeMetrics: ModelRuntimeMetrics? = nil
     ) -> CandidateEvaluation {
         var exclusions: [String] = []
 
@@ -742,6 +1288,10 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                 exclusions.append("模型状态为「\(model.availabilityStatus.displayName)」\(note)")
             }
         }
+        if let cooldownUntil = runtimeMetrics?.cooldownUntil, cooldownUntil > Date() {
+            let secs = max(1, Int(ceil(cooldownUntil.timeIntervalSinceNow)))
+            exclusions.append("处于瞬时限流/抖动短暂冷却中（约 \(secs)s 后自动恢复）")
+        }
         if features.requiresTools && !model.capabilities.contains(.tools) {
             exclusions.append("请求包含 tools，但模型未配置工具调用能力")
         }
@@ -749,7 +1299,11 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             exclusions.append("请求包含图像内容，但模型未配置视觉能力")
         }
         if features.estimatedInputTokens > model.contextWindow {
-            exclusions.append("估算输入 \(features.estimatedInputTokens) tokens 超过上下文上限 \(model.contextWindow)")
+            let uncertaintyRatio = features.tokenEstimateConfidence == .low ? 0.15 : 0.08
+            let uncertaintySlack = max(256, Int(Double(model.contextWindow) * uncertaintyRatio))
+            if features.estimatedInputTokens > model.contextWindow + uncertaintySlack {
+                exclusions.append("估算输入 \(features.estimatedInputTokens) tokens 明确超过上下文上限 \(model.contextWindow)（含 \(Int(uncertaintyRatio * 100))% 估算缓冲）")
+            }
         }
 
         if !ignorePriceCap {
@@ -789,7 +1343,8 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         features: RequestFeatures,
         strategy: RoutingStrategyPreset,
         targetEffort: ReasoningEffort = .medium,
-        runtimeMetrics: ModelRuntimeMetrics? = nil
+        runtimeMetrics: ModelRuntimeMetrics? = nil,
+        preferredProviderID: UUID? = nil
     ) -> (Double, [String]) {
         var breakdown: [String] = []
         var quality = Double(model.qualityScore)
@@ -866,6 +1421,11 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             }
         }
 
+        if let preferredProviderID, model.providerID == preferredProviderID {
+            totalScore += 18.0
+            breakdown.append("同供应商缓存亲和 +18.0")
+        }
+
         return (totalScore, breakdown)
     }
 
@@ -906,8 +1466,25 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
 // MARK: - Router Coordinator (with Session Stickiness Cache & Plugin Registry)
 
 public final class ModelRouter: @unchecked Sendable {
+    private struct SessionStickinessKey: Hashable {
+        var fingerprint: String
+        var modeKey: String
+    }
+
+    private struct SessionStickinessState {
+        var modelUUID: UUID
+        var policyVersion: Int
+        var consecutiveRoutineTurns: Int
+        var escalateNextTurn: Bool
+        var wasMultiTurn: Bool
+        var lastAccessedAt: Date
+    }
+
+    private static let stickinessTTLSeconds: TimeInterval = 7200
+    private static let maxStickinessEntries = 500
+
     private let lock = NSLock()
-    private var sessionStickinessMap: [String: (modelUUID: UUID, policyVersion: Int)] = [:]
+    private var sessionStickinessMap: [SessionStickinessKey: SessionStickinessState] = [:]
     private var plugins: [String: any RoutingDeciderPlugin] = [:]
 
     public init(plugins: [any RoutingDeciderPlugin] = [DeterministicLocalDeciderPlugin()]) {
@@ -928,23 +1505,60 @@ public final class ModelRouter: @unchecked Sendable {
         return Array(plugins.values).sorted { $0.pluginID < $1.pluginID }
     }
 
+    private static func stickinessModeKey(requestedModel: String, explicitTier: ModelTier? = nil) -> String {
+        if let tier = explicitTier ?? ModelTier.matchExplicitTier(requestedModel: requestedModel) {
+            return "tier:\(tier.rawValue)"
+        }
+        return "auto"
+    }
+
+    private func pruneStickinessLocked(now: Date) {
+        sessionStickinessMap = sessionStickinessMap.filter {
+            now.timeIntervalSince($0.value.lastAccessedAt) <= Self.stickinessTTLSeconds
+        }
+        if sessionStickinessMap.count > Self.maxStickinessEntries {
+            let overflow = sessionStickinessMap.count - Self.maxStickinessEntries
+            let oldestKeys = sessionStickinessMap
+                .sorted { $0.value.lastAccessedAt < $1.value.lastAccessedAt }
+                .prefix(overflow)
+                .map(\.key)
+            for key in oldestKeys {
+                sessionStickinessMap.removeValue(forKey: key)
+            }
+        }
+    }
+
     public func route(
         requestedModel: String,
         features: RequestFeatures,
         providers: [ProviderConfig],
         models: [ModelConfig],
         policy: RoutingPolicyConfig,
-        runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics] = [:]
+        runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics] = [:],
+        stickinessNamespace: String? = nil
     ) -> RoutingDecision {
-        let stickyID: UUID? = lock.withLock {
+        let baseModeKey = Self.stickinessModeKey(requestedModel: requestedModel)
+        let modeKey = stickinessNamespace.map { "agent:\($0)|\(baseModeKey)" } ?? baseModeKey
+        let now = Date()
+        let sessionSnapshot: (stickyID: UUID?, routineCount: Int, escalate: Bool) = lock.withLock {
+            pruneStickinessLocked(now: now)
             guard policy.enableSessionStickiness,
                   features.isMultiTurn,
-                  let fp = features.conversationFingerprint,
-                  let cached = sessionStickinessMap[fp],
-                  cached.policyVersion == policy.policyVersion else {
-                return nil
+                  let fp = features.conversationFingerprint else {
+                return (nil, 0, false)
             }
-            return cached.modelUUID
+            let key = SessionStickinessKey(fingerprint: fp, modeKey: modeKey)
+            guard var cached = sessionStickinessMap[key],
+                  cached.policyVersion == policy.policyVersion else {
+                return (nil, 0, false)
+            }
+            let isRoutineBoundary = features.isUserTurnBoundary != false
+                && features.subtaskCategory.recommendedTier != .high
+                && !(features.clientProvidedEffort ?? features.recommendedEffort).requiresDeepReasoning
+            let routineCount = isRoutineBoundary ? (cached.consecutiveRoutineTurns + 1) : 0
+            cached.lastAccessedAt = now
+            sessionStickinessMap[key] = cached
+            return (cached.modelUUID, routineCount, cached.escalateNextTurn)
         }
 
         let decider: any RoutingDeciderPlugin = lock.withLock {
@@ -957,7 +1571,9 @@ public final class ModelRouter: @unchecked Sendable {
             providers: providers,
             models: models,
             policy: policy,
-            stickyModelID: stickyID,
+            stickyModelID: sessionSnapshot.stickyID,
+            consecutiveRoutineTurns: sessionSnapshot.routineCount,
+            escalateNextTurn: sessionSnapshot.escalate,
             runtimeMetricsByModelID: runtimeMetricsByModelID
         )
 
@@ -967,11 +1583,45 @@ public final class ModelRouter: @unchecked Sendable {
     public func recordSuccessfulSessionModel(
         fingerprint: String?,
         modelUUID: UUID,
-        policyVersion: Int
+        policyVersion: Int,
+        isRoutineSubtask: Bool = false,
+        wasToolStarved: Bool = false,
+        requestedModel: String = "auto",
+        explicitTier: ModelTier? = nil,
+        isMultiTurn: Bool = true,
+        stickinessNamespace: String? = nil,
+        isUserTurnBoundary: Bool = true
     ) {
         guard let fingerprint, !fingerprint.isEmpty else { return }
+        let baseModeKey = Self.stickinessModeKey(requestedModel: requestedModel, explicitTier: explicitTier)
+        let modeKey = stickinessNamespace.map { "agent:\($0)|\(baseModeKey)" } ?? baseModeKey
+        let key = SessionStickinessKey(fingerprint: fingerprint, modeKey: modeKey)
+        let now = Date()
         lock.withLock {
-            sessionStickinessMap[fingerprint] = (modelUUID: modelUUID, policyVersion: policyVersion)
+            let prev = sessionStickinessMap[key]
+            // Never let a stray single-turn sidecar/background call hijack an active multi-turn sticky session
+            if !isMultiTurn,
+               let prev,
+               prev.policyVersion == policyVersion,
+               prev.wasMultiTurn,
+               prev.modelUUID != modelUUID {
+                return
+            }
+            let sameModel = prev?.modelUUID == modelUUID && prev?.policyVersion == policyVersion
+            var routineCount = sameModel ? (prev?.consecutiveRoutineTurns ?? 0) : 0
+            if isUserTurnBoundary {
+                routineCount = isRoutineSubtask && sameModel ? min(2, routineCount + 1) : 0
+            }
+            let nextWasMultiTurn = isMultiTurn || (sameModel && (prev?.wasMultiTurn ?? false))
+            sessionStickinessMap[key] = SessionStickinessState(
+                modelUUID: modelUUID,
+                policyVersion: policyVersion,
+                consecutiveRoutineTurns: routineCount,
+                escalateNextTurn: wasToolStarved,
+                wasMultiTurn: nextWasMultiTurn,
+                lastAccessedAt: now
+            )
+            pruneStickinessLocked(now: now)
         }
     }
 

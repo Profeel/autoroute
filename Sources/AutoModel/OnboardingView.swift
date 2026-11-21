@@ -6,157 +6,237 @@ struct OnboardingView: View {
     @ObservedObject var engine: AutoModelEngine
     var onNavigate: (SidebarTab) -> Void
     var onOpenTestBench: () -> Void = {}
+    var onOpenReceipt: (UUID) -> Void = { _ in }
 
     @State private var statusBanner: String?
     @State private var isTestingLocalMock = false
+    @State private var isValidating = false
+    @State private var showValidationConfirmation = false
+    @State private var validationResult: OnboardingValidationResult?
+    @State private var selectedAgent: AgentKind?
+    @State private var showProviderEditor = false
+    @State private var selectedProviderID: UUID?
+    @State private var showProbeConfirmation = false
+
+    private var agentStatus: AgentIntegrationStatus? {
+        engine.agentStatuses.first { $0.kind == selectedAgent }
+    }
+
+    private var hasUsableModel: Bool { !engine.healthyAvailableModels().isEmpty }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                heroSection
-                checklistSection
-                quickSetupSection
-                clientIntegrationSection
-            }
-            .padding(24)
+            VStack(alignment: .leading, spacing: 16) {
+                Text("欢迎使用 AutoRoute").font(.title.bold())
+                Text("连接提供商、接入一个 Agent，然后从 Agent 发出第一条请求。默认使用均衡策略，模型档位自动分配。")
+                    .foregroundStyle(.secondary)
+                if let statusBanner {
+                    Text(statusBanner).font(.callout).padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                }
+                if !engine.isLocalAPITokenPersistent { credentialBlockingSection }
+                providerStep
+                if hasUsableModel && engine.proxyReadiness != .running {
+                    ConnectionStatusView(engine: engine, onNavigate: onNavigate, onOpenReceipt: onOpenReceipt)
+                }
+                agentStep
+                firstRequestStep
+                DisclosureGroup("高级选项：发现、档位、模拟和手动接入") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("本机发现会读取受支持的 Agent 配置，并测活已启用的上游，可能产生费用；新发现的提供商默认关闭，需手动启用。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Button("发现本机配置") {
+                                Task {
+                                    _ = await engine.discoverAndProbeLocalModels()
+                                    selectedProviderID = engine.config.providers.first(where: \.isEnabled)?.id
+                                    statusBanner = "发现完成。新发现的供应商默认关闭，请到管理页启用后检测。"
+                                }
+                            }.disabled(engine.isDiscoveringAndProbing)
+                            Button("修改策略与档位") { onNavigate(.modelsAndPolicy) }
+                            Button("使用本地模拟上游") { activateLocalMockPreset() }.disabled(isTestingLocalMock)
+                            Button("打开测试台") { onOpenTestBench() }
+                        }
+                        Text("模拟请求只用于演示，不会验证 Agent 的真实接入。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        validationSection
+                        clientIntegrationSection
+                        Button("跳过引导") {
+                            engine.skipOnboarding()
+                            onNavigate(.history)
+                        }
+                    }.padding(.top, 8)
+                }
+            }.padding(24)
         }
         .navigationTitle("首次使用引导")
-    }
-
-    private var heroSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: "arrow.triangle.branch")
-                    .font(.largeTitle)
-                    .foregroundStyle(Color.accentColor)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("欢迎使用 Auto Model")
-                        .font(.title.bold())
-                    Text("本机多模型路由 API 代理 · 仅监听 127.0.0.1 · 开源版无需账号，密钥仅存 macOS Keychain")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
+        .onAppear {
+            engine.recordOnboardingStarted()
+            engine.refreshAgentStatuses()
+            selectedAgent = selectedAgent ?? engine.agentStatuses.first(where: \.isInstalled)?.kind
+            selectedProviderID = selectedProviderID ?? engine.config.providers.first(where: \.isEnabled)?.id
+        }
+        .sheet(isPresented: $showProviderEditor) {
+            ProviderEditorSheet(existingProvider: nil, existingKeyStatus: .missing) { provider, keys, preset, seed in
+                do {
+                    statusBanner = try applyProviderEditorSave(engine: engine, provider: provider, apiKeys: keys, selectedPreset: preset, seedRecommendedModels: seed)
+                    selectedProviderID = provider.id
+                } catch { statusBanner = "保存失败：\(error.localizedDescription)" }
             }
-            if let statusBanner {
-                Text(statusBanner)
-                    .font(.callout)
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.accentColor.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .confirmationDialog("检测会向供应商发送请求，可能产生费用。继续？", isPresented: $showProbeConfirmation, titleVisibility: .visible) {
+            Button("检测供应商") {
+                if let id = selectedProviderID { Task { await engine.probeProviderModels(providerID: id) } }
             }
+            Button("取消", role: .cancel) {}
+        }
+        .confirmationDialog("将通过本地 HTTP 代理调用实际上游，可能产生供应商费用。继续？", isPresented: $showValidationConfirmation, titleVisibility: .visible) {
+            Button("发送真实验收请求") { Task { await validate() } }
+            Button("取消", role: .cancel) {}
         }
     }
 
-    private var checklistSection: some View {
-        let hasProvider = !engine.config.providers.isEmpty
-        let hasTwoModels = engine.config.models.filter(\.isEnabled).count >= 2
-        let hasSuccessfulTest = engine.callHistory.contains { $0.source == .testBench && $0.status == .success }
-        let hasExternalCall = engine.callHistory.contains { $0.source == .externalProxy }
-
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
-                StepRow(
-                    number: 1,
-                    title: "添加一个 OpenAI 兼容供应商或中转站",
-                    subtitle: "填写名称、Base URL 与 API Key（保存在 macOS Keychain）",
-                    done: hasProvider,
-                    actionTitle: "前往配置"
-                ) {
-                    onNavigate(.modelsAndPolicy)
-                }
-
-                StepRow(
-                    number: 2,
-                    title: "添加至少两个可用模型",
-                    subtitle: "配置模型 ID、输入/输出单价（可选，未填时显示无法计算费用）、能力标签与默认用途",
-                    done: hasTwoModels,
-                    actionTitle: "管理模型"
-                ) {
-                    onNavigate(.modelsAndPolicy)
-                }
-
-                StepRow(
-                    number: 3,
-                    title: "在「快速测试台」发送真实请求验证链路",
-                    subtitle: "确认供应商连通、流式响应与路由收据解释正常",
-                    done: hasSuccessfulTest,
-                    actionTitle: "打开测试台"
-                ) {
-                    onOpenTestBench()
-                }
-
-                StepRow(
-                    number: 4,
-                    title: "在外部 AI 应用接入 127.0.0.1 并使用 model=auto",
-                    subtitle: "将其他客户端的 Base URL 设为 \(engine.config.proxySettings.baseURLString)，模型填 auto",
-                    done: hasExternalCall,
-                    actionTitle: "查看调用记录"
-                ) {
-                    onNavigate(.history)
-                }
-            }
-            .padding(6)
-        } label: {
-            Label("4 步上手进度", systemImage: "checklist")
-                .font(.headline)
-        }
-    }
-
-    private var quickSetupSection: some View {
+    private var providerStep: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("快速开始选项")
-                    .font(.subheadline.weight(.semibold))
-
-                HStack(spacing: 12) {
-                    Button {
-                        Task {
-                            let summary = await engine.discoverAndProbeLocalModels()
-                            statusBanner = "已自动发掘并实测完成：新增 \(summary.discoveredProvidersCount) 个供应商、\(summary.discoveredModelsCount) 个模型；其中 \(summary.healthyModelsCount) 个实测可用，\(summary.evictedModelsCount) 个不可用模型已自动剔除。"
-                        }
-                    } label: {
-                        if engine.isDiscoveringAndProbing {
-                            HStack(spacing: 6) {
-                                ProgressView().controlSize(.small)
-                                Text("正在发掘与测活...")
-                            }
-                        } else {
-                            Label("一键发掘本机已配置模型并测活剔除", systemImage: "radar")
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(engine.isDiscoveringAndProbing)
-
-                    Button {
-                        onNavigate(.modelsAndPolicy)
-                    } label: {
-                        Label("手动添加中转站", systemImage: "plus.circle")
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button {
-                        activateLocalMockPreset()
-                    } label: {
-                        Label("启用本地模拟测试上游", systemImage: "cpu")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isTestingLocalMock)
+            VStack(alignment: .leading, spacing: 8) {
+                Label("1. 连接一个提供商", systemImage: hasUsableModel ? "checkmark.circle.fill" : "1.circle")
+                    .font(.headline)
+                switch engine.providerReadiness {
+                case .ready: Text("已检测到可用模型。")
+                case .needsTesting: Text("已配置模型，尚未完成测活；可继续接入 Agent，或主动检测。")
+                case .missing: Text("添加提供商并选择推荐模型，或主动检测以发现模型。")
                 }
+                HStack {
+                    if engine.config.providers.isEmpty {
+                        Button("添加提供商") { showProviderEditor = true }.buttonStyle(.borderedProminent)
+                    } else {
+                        if let id = selectedProviderID, engine.config.providers.contains(where: { $0.id == id && $0.isEnabled }) {
+                            if hasUsableModel {
+                                Button("检测提供商") { showProbeConfirmation = true }
+                                    .buttonStyle(.bordered).disabled(engine.isDiscoveringAndProbing)
+                            } else {
+                                Button(engine.isDiscoveringAndProbing ? "正在检测…" : "检测提供商") { showProbeConfirmation = true }
+                                    .buttonStyle(.borderedProminent).disabled(engine.isDiscoveringAndProbing)
+                            }
+                        }
+                        Button("添加其他提供商") { showProviderEditor = true }.buttonStyle(.bordered)
+                        if engine.config.providers.contains(where: \.isEnabled) {
+                            Button("管理提供商") { onNavigate(.modelsAndPolicy) }.buttonStyle(.bordered)
+                        } else {
+                            Button("管理并启用提供商") { onNavigate(.modelsAndPolicy) }.buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+            }.padding(6)
+        }
+    }
 
-                if let summary = engine.lastDiscoverySummary {
-                    Text("最近自动巡检：共实测 \(summary.probedModelsCount) 个模型 · 可用 \(summary.healthyModelsCount) 个 · 自动剔除不可用 \(summary.evictedModelsCount) 个（扫描来源：\(summary.sourcesScanned.joined(separator: "、"))）")
-                        .font(.caption)
+    private var agentStep: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("2. 预览并接入一个 Agent", systemImage: "2.circle").font(.headline)
+                if !hasUsableModel {
+                    Text("连接提供商后可预览 Agent 配置。")
+                        .foregroundStyle(.secondary)
+                } else if engine.agentStatuses.contains(where: \.isInstalled) {
+                    Picker("Agent", selection: $selectedAgent) {
+                        ForEach(engine.agentStatuses.filter(\.isInstalled)) { status in
+                            Text(status.kind.displayName).tag(AgentKind?.some(status.kind))
+                        }
+                    }.frame(maxWidth: 300)
+                    if let status = agentStatus {
+                        AgentConnectionCard(engine: engine, status: status, onOpenReceipt: onOpenReceipt)
+                    }
+                } else {
+                    Text("未检测到 Agent；可在高级选项中手动接入或跳过。")
                         .foregroundStyle(.secondary)
                 }
+            }.padding(6)
+        }
+    }
 
-                Text("注：「本地模拟测试上游」仅在 127.0.0.1:18765 提供确定性模拟响应，用于在没有外部 API Key 时验证路由规则、流式输出和错误回退；真实生产调用请添加您的模型厂商或中转站。")
+    private var firstRequestStep: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("3. 从 Agent 发出第一条请求", systemImage: "3.circle").font(.headline)
+                if let selectedAgent {
+                    switch engine.agentReadiness(for: selectedAgent) {
+                    case .notConfigured:
+                        Text("先预览并写入 \(selectedAgent.displayName) 的配置。")
+                    case .waiting:
+                        Text("重启 \(selectedAgent.displayName)，发送一条普通请求。成功后此处会显示验证结果；上游可能收费。")
+                    case .verified:
+                        Text("已收到该 Agent 的真实成功请求。")
+                        Button("完成引导") {
+                            engine.setOnboardingCompleted(true)
+                            onNavigate(.history)
+                        }.buttonStyle(.borderedProminent)
+                    }
+                }
+            }.padding(6)
+        }
+    }
+
+    private var credentialBlockingSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("本地凭据未持久化，暂时无法启动代理或接入 Agent", systemImage: "exclamationmark.lock.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.red)
+                Text(engine.localAPITokenPersistenceError ?? "无法确认本地 token 已保存到 Keychain。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("检查并重试保存凭据") {
+                    do {
+                        try engine.retryPersistingLocalAPIToken()
+                        if !engine.proxyState.isRunning {
+                            engine.startProxy()
+                        }
+                        statusBanner = engine.proxyState.isRunning
+                            ? "本地 API token 已持久化，本地代理已启动，可以继续验收和接入 Agent。"
+                            : "本地 API token 已持久化，可以继续验收和接入 Agent。"
+                    } catch {
+                        statusBanner = "仍无法持久化本地凭据：\(error.localizedDescription)"
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(6)
+        }
+    }
+
+    private var validationSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("验收通过真实 URLSession → 127.0.0.1 socket → 本地认证与路由器 → 上游执行，不直接调用内部路由方法来代替端到端验证。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button {
+                        showValidationConfirmation = true
+                    } label: {
+                        if isValidating { ProgressView().controlSize(.small) } else { Label("发送真实 HTTP 验收", systemImage: "network") }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isValidating)
+                    Button("明确跳过引导") {
+                        engine.skipOnboarding()
+                        statusBanner = "已跳过引导，现有配置未删除。之后可从设置重新打开并完成真实验收。"
+                    }
+                    .buttonStyle(.bordered)
+                }
+                if let validationResult {
+                    Label(validationResult.isDemo ? "演示链路成功（不计入真实成功或节省）" : "真实外部代理请求成功", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    RoutingReceiptView(record: validationResult.record)
+                        .frame(minHeight: 360)
+                }
             }
             .padding(6)
         } label: {
-            Label("快速接入", systemImage: "bolt.fill")
+            Label("独立 HTTP 验收与路由收据", systemImage: "doc.text.magnifyingglass")
                 .font(.headline)
         }
     }
@@ -164,61 +244,46 @@ struct OnboardingView: View {
     private var clientIntegrationSection: some View {
         let baseURL = engine.config.proxySettings.baseURLString
         let curlCmd = """
+        export AUTOROUTE_API_TOKEN='在设置中复制的本机 token'
         curl -N \(baseURL)/chat/completions \\
+          -H "Authorization: Bearer $AUTOROUTE_API_TOKEN" \\
           -H "Content-Type: application/json" \\
           -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"用三句话解释 Raft 共识算法"}]}'
         """
-
-        let pythonSnippet = """
-        from openai import OpenAI
-
-        client = OpenAI(base_url="\(baseURL)", api_key="local-auto-model")
-        resp = client.chat.completions.create(
-            model="auto",
-            messages=[{"role": "user", "content": "写一个 Swift 防抖函数"}],
-        )
-        print("实际执行模型:", resp.model)
-        print(resp.choices[0].message.content)
-        """
-
         return GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("本地代理地址:")
-                        .font(.callout.weight(.medium))
-                    Text(baseURL)
-                        .font(.callout.monospaced())
-                        .textSelection(.enabled)
-                    Button("复制") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(baseURL, forType: .string)
-                        statusBanner = "已复制本地代理地址 \(baseURL)"
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
+                    Text(baseURL).font(.callout.monospaced()).textSelection(.enabled)
+                    Button("复制 Base URL") { copy(baseURL, message: "已复制 Base URL") }
+                    Button("复制 token") { copy(engine.localAPIToken, message: "已复制本地 API token，请勿提交到 Git 或公开日志。") }
                     Spacer()
-                    Text(engine.proxyState.statusText)
-                        .font(.caption)
-                        .foregroundStyle(engine.proxyState.isRunning ? .green : .orange)
+                    Text(engine.proxyState.statusText).font(.caption).foregroundStyle(engine.proxyState.isRunning ? .green : .orange)
                 }
-
-                Text("第一版明确支持 OpenAI Chat Completions (`POST /v1/chat/completions`) 的普通与流式响应，以及 `GET /v1/models`。暂未实现 Responses API (`/v1/responses`) 或 Anthropic Messages (`/v1/messages`)。")
+                Text("支持 OpenAI Chat Completions、OpenAI Responses 与 Anthropic Messages 的普通和 SSE 请求。除最小健康检查外均需 token；默认不授予浏览器 CORS。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-
-                CodeBlockCard(title: "curl 流式测试示例", code: curlCmd) {
-                    statusBanner = "已复制 curl 测试命令"
-                }
-
-                CodeBlockCard(title: "Python OpenAI SDK 示例", code: pythonSnippet) {
-                    statusBanner = "已复制 Python SDK 示例"
+                CodeBlockCard(title: "手动客户端等价路径（curl）", code: curlCmd) {
+                    statusBanner = "已复制 curl 命令；请先设置 AUTOROUTE_API_TOKEN 环境变量。"
                 }
             }
             .padding(6)
         } label: {
-            Label("在其他 AI 应用中使用 model=auto", systemImage: "terminal")
+            Label("手动客户端配置", systemImage: "terminal")
                 .font(.headline)
+        }
+    }
+
+    private func validate() async {
+        isValidating = true
+        defer { isValidating = false }
+        do {
+            let result = try await engine.validateOnboardingEndToEnd()
+            validationResult = result
+            statusBanner = result.isDemo
+                ? "演示链路已通过真实本地 HTTP socket 验证；它不会被计为真实路由成功。接入真实供应商后可再次验收。"
+                : "真实外部代理验收成功，已生成可核对的模型、路由原因、TTFT、用量、费用和回退收据。"
+        } catch {
+            statusBanner = error.localizedDescription
         }
     }
 
@@ -227,41 +292,16 @@ struct OnboardingView: View {
         defer { isTestingLocalMock = false }
         do {
             try engine.installLocalTestPreset()
-            statusBanner = "已启动本地模拟测试上游并添加了 3 个模拟模型，现在可以去「测试台」或使用外部客户端请求 model=auto。"
+            statusBanner = "本地模拟上游已启动并配置 3 个演示模型。可继续验证 socket 与收据，但不会标记真实完成。"
         } catch {
-            statusBanner = "启用模拟上游失败: \(error.localizedDescription)"
+            statusBanner = "启用模拟上游失败：\(error.localizedDescription)。请检查本地端口或改用手动供应商。"
         }
     }
-}
 
-private struct StepRow: View {
-    let number: Int
-    let title: String
-    let subtitle: String
-    let done: Bool
-    let actionTitle: String
-    let action: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: done ? "checkmark.circle.fill" : "\(number).circle")
-                .font(.title2)
-                .foregroundStyle(done ? .green : .secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.callout.weight(.semibold))
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button(actionTitle, action: action)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-        }
-        .padding(8)
-        .background(Color(.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+    private func copy(_ value: String, message: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        statusBanner = message
     }
 }
 

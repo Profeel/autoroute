@@ -1,0 +1,12 @@
+cask "autoroute" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/Profeel/autoroute/releases/download/v#{version}/AutoRoute-#{version}.zip"
+  name "AutoRoute"
+  desc "Local-first multi-model router for macOS coding agents"
+  homepage "https://github.com/Profeel/autoroute"
+
+  depends_on macos: ">= :sonoma"
+  app "AutoRoute.app"
+end
