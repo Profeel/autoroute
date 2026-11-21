@@ -413,7 +413,17 @@ public final class LoopbackHTTPServer: @unchecked Sendable {
         var handledCount = 0
 
         while handledCount < maxRequestsPerConnection {
-            let readResult = readHTTPRequest(fd: fd, carryOver: &carryOver)
+            // recv can wait for the next keep-alive request. Leave Swift's
+            // cooperative executor available to run the handlers of other clients.
+            let buffered = carryOver
+            let (readResult, remaining) = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    var bytes = buffered
+                    let result = readHTTPRequest(fd: fd, carryOver: &bytes)
+                    continuation.resume(returning: (result, bytes))
+                }
+            }
+            carryOver = remaining
             switch readResult {
             case .eof:
                 onBeforeClose(fd)
