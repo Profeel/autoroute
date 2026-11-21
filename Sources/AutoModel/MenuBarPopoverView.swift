@@ -20,358 +20,104 @@ struct MenuBarPopoverView: View {
     let onOpenMainWindow: (SidebarTab?, UUID?) -> Void
     let onQuit: () -> Void
 
-    @State private var copiedAddress = false
-
-    private var recentRecords: [CallRecord] {
-        Array(engine.callHistory.prefix(4))
-    }
-
-    private var todayCallsCount: Int {
-        let cal = Calendar.current
-        return engine.callHistory.filter { cal.isDateInToday($0.timestamp) }.count
-    }
-
-    private var todayCostUSD: Double {
-        let cal = Calendar.current
-        return engine.callHistory
-            .filter { cal.isDateInToday($0.timestamp) }
-            .compactMap(\.totalCostUSD)
-            .reduce(0, +)
-    }
+    @State private var currentDayKey = DailyUsageLedger.dayKey(for: Date())
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if !engine.isLocalAPITokenPersistent {
-                localCredentialWarningSection
-            }
-            headerSection
-            impactBannerSection
+        VStack(alignment: .leading, spacing: 10) {
+            ConnectionStatusView(engine: engine, onNavigate: { onOpenMainWindow($0, nil) }, onOpenReceipt: { onOpenMainWindow(.history, $0) })
+            ActivitySummaryView(engine: engine, onOpenReceipt: { onOpenMainWindow(.history, $0) })
+            liveRoutingRow
+            DisclosureGroup("策略与档位") { strategyAndTiersSection }
+
             Divider()
-            strategySection
-            tierStripSection
-            Divider()
-            recentCallsSection
-            Divider()
+
+            // 5. Footer: Open Main Window / Quit
             footerSection
         }
         .padding(14)
-        .frame(width: 360)
-    }
-
-    private var localCredentialWarningSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("本地凭据未持久化", systemImage: "exclamationmark.lock.fill")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.red)
-            Text("代理启动与 Agent 接入已禁止；请在设置中修复 Keychain 后重试。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 320)
+        .onAppear {
+            currentDayKey = DailyUsageLedger.dayKey(for: Date())
         }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.red.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var headerSection: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(engine.proxyState.isRunning ? Color.green : Color.orange)
-                .frame(width: 9, height: 9)
-
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("AutoRoute")
-                        .font(.headline)
-                    Text(engine.proxyState.isRunning ? "运行中" : "已停止")
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1.5)
-                        .background((engine.proxyState.isRunning ? Color.green : Color.orange).opacity(0.15))
-                        .foregroundStyle(engine.proxyState.isRunning ? Color.green : Color.orange)
-                        .clipShape(Capsule())
-                }
-                Text("\(engine.config.proxySettings.baseURLString) · 今日 \(todayCallsCount) 次 · \(AutoModelFormatter.formatUSD(todayCostUSD))")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer()
-
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(engine.config.proxySettings.baseURLString, forType: .string)
-                copiedAddress = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                    copiedAddress = false
-                }
-            } label: {
-                Image(systemName: copiedAddress ? "checkmark" : "doc.on.doc")
-                    .font(.caption)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("复制本地代理 Base URL")
-
-            Button(engine.proxyState.isRunning ? "停止" : "启动") {
-                if engine.proxyState.isRunning {
-                    engine.stopProxy()
-                } else {
-                    engine.startProxy()
-                }
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(!engine.proxyState.isRunning && !engine.isLocalAPITokenPersistent)
+        .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in
+            currentDayKey = DailyUsageLedger.dayKey(for: Date())
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
+            currentDayKey = DailyUsageLedger.dayKey(for: Date())
         }
     }
 
-    @ViewBuilder
-    private var impactBannerSection: some View {
-        if let impact = engine.routingImpactSummary(todayOnly: false) {
-            let costSavedPositive = impact.costSavedUSD >= 0
-            let costPctText: String = {
-                if let pct = impact.costSavingsPercent {
-                    return String(format: "%@%.1f%%", pct >= 0 ? "-" : "+", abs(pct))
-                }
-                return "—"
-            }()
-            let speedPctText: String = {
-                if let pct = impact.speedGainPercent {
-                    return String(format: "%@%.1f%%", pct >= 0 ? "+" : "-", abs(pct))
-                }
-                return "—"
-            }()
-            let speedSubText: String = {
-                if let savedMs = impact.speedSavedMsPerTurn {
-                    let sec = abs(savedMs) / 1000.0
-                    return savedMs >= 0
-                        ? String(format: "均快 %.1fs/轮", sec)
-                        : String(format: "均慢 %.1fs/轮", sec)
-                }
-                return impact.speedBasisLabel
-            }()
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 4) {
-                            Text(costSavedPositive ? "较传统方案省费" : "较基准多花")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(costPctText)
-                                .font(.caption.weight(.bold).monospacedDigit())
-                                .foregroundStyle(costSavedPositive ? Color.green : Color.orange)
-                        }
-                        Text("\(costSavedPositive ? "已省" : "多花") \(AutoModelFormatter.formatUSD(abs(impact.costSavedUSD)))")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background((costSavedPositive ? Color.green : Color.orange).opacity(0.09))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 4) {
-                            Text("响应速度提升")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(speedPctText)
-                                .font(.caption.weight(.bold).monospacedDigit())
-                                .foregroundStyle(Color.blue)
-                        }
-                        Text(speedSubText)
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.blue.opacity(0.09))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
-                }
-
-                HStack(spacing: 6) {
-                    Text("基准: \(impact.baselineModelDisplayName)")
-                    Text("·")
-                    Text("成功率 \(impact.successRatePercent)%")
-                    if let top10 = impact.top10PercentCostSharePercent {
-                        Text("·")
-                        Text(String(format: "Top10%%难题占%.0f%%花费", top10))
-                    }
-                }
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            }
-        }
-    }
-
-    private var strategySection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("路由策略")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(engine.config.policy.activeStrategy.subtitle)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Picker("路由策略", selection: Binding(
-                get: { engine.config.policy.activeStrategy },
-                set: { engine.setStrategy($0) }
-            )) {
-                ForEach(RoutingStrategyPreset.allCases, id: \.self) { preset in
-                    Text(preset.displayName).tag(preset)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-        }
-    }
-
-    private var tierStripSection: some View {
-        let healthyIDs = Set(engine.healthyAvailableModels().map(\.id))
-        return HStack(spacing: 8) {
-            ForEach(ModelTier.allCases) { tier in
-                let assigned = engine.model(for: tier)
-                let color: Color = (tier == .low ? .green : (tier == .medium ? .blue : .purple))
-                let isHealthy = assigned.map { healthyIDs.contains($0.id) } ?? false
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 4) {
-                        Text(tier.shortName)
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(color)
-                        Spacer()
-                        Circle()
-                            .fill(assigned == nil ? Color.gray.opacity(0.4) : (isHealthy ? Color.green : Color.orange))
-                            .frame(width: 6, height: 6)
-                    }
-                    Text(assigned?.displayName ?? "未分配")
-                        .font(.caption2.weight(.medium))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(.controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 7))
-            }
-        }
-    }
-
-    private var recentCallsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("最近路由动态")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if !engine.callHistory.isEmpty {
-                    Button("查看全部") {
-                        onOpenMainWindow(.history, nil)
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption2)
-                }
-            }
-
-            if recentRecords.isEmpty {
-                HStack(spacing: 8) {
-                    Image(systemName: "waveform.path.ecg")
-                        .foregroundStyle(.secondary)
-                    Text("暂无调用记录，接入客户端或使用测试台即可在此实时查看。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 10)
-            } else {
-                VStack(spacing: 4) {
-                    ForEach(recentRecords) { record in
-                        Button {
-                            onOpenMainWindow(.history, record.id)
-                        } label: {
-                            recentRecordRow(record)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-    }
-
-    private func recentRecordRow(_ record: CallRecord) -> some View {
-        let level = record.routingComplexityLevel
-        let badgeColor: Color = {
-            switch level {
-            case .low: return .green
-            case .medium: return .blue
-            case .high: return .purple
-            case .direct: return .gray
-            }
-        }()
-
-        return HStack(spacing: 8) {
-            Circle()
-                .fill(record.status == .success ? Color.green : Color.red)
-                .frame(width: 6, height: 6)
-
-            Text(level.shortBadge)
-                .font(.caption2.weight(.bold))
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
-                .background(badgeColor.opacity(0.14))
-                .foregroundStyle(badgeColor)
-                .clipShape(Capsule())
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(record.executedModelShortLabel)
+    private var liveRoutingRow: some View {
+        let state = engine.liveRoutingState
+        return HStack(spacing: 6) {
+            if state.inFlightCount > 0 {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 6, height: 6)
+                Text("\(state.activeAgentName ?? "客户端") → \(state.targetModelDisplayName ?? "路由中…")")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.primary)
                     .lineLimit(1)
-                Text(record.requestFeatures.detectedTaskType.displayName)
-                    .font(.caption2)
+            } else if let summary = state.lastCompletedSummary {
+                Circle()
+                    .fill(Color.blue.opacity(0.75))
+                    .frame(width: 6, height: 6)
+                Text(summary)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            } else {
+                Circle()
+                    .fill(Color.secondary.opacity(0.4))
+                    .frame(width: 6, height: 6)
+                Text(engine.proxyState.isRunning ? "等待 Agent 请求…" : "代理已停止")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-
             Spacer()
-
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(AutoModelFormatter.formatMs(record.totalCompletionMs))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Text(record.costStatus == .calculated ? AutoModelFormatter.formatUSD(record.totalCostUSD) : "—")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .background(Color(.controlBackgroundColor).opacity(0.65))
-        .clipShape(RoundedRectangle(cornerRadius: 7))
-        .contentShape(Rectangle())
+        .background(Color(.controlBackgroundColor).opacity(0.7), in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    private var strategyAndTiersSection: some View {
+        let modelsByID = Dictionary(uniqueKeysWithValues: engine.config.models.map { ($0.id, $0) })
+        return VStack(alignment: .leading, spacing: 8) {
+            Picker("策略", selection: Binding(
+                get: { engine.config.policy.activeStrategy },
+                set: { engine.setStrategy($0) }
+            )) {
+                Text("省钱").tag(RoutingStrategyPreset.costFirst)
+                Text("均衡").tag(RoutingStrategyPreset.balanced)
+                Text("质量").tag(RoutingStrategyPreset.qualityFirst)
+            }
+            .pickerStyle(.segmented)
+
+            HStack(spacing: 6) {
+                ForEach(ModelTier.allCases) { tier in
+                    let assignment = engine.config.policy.tierAssignment(for: tier)
+                    let modelName = assignment.primaryModelID.flatMap { modelsByID[$0]?.displayName } ?? "自动"
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tier.shortName)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(modelName)
+                            .font(.caption2.weight(.medium))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 5)
+                    .background(Color(.controlBackgroundColor).opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+        }
     }
 
     private var footerSection: some View {
         HStack {
-            Button {
+            Button("打开主窗口") {
                 onOpenMainWindow(nil, nil)
-            } label: {
-                Label("打开主窗口", systemImage: "macwindow")
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)

@@ -180,14 +180,18 @@ public enum RequestFeatureExtractor {
         let latestMessageRole = ((messages.last?["role"] as? String) ?? "").lowercased()
         let recentToolNames = extractRecentAssistantToolNames(from: messages)
         let trailingToolOutputs = extractTrailingToolOutputs(from: messages)
-        let latestSubtaskSource = userTextParts.last ?? nonSystemTextParts.last ?? combinedText
+        let latestSubtaskSource = userTextParts.last ?? nonSystemTextParts.last ?? ""
+        // Anthropic can place tool results and user text in the same message. Its adapter
+        // emits the tool result immediately before the normalized user message.
+        let isUserTurnBoundary = latestMessageRole == "user"
+            && (messages.dropLast().last?["role"] as? String) != "tool"
         let (subtaskCategory, recommendedEffort) = classifySubtaskAndEffort(
             text: latestSubtaskSource,
             latestMessageRole: latestMessageRole,
             recentToolNames: recentToolNames,
             trailingToolOutputs: trailingToolOutputs,
             estimatedTokens: estimatedInputTokens,
-            intentTokens: intentTokens,
+            intentTokens: estimateTextTokens(latestSubtaskSource),
             requiresTools: requiresTools,
             requiresVision: requiresVision
         )
@@ -244,7 +248,8 @@ public enum RequestFeatureExtractor {
             subtaskCategory: subtaskCategory,
             recommendedEffort: recommendedEffort,
             subtaskSummary: subtaskSummary,
-            clientProvidedEffort: clientProvidedEffort
+            clientProvidedEffort: clientProvidedEffort,
+            isUserTurnBoundary: isUserTurnBoundary
         )
     }
 
@@ -422,85 +427,74 @@ public enum RequestFeatureExtractor {
             return (.toolOrchestration, .medium)
         }
 
-        // 2. Deep debugging (High tier + Max effort)
         let debugSignals = [
-            "stack trace", "traceback", "crash", "deadlock", "root cause", "segfault", "panic",
-            "崩溃", "死锁", "根因", "为什么失败", "无法编译"
+            "stack trace", "traceback", "deadlock", "root cause", "segfault", "intermittent failure",
+            "崩溃", "死锁", "根因", "偶发故障", "为什么失败", "无法编译"
         ]
         if debugSignals.contains(where: { lower.contains($0) }) {
-            return (.deepDebugging, .max)
+            return (.deepDebugging, .high)
         }
 
-        // 3. Browser / ego-lite interactive task on user turn -> Medium tier (never auto-promoted to High)
-        let browserTaskSignals = [
+        let planningSignals = [
+            "architecture", "system design", "migration", "major refactor", "cross-service", "performance optimiz",
+            "deep research", "quantitative analysis", "tradeoff", "架构", "系统设计", "迁移", "大规模重构",
+            "跨模块", "性能优化", "深度分析", "深度研究", "定量分析", "方案对比", "重构方案"
+        ]
+        if planningSignals.contains(where: { lower.contains($0) }) || estimatedTokens >= 120_000 {
+            return (.architecturePlanning, .high)
+        }
+        if requiresVision || intentTokens >= 1_500 {
+            return (.generalEngineering, .medium)
+        }
+
+        let browserSignals = [
             "ego-lite", "ego_lite", "ego-browser", "浏览器", "打开网页", "访问网页", "抓取网页", "x.com"
         ]
-        let heavyArchitectureSignals = [
-            "architecture", "system design", "migration plan", "refactor plan", "tradeoff",
-            "架构", "系统设计", "迁移计划", "方案对比", "利弊", "重构方案", "深度分析"
-        ]
-        if browserTaskSignals.contains(where: { lower.contains($0) })
-            && !heavyArchitectureSignals.contains(where: { lower.contains($0) }) {
+        if browserSignals.contains(where: { lower.contains($0) }) {
             return (.toolOrchestration, .medium)
         }
 
-        // 4. Heavy architecture & planning (High tier + High effort)
-        let planningSignals = heavyArchitectureSignals + ["step by step", "设计方案", "规划"]
-        if planningSignals.contains(where: { lower.contains($0) }) {
-            return (.architecturePlanning, .high)
-        }
-
-        // 5. Review / verification / audit -> stay on Medium tier with High effort (no unnecessary flagship tier)
         let reviewSignals = [
-            "code review", "review", "audit", "verify", "git diff", "final check",
-            "审核", "审查", "复核", "验收", "门禁", "最终检查", "校对", "检查"
+            "code review", "review the", "audit", "verify", "git diff", "final check",
+            "审核", "审查", "复核", "验收", "门禁", "最终检查", "校对"
         ]
         if reviewSignals.contains(where: { lower.contains($0) }) {
             return (requiresTools ? .toolOrchestration : .routineCoding, .high)
         }
 
-        // 6. Summarization / compaction / translation (Low tier + Low effort)
-        let summarySignals = [
-            "summarize", "summary", "compact", "tl;dr", "translate", "title", "condense",
-            "摘要", "总结", "压缩", "提炼", "翻译", "生成标题"
+        var instruction = lower.trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["please ", "请", "帮我"] where instruction.hasPrefix(prefix) {
+            instruction = String(instruction.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+        }
+        let transformPrefixes = [
+            "summarize ", "summarise ", "compact ", "tl;dr", "translate ", "condense ", "classify ", "tag ", "extract ",
+            "摘要", "总结", "压缩", "提炼", "翻译", "生成标题", "分类", "打标签", "提取", "从以下"
         ]
-        if summarySignals.contains(where: { lower.contains($0) }) && intentTokens < 600 {
+        if intentTokens < 600, transformPrefixes.contains(where: { instruction.hasPrefix($0) }),
+           !instruction.hasPrefix("从以下") || instruction.contains("提取") {
             return (.summarizationCompaction, .low)
         }
 
-        // 7. Exploration / search (Low tier + Low effort)
-        let exploreSignals = [
-            "grep", "glob", "read_file", "find_by_name", "list_dir", "search", "locate", "what is",
-            "where is", "查找", "检索", "定位", "列出", "读取", "搜索", "看看"
+        let lookupPrefixes = [
+            "grep ", "glob ", "read_file ", "find_by_name ", "list_dir ", "search for ", "locate ", "where is ",
+            "查找", "检索", "列出", "读取", "搜索"
         ]
-        if exploreSignals.contains(where: { lower.contains($0) }) && intentTokens < 300 {
+        if intentTokens < 300, lookupPrefixes.contains(where: { instruction.hasPrefix($0) }) {
             return (.explorationSearch, .low)
         }
 
-        if estimatedTokens >= 120_000 {
-            return (.architecturePlanning, .high)
-        }
-
-        if requiresTools {
-            if intentTokens < 100 {
-                return (.toolOrchestration, .low)
-            }
-            return (.toolOrchestration, .medium)
-        }
-
-        let codingSignals = [
-            "```", "func ", "def ", "class ", "import ", "struct ", "select ", "swift", "python",
-            "typescript", "javascript", "rust", "refactor", "implement", "write test", "unit test",
-            "单元测试", "重构", "代码", "实现", "函数", "接口", "sql"
+        let scopedSignals = [
+            "fix the typo", "fix this typo", "bug fix", "implement", "write test", "write a test", "unit test",
+            "write a ", "draft ", "spec-driven", "refactor this ", "重构这段", "单元测试", "拼写错误", "修复这个",
+            "实现", "撰写", "写一", "文档", "表格", "幻灯片"
         ]
-        if codingSignals.contains(where: { lower.contains($0) }) || requiresVision {
+        if scopedSignals.contains(where: { lower.contains($0) }) {
             return (.routineCoding, .medium)
         }
-
-        if intentTokens < 100 {
+        if ["hello", "hi", "hey", "thanks", "你好", "谢谢"].contains(instruction) {
             return (.explorationSearch, .low)
         }
-        return (.routineCoding, .medium)
+        return (.generalEngineering, .medium)
     }
 
     private static func extractSubtaskSummary(
@@ -590,6 +584,12 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                 break
             }
         }
+        if matchedModel == nil, requestedModel.hasPrefix("codex/") {
+            let stripped = String(requestedModel.dropFirst("codex/".count))
+            matchedModel = context.models.first(where: { m in
+                m.modelID == stripped && providersByID[m.providerID]?.apiProtocol == .codexChatGPT
+            })
+        }
 
         guard let model = matchedModel else {
             let ms = elapsedMs(since: startTime)
@@ -614,6 +614,63 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
 
         let ms = elapsedMs(since: startTime)
         let provider = providersByID[model.providerID]
+        let canonicalID = CanonicalModelNormalizer.canonicalID(for: model)
+
+        if context.policy.enableAutoSameModelGrouping, !canonicalID.isEmpty {
+            let groupMatches: [(ModelConfig, ProviderConfig, CandidateEvaluation)] = context.models.compactMap { candidate in
+                guard CanonicalModelNormalizer.canonicalID(for: candidate) == canonicalID,
+                      let candProvider = providersByID[candidate.providerID] else {
+                    return nil
+                }
+                let eval = evaluateHardConstraints(
+                    model: candidate,
+                    provider: candProvider,
+                    features: context.features,
+                    policy: context.policy,
+                    ignorePriceCap: true
+                )
+                guard eval.passedHardConstraints else { return nil }
+                return (candidate, candProvider, eval)
+            }
+            .sorted { lhs, rhs in
+                if lhs.0.id == model.id && rhs.0.id != model.id { return true }
+                if rhs.0.id == model.id && lhs.0.id != model.id { return false }
+                let lLat = lhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                let rLat = rhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                if lLat != rLat { return lLat < rLat }
+                return lhs.1.name < rhs.1.name
+            }
+
+            if let primaryMatch = groupMatches.first {
+                let peerIDs = groupMatches.dropFirst().map(\.0.id)
+                var rules = evaluation.passedHardConstraints
+                    ? ["显式指定模型，直接转发到 \(primaryMatch.1.name) / \(primaryMatch.0.modelID)"]
+                    : ["原通道 \(provider?.name ?? "") 不可用，同模型自动分组切换至健康通道 \(primaryMatch.1.name) / \(primaryMatch.0.modelID)"]
+                if !peerIDs.isEmpty {
+                    rules.append("同模型自动分组「\(canonicalID)」已挂载 \(groupMatches.count) 个健康通道")
+                }
+                return RoutingDecision(
+                    requestedModel: requestedModel,
+                    isAutoRouted: !peerIDs.isEmpty || primaryMatch.0.id != model.id,
+                    selectedModelUUID: primaryMatch.0.id,
+                    selectedModelID: primaryMatch.0.modelID,
+                    selectedDisplayName: primaryMatch.0.displayName,
+                    selectedProviderID: primaryMatch.1.id,
+                    selectedProviderName: primaryMatch.1.name,
+                    orderedFallbackCandidateIDs: peerIDs,
+                    candidateEvaluations: groupMatches.map(\.2),
+                    matchedRules: rules,
+                    strategyName: "显式指定模型",
+                    policyVersion: context.policy.policyVersion,
+                    deciderPluginID: pluginID,
+                    decisionDurationMs: ms,
+                    selectedEffort: context.features.recommendedEffort,
+                    subtaskCategory: context.features.subtaskCategory,
+                    routingReasonNote: "指定模型「\(primaryMatch.0.displayName)」· 通道 \(primaryMatch.1.name)",
+                    canonicalGroupID: canonicalID
+                )
+            }
+        }
 
         if !evaluation.passedHardConstraints {
             return RoutingDecision(
@@ -752,7 +809,7 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         matchedRules.append("思考程度路由: effort=\(targetEffort.rawValue) (\(targetEffort.displayName))")
         let hasReasoningCandidate = sorted.contains { $0.0.capabilities.contains(.reasoning) || $0.0.defaultRole == .complexReasoning }
         if targetEffort.requiresDeepReasoning && hasReasoningCandidate {
-            matchedRules.append("思考程度筛选 [effort=\(targetEffort.rawValue)]：自动筛选具备深度推理 (reasoning) 能力的模型")
+            matchedRules.append("思考程度筛选 [effort=\(targetEffort.rawValue)]：评分优先考虑具备深度推理 (reasoning) 能力的模型")
         }
         if context.features.requiresTools {
             matchedRules.append("硬约束: 要求支持工具调用 (tools)")
@@ -771,8 +828,10 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             effort: targetEffort,
             strategy: context.policy.activeStrategy
         )
+        let canSwitchPhase = context.features.isUserTurnBoundary != false
+        let shouldRescue = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis && context.escalateNextTurn
         let targetTier: ModelTier = {
-            guard context.escalateNextTurn else { return baseTier }
+            guard shouldRescue else { return baseTier }
             switch baseTier {
             case .low: return .medium
             case .medium, .high: return .high
@@ -784,40 +843,61 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         let enforceStrictTierPool = context.policy.strictThreeTierPoolOnly
             && (context.policy.preferTierMappingInAuto || explicitTier != nil)
             && hasConfiguredPool
-        let effectiveTier = explicitTier ?? targetTier
+        var effectiveTier = explicitTier ?? targetTier
 
         let stickyTuple = context.stickyModelID.flatMap { sid in sorted.first(where: { $0.0.id == sid }) }
-        let allowDynamicPhaseSwitching = context.policy.enablePhaseDowngradeHysteresis
-        let stickyIsHighTier = context.stickyModelID.map { sid in
-            sid == context.policy.highTierModelID
-                || context.policy.highTierBackupModelIDs.contains(sid)
-                || (context.models.first(where: { $0.id == sid })?.defaultRole == .complexReasoning)
-        } ?? false
-        let stickyNeedsEscalateToReasoning = allowDynamicPhaseSwitching && (stickyTuple.map { st in
-            context.policy.activeStrategy != .costFirst
-                && targetEffort.requiresDeepReasoning
-                && !st.0.capabilities.contains(.reasoning)
-                && st.0.defaultRole != .complexReasoning
-                && hasReasoningCandidate
-        } ?? false)
-        let stickyNeedsToolRescue = allowDynamicPhaseSwitching
-            && context.escalateNextTurn
-            && (stickyTuple?.0.id != context.policy.highTierModelID)
-        let stickyShouldDowngrade = allowDynamicPhaseSwitching
-            && context.policy.activeStrategy == .balanced
-            && !context.escalateNextTurn
-            && !targetEffort.requiresDeepReasoning
-            && targetTier != .high
-            && stickyIsHighTier
-            && context.consecutiveRoutineTurns >= 2
-            && !context.policy.modelIDs(for: targetTier).isEmpty
+        let tierOrder = ModelTier.allCases
+        let stickyTiers: [ModelTier] = stickyTuple.map { sticky in
+            let canonicalID = CanonicalModelNormalizer.canonicalID(for: sticky.0)
+            return tierOrder.filter { tier in
+                let ids = context.policy.modelIDs(for: tier)
+                if ids.contains(sticky.0.id) { return true }
+                guard context.policy.enableAutoSameModelGrouping else { return false }
+                return !canonicalID.isEmpty && context.models.contains {
+                    ids.contains($0.id) && CanonicalModelNormalizer.canonicalID(for: $0) == canonicalID
+                }
+            }
+        } ?? []
+        let targetIndex = tierOrder.firstIndex(of: targetTier) ?? 0
+        let stickyTier = stickyTiers.contains(targetTier) ? targetTier : stickyTiers.last
+        let stickyTierIndex = stickyTier.flatMap { tierOrder.firstIndex(of: $0) }
+        let tierPoolIDs = context.policy.modelIDs(for: targetTier)
+        let resolvedTierCandidate = Self.resolveTierCandidate(
+            poolIDs: tierPoolIDs,
+            sorted: sorted,
+            allModels: context.models,
+            enableSameModelGrouping: context.policy.enableAutoSameModelGrouping
+        )
+        let canFollowTaskTier = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
+            && context.policy.activeStrategy == .balanced && context.policy.preferTierMappingInAuto
+            && resolvedTierCandidate != nil
+        let stickyNeedsTierUpgrade = canFollowTaskTier
+            && (stickyTierIndex ?? -1) < targetIndex
+        let stickyNeedsEscalateToReasoning = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
+            && (!context.policy.preferTierMappingInAuto || context.policy.modelIDs(for: targetTier).isEmpty)
+            && context.policy.activeStrategy != .costFirst && targetEffort.requiresDeepReasoning
+            && hasReasoningCandidate && (stickyTuple.map {
+                !$0.0.capabilities.contains(.reasoning) && $0.0.defaultRole != .complexReasoning
+            } ?? false)
+        let stickyNeedsToolRescue = shouldRescue && !stickyTiers.contains(targetTier)
+        let stickyShouldDowngrade = canFollowTaskTier && !context.escalateNextTurn && !targetEffort.requiresDeepReasoning
+            && (stickyTierIndex ?? -1) > targetIndex && context.consecutiveRoutineTurns >= 2
 
         if let explicitTier {
             let tierPoolIDs = context.policy.modelIDs(for: explicitTier)
-            if let tierTuple = tierPoolIDs.compactMap({ tid in sorted.first(where: { $0.0.id == tid }) }).first {
-                selectedTuple = tierTuple
-                let isPrimary = tierTuple.0.id == tierPoolIDs.first
-                matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：请求「\(context.requestedModel)」-> 选用配置的\(explicitTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.0.displayName)」")
+            if let tierTuple = Self.resolveTierCandidate(
+                poolIDs: tierPoolIDs,
+                sorted: sorted,
+                allModels: context.models,
+                enableSameModelGrouping: context.policy.enableAutoSameModelGrouping
+            ) {
+                selectedTuple = tierTuple.tuple
+                let isPrimary = tierTuple.tuple.0.id == tierPoolIDs.first
+                if tierTuple.viaSameModelGroup {
+                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：主通道冷却中，同模型自动分组切换至「\(tierTuple.tuple.1.name) / \(tierTuple.tuple.0.displayName)」")
+                } else {
+                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：请求「\(context.requestedModel)」-> 选用配置的\(explicitTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.tuple.0.displayName)」")
+                }
                 reasonNote = "显式指定 \(explicitTier.shortName) 档 · effort=\(targetEffort.rawValue)"
             } else if let controlledFallback = selectControlledFallback(
                 for: explicitTier,
@@ -850,53 +930,44 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                 matchedRules.append("显式档位路由 [\(explicitTier.displayName)] 尚未指定模型，按档位偏好评分选中「\(selectedTuple.0.displayName)」")
                 reasonNote = "按 \(explicitTier.shortName) 档位偏好评分 + effort=\(targetEffort.rawValue)"
             }
-        } else if let pinnedID = context.policy.pinnedModelID {
-            if let pinnedTuple = sorted.first(where: { $0.0.id == pinnedID }) {
-                selectedTuple = pinnedTuple
-                matchedRules.append("命中固定模型规则: 用户已固定「\(pinnedTuple.0.displayName)」")
-                reasonNote = "命中用户固定模型规则「\(pinnedTuple.0.displayName)」· effort=\(targetEffort.rawValue)"
-            } else if let pinnedModel = context.models.first(where: { $0.id == pinnedID }) {
-                matchedRules.append("固定模型「\(pinnedModel.displayName)」未通过硬约束，已自动回退按策略选择")
-            }
+        } else if let pinnedID = context.policy.pinnedModelID,
+                  let pinnedTuple = sorted.first(where: { $0.0.id == pinnedID }) {
+            selectedTuple = pinnedTuple
+            matchedRules.append("命中固定模型规则: 用户已固定「\(pinnedTuple.0.displayName)」")
+            reasonNote = "命中用户固定模型规则「\(pinnedTuple.0.displayName)」· effort=\(targetEffort.rawValue)"
         } else if context.policy.enableSessionStickiness,
                   context.features.isMultiTurn,
                   let stickyTuple,
+                  !stickyNeedsTierUpgrade,
                   !stickyNeedsEscalateToReasoning,
                   !stickyNeedsToolRescue,
                   !stickyShouldDowngrade {
             selectedTuple = stickyTuple
+            effectiveTier = stickyTier ?? effectiveTier
             matchedRules.append("命中多轮会话粘性: 保持与同会话上一轮一致的「\(stickyTuple.0.displayName)」以保留缓存收益")
             reasonNote = "保持会话缓存稳定 (粘性) · \(subtask.displayName) · effort=\(targetEffort.rawValue)"
         } else {
-            let stickyWasEscalated = allowDynamicPhaseSwitching
-                && context.policy.enableSessionStickiness
-                && context.features.isMultiTurn
-                && context.stickyModelID != nil
-                && (stickyNeedsEscalateToReasoning || stickyNeedsToolRescue)
+            let stickyWasEscalated = context.policy.enableSessionStickiness
+                && context.features.isMultiTurn && stickyTuple != nil
+                && (stickyNeedsTierUpgrade || stickyNeedsEscalateToReasoning || stickyNeedsToolRescue)
 
-            let tierPoolIDs = context.policy.modelIDs(for: targetTier)
-            // Within the chosen tier's configured models, keep primary first, or prefer same-provider when failing over/downgrading
-            let tierCandidates = tierPoolIDs.compactMap { tid in sorted.first(where: { $0.0.id == tid }) }
-            let pickedTierTuple: (ModelConfig, ProviderConfig, Double, [String])? = {
-                if stickyShouldDowngrade, let prefProv = stickyProviderID,
-                   let sameProv = tierCandidates.first(where: { $0.1.id == prefProv }) {
-                    return sameProv
-                }
-                return tierCandidates.first
-            }()
-
-            if context.policy.preferTierMappingInAuto, let tierTuple = pickedTierTuple {
+            if context.policy.preferTierMappingInAuto, let resolved = resolvedTierCandidate {
+                let tierTuple = resolved.tuple
                 selectedTuple = tierTuple
                 let isPrimary = tierTuple.0.id == tierPoolIDs.first
-                matchedRules.append("三档路由命中 [\(targetTier.displayName)]：任务「\(subtask.displayName)」(effort=\(targetEffort.rawValue)) + 策略「\(context.policy.activeStrategy.displayName)」-> 选用\(targetTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.0.displayName)」")
+                if resolved.viaSameModelGroup {
+                    matchedRules.append("三档路由命中 [\(targetTier.displayName)]：主通道不可用，同模型自动分组切换至「\(tierTuple.1.name) / \(tierTuple.0.displayName)」")
+                } else {
+                    matchedRules.append("三档路由命中 [\(targetTier.displayName)]：任务「\(subtask.displayName)」(effort=\(targetEffort.rawValue)) + 策略「\(context.policy.activeStrategy.displayName)」-> 选用\(targetTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.0.displayName)」")
+                }
                 if stickyShouldDowngrade {
-                    reasonNote = "连续常规执行防抖回归，从高档平滑下沉至「\(tierTuple.0.displayName)」"
-                    matchedRules.append("三段式防抖降档：连续 \(context.consecutiveRoutineTurns) 轮常规任务，从高档安全下沉至\(targetTier.shortName)")
+                    reasonNote = "连续常规任务，降档至「\(tierTuple.0.displayName)」"
+                    matchedRules.append("防抖降档：连续 \(context.consecutiveRoutineTurns) 轮常规任务，切换至\(targetTier.shortName)")
                 } else if stickyNeedsToolRescue {
                     reasonNote = "连续无有效工具调用/空转，自动升档破局至「\(tierTuple.0.displayName)」"
                     matchedRules.append("语义软升级：检测到前序轮次工具调用空转，自动升至「\(tierTuple.0.displayName)」")
                 } else if stickyWasEscalated {
-                    reasonNote = "子任务升级为「\(subtask.displayName)」(effort=\(targetEffort.rawValue))，自动切换高阶推理模型"
+                    reasonNote = "子任务升级为「\(subtask.displayName)」(effort=\(targetEffort.rawValue))，切换至\(targetTier.shortName)模型"
                 } else {
                     reasonNote = "识别「\(subtask.displayName)」+ effort=\(targetEffort.rawValue)，命中\(targetTier.shortName)\(isPrimary ? "" : "备选")模型"
                 }
@@ -961,12 +1032,33 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         }
 
         // Build ordered fallback candidate IDs:
+        // 0. Same-canonical-model healthy channels across other providers (when enableAutoSameModelGrouping is on)
         // 1. Same-tier backup models (prefer same provider for prompt-cache continuity)
         // 2. Explicit global fallback model
         // 3. Adjacent configured tiers' primary+backup pools
         // 4. Remaining healthy candidates (omitted when strictThreeTierPoolOnly is enabled)
         var fallbackIDs: [UUID] = []
         let activeProviderID = selectedTuple.1.id
+        let selectedCanonicalID = CanonicalModelNormalizer.canonicalID(for: selectedTuple.0)
+        if context.policy.enableAutoSameModelGrouping, !selectedCanonicalID.isEmpty {
+            let sameGroupPeers = sorted
+                .filter {
+                    $0.0.id != selectedTuple.0.id
+                        && CanonicalModelNormalizer.canonicalID(for: $0.0) == selectedCanonicalID
+                }
+                .sorted { lhs, rhs in
+                    let lLat = lhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                    let rLat = rhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                    if lLat != rLat { return lLat < rLat }
+                    return lhs.2 > rhs.2
+                }
+            for peer in sameGroupPeers where !fallbackIDs.contains(peer.0.id) {
+                fallbackIDs.append(peer.0.id)
+            }
+            if !sameGroupPeers.isEmpty {
+                matchedRules.append("同模型自动分组「\(selectedCanonicalID)」已挂载 \(sameGroupPeers.count + 1) 个可用通道")
+            }
+        }
         if context.policy.preferTierMappingInAuto || explicitTier != nil {
             let sameTierBackups = context.policy.modelIDs(for: effectiveTier)
                 .filter { $0 != selectedTuple.0.id }
@@ -1023,8 +1115,40 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             decisionDurationMs: ms,
             selectedEffort: targetEffort,
             subtaskCategory: subtask,
-            routingReasonNote: reasonNote
+            routingReasonNote: reasonNote,
+            canonicalGroupID: context.policy.enableAutoSameModelGrouping && !selectedCanonicalID.isEmpty ? selectedCanonicalID : nil
         )
+    }
+
+    private static func resolveTierCandidate(
+        poolIDs: [UUID],
+        sorted: [(ModelConfig, ProviderConfig, Double, [String])],
+        allModels: [ModelConfig],
+        enableSameModelGrouping: Bool
+    ) -> (tuple: (ModelConfig, ProviderConfig, Double, [String]), viaSameModelGroup: Bool)? {
+        for tid in poolIDs {
+            if let direct = sorted.first(where: { $0.0.id == tid }) {
+                return (direct, false)
+            }
+            if enableSameModelGrouping,
+               let targetModel = allModels.first(where: { $0.id == tid }) {
+                let canonical = CanonicalModelNormalizer.canonicalID(for: targetModel)
+                if !canonical.isEmpty {
+                    let peers = sorted
+                        .filter { CanonicalModelNormalizer.canonicalID(for: $0.0) == canonical }
+                        .sorted { lhs, rhs in
+                            let lLat = lhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                            let rLat = rhs.0.lastProbeLatencyMs ?? .greatestFiniteMagnitude
+                            if lLat != rLat { return lLat < rLat }
+                            return lhs.2 > rhs.2
+                        }
+                    if let peer = peers.first {
+                        return (peer, true)
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     private static func orderedAdjacentTiers(for tier: ModelTier) -> [ModelTier] {
@@ -1428,12 +1552,13 @@ public final class ModelRouter: @unchecked Sendable {
                   cached.policyVersion == policy.policyVersion else {
                 return (nil, 0, false)
             }
-            let isRoutineSubtask = features.subtaskCategory.recommendedTier != .high
-            let nextRoutine = isRoutineSubtask ? (cached.consecutiveRoutineTurns + 1) : 0
-            cached.consecutiveRoutineTurns = nextRoutine
+            let isRoutineBoundary = features.isUserTurnBoundary != false
+                && features.subtaskCategory.recommendedTier != .high
+                && !(features.clientProvidedEffort ?? features.recommendedEffort).requiresDeepReasoning
+            let routineCount = isRoutineBoundary ? (cached.consecutiveRoutineTurns + 1) : 0
             cached.lastAccessedAt = now
             sessionStickinessMap[key] = cached
-            return (cached.modelUUID, nextRoutine, cached.escalateNextTurn)
+            return (cached.modelUUID, routineCount, cached.escalateNextTurn)
         }
 
         let decider: any RoutingDeciderPlugin = lock.withLock {
@@ -1464,7 +1589,8 @@ public final class ModelRouter: @unchecked Sendable {
         requestedModel: String = "auto",
         explicitTier: ModelTier? = nil,
         isMultiTurn: Bool = true,
-        stickinessNamespace: String? = nil
+        stickinessNamespace: String? = nil,
+        isUserTurnBoundary: Bool = true
     ) {
         guard let fingerprint, !fingerprint.isEmpty else { return }
         let baseModeKey = Self.stickinessModeKey(requestedModel: requestedModel, explicitTier: explicitTier)
@@ -1482,12 +1608,15 @@ public final class ModelRouter: @unchecked Sendable {
                 return
             }
             let sameModel = prev?.modelUUID == modelUUID && prev?.policyVersion == policyVersion
-            let preservedRoutineCount = sameModel && isRoutineSubtask ? (prev?.consecutiveRoutineTurns ?? 0) : 0
+            var routineCount = sameModel ? (prev?.consecutiveRoutineTurns ?? 0) : 0
+            if isUserTurnBoundary {
+                routineCount = isRoutineSubtask && sameModel ? min(2, routineCount + 1) : 0
+            }
             let nextWasMultiTurn = isMultiTurn || (sameModel && (prev?.wasMultiTurn ?? false))
             sessionStickinessMap[key] = SessionStickinessState(
                 modelUUID: modelUUID,
                 policyVersion: policyVersion,
-                consecutiveRoutineTurns: preservedRoutineCount,
+                consecutiveRoutineTurns: routineCount,
                 escalateNextTurn: wasToolStarved,
                 wasMultiTurn: nextWasMultiTurn,
                 lastAccessedAt: now

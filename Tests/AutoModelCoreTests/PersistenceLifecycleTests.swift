@@ -99,6 +99,46 @@ final class PersistenceLifecycleTests: XCTestCase {
     }
 
     @MainActor
+    func testConfigWriteCannotHideFailedHistorySnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AutoRouteErrorTracking-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LocalPersistenceStore(baseDirectoryURL: directory)
+        let engine = AutoModelEngine(persistence: store, keychain: InMemoryKeychainService(), autoStartProxyIfConfigured: false)
+        try await store.flush()
+        try FileManager.default.createDirectory(at: store.historyFileURL, withIntermediateDirectories: true)
+        await engine.persistCallHistory()
+        do { try await store.flush(); XCTFail("snapshot should fail") } catch {}
+        engine.saveConfig()
+        do { try await store.flush(); XCTFail("config success must not clear a failed history snapshot") } catch {}
+        try FileManager.default.removeItem(at: store.historyFileURL)
+        await engine.persistCallHistory()
+        try await store.flush()
+    }
+
+    @MainActor
+    func testFailedShutdownKeepsRunningServersAvailable() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AutoRouteShutdownRecovery-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LocalPersistenceStore(baseDirectoryURL: directory)
+        let engine = AutoModelEngine(persistence: store, keychain: InMemoryKeychainService(), autoStartProxyIfConfigured: false)
+        engine.updateProxyPort(0)
+        engine.startProxy()
+        XCTAssertTrue(engine.proxyState.isRunning)
+        _ = try engine.startLocalTestUpstream(port: 0)
+        try await store.flush()
+        try FileManager.default.createDirectory(at: store.historyFileURL, withIntermediateDirectories: true)
+        await engine.persistCallHistory()
+        do { try await engine.shutdown(); XCTFail("shutdown should fail") } catch {}
+        XCTAssertTrue(engine.proxyState.isRunning, "proxy must remain usable when shutdown is cancelled")
+        XCTAssertTrue(engine.isLocalTestUpstreamRunning, "test server must remain usable when shutdown is cancelled")
+        try FileManager.default.removeItem(at: store.historyFileURL)
+        await engine.persistCallHistory()
+        try await engine.shutdown()
+        XCTAssertFalse(engine.proxyState.isRunning)
+        XCTAssertFalse(engine.isLocalTestUpstreamRunning)
+    }
+
+    @MainActor
     func testHistoryWriteFailureIsVisible() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AutoRoutePersistence-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }

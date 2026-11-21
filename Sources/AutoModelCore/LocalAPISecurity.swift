@@ -22,6 +22,17 @@ public enum LocalAPITokenManager {
         return Data(bytes).base64EncodedString()
     }
 
+    /// Generates a URL/YAML/shell-safe model-only API key (`ar-...`) meeting `LocalModelAPIKeyError.validate`.
+    public static func generateModelAPIKey() throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 24)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            throw KeychainError.unexpectedStatus(status)
+        }
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        return "ar-\(hex)"
+    }
+
     /// Compares every byte and does not return early on the first mismatch.
     public static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
         let left = Array(lhs.utf8)
@@ -34,6 +45,28 @@ public enum LocalAPITokenManager {
             difference |= Int(a ^ b)
         }
         return difference == 0
+    }
+}
+
+public enum LocalModelAPIKeyError: LocalizedError, Sendable {
+    case invalidFormat
+    case matchesManagementToken
+    case managementTokenUnavailable
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidFormat: return "密钥须为 4–128 个字符，只能包含英文字母、数字及 - . _ ~。"
+        case .matchesManagementToken: return "模型密钥不能与本地管理 token 相同。"
+        case .managementTokenUnavailable: return "请先恢复本地管理 token，再设置模型密钥。"
+        }
+    }
+
+    public static func validate(_ key: String, managementToken: String) throws {
+        let bytes = key.utf8
+        guard (4...128).contains(bytes.count), bytes.allSatisfy({ byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte) || [45, 46, 95, 126].contains(byte)
+        }) else { throw invalidFormat }
+        guard !LocalAPITokenManager.constantTimeEquals(key, managementToken) else { throw matchesManagementToken }
     }
 }
 
@@ -54,7 +87,8 @@ public enum LocalAPIRequestSecurity {
     public static func rejection(
         for request: HTTPRequestMessage,
         port: Int,
-        token: String
+        token: String,
+        modelAPIKey: String? = nil
     ) -> LocalAPIRejection? {
         guard isAllowedHost(request.header("Host"), port: port) else {
             return LocalAPIRejection(
@@ -82,7 +116,17 @@ public enum LocalAPIRequestSecurity {
             return String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
         }()
         let supplied = bearer ?? request.header("x-api-key")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let supplied, LocalAPITokenManager.constantTimeEquals(supplied, token) else {
+        let allowsModelKey: Bool
+        switch (request.method, request.path) {
+        case ("GET", "/v1/models"), ("POST", "/v1/chat/completions"),
+             ("POST", "/v1/responses"), ("POST", "/v1/messages"):
+            allowsModelKey = true
+        default:
+            allowsModelKey = false
+        }
+        guard let supplied,
+              LocalAPITokenManager.constantTimeEquals(supplied, token) ||
+                (allowsModelKey && modelAPIKey.map { LocalAPITokenManager.constantTimeEquals(supplied, $0) } == true) else {
             return LocalAPIRejection(
                 statusCode: 401,
                 code: "unauthorized",

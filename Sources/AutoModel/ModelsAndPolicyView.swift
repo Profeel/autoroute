@@ -12,6 +12,7 @@ struct ModelsAndPolicyView: View {
 
     @State private var showCandidatePool = true
     @State private var showDisabledModels = false
+    @State private var showAllProviders = false
     @State private var showAdvancedPolicy = false
 
     @State private var maxInInput: String = ""
@@ -22,11 +23,18 @@ struct ModelsAndPolicyView: View {
         engine.healthyAvailableModels()
     }
 
+    private var visibleProviders: [ProviderConfig] {
+        showAllProviders
+            ? engine.config.providers
+            : engine.config.providers.filter { engine.isProviderAvailable($0) }
+    }
+
     private var selectedProvider: ProviderConfig? {
-        if let id = selectedProviderID, let found = engine.config.providers.first(where: { $0.id == id }) {
+        let pool = visibleProviders
+        if let id = selectedProviderID, let found = pool.first(where: { $0.id == id }) {
             return found
         }
-        return engine.config.providers.first
+        return pool.first
     }
 
     var body: some View {
@@ -62,11 +70,16 @@ struct ModelsAndPolicyView: View {
             syncPriceCapInputs()
         }
         .sheet(isPresented: $showAddProvider) {
-            ProviderEditorSheet(existingProvider: nil, existingHasKey: false) { newProvider, apiKey in
+            ProviderEditorSheet(existingProvider: nil, existingKeyStatus: .missing) { newProvider, apiKeys, selectedPreset, seedRecommendedModels in
                 do {
-                    try engine.upsertProvider(newProvider, apiKey: apiKey)
+                    feedbackMessage = try applyProviderEditorSave(
+                        engine: engine,
+                        provider: newProvider,
+                        apiKeys: apiKeys,
+                        selectedPreset: selectedPreset,
+                        seedRecommendedModels: seedRecommendedModels
+                    )
                     selectedProviderID = newProvider.id
-                    feedbackMessage = "已添加供应商「\(newProvider.name)」。"
                 } catch {
                     feedbackMessage = "保存供应商失败: \(error.localizedDescription)"
                 }
@@ -75,12 +88,17 @@ struct ModelsAndPolicyView: View {
         .sheet(item: $editingProvider) { provider in
             ProviderEditorSheet(
                 existingProvider: provider,
-                existingHasKey: engine.hasAPIKey(for: provider.id)
-            ) { updated, apiKey in
+                existingKeyStatus: engine.cachedAPIKey(for: provider.id)
+            ) { updated, apiKeys, _, _ in
                 do {
-                    try engine.upsertProvider(updated, apiKey: apiKey)
+                    feedbackMessage = try applyProviderEditorSave(
+                        engine: engine,
+                        provider: updated,
+                        apiKeys: apiKeys,
+                        selectedPreset: nil,
+                        seedRecommendedModels: false
+                    )
                     selectedProviderID = updated.id
-                    feedbackMessage = "已更新供应商「\(updated.name)」。"
                 } catch {
                     feedbackMessage = "更新供应商失败: \(error.localizedDescription)"
                 }
@@ -396,9 +414,28 @@ struct ModelsAndPolicyView: View {
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 8)
                 } else {
+                    let availableProviders = engine.config.providers.filter { engine.isProviderAvailable($0) }
+                    let hiddenProviderCount = max(0, engine.config.providers.count - availableProviders.count)
+                    HStack {
+                        Picker("供应商筛选", selection: $showAllProviders) {
+                            Text("可用 (\(availableProviders.count))").tag(false)
+                            Text("全部 (\(engine.config.providers.count))").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 210)
+                        Spacer()
+                    }
+
+                    if visibleProviders.isEmpty {
+                        Text("当前 \(hiddenProviderCount) 家供应商均处于无网络/不可达状态，已默认隐藏。可切换上方「全部」查看。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
+                    }
+
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
-                            ForEach(engine.config.providers) { provider in
+                            ForEach(visibleProviders) { provider in
                                 let isSelected = selectedProvider?.id == provider.id
                                 let dotColor: Color = {
                                     switch provider.healthStatus {
@@ -433,8 +470,8 @@ struct ModelsAndPolicyView: View {
 
                     if let provider = selectedProvider {
                         let providerModels = engine.config.models.filter { $0.providerID == provider.id }
-                        let activeList = providerModels.filter { $0.isEnabled && !$0.isAutoEvicted && $0.availabilityStatus != .unavailable }
-                        let inactiveList = providerModels.filter { !$0.isEnabled || $0.isAutoEvicted || $0.availabilityStatus == .unavailable }
+                        let activeList = providerModels.filter { engine.isModelAvailable($0, provider: provider) }
+                        let inactiveList = providerModels.filter { !engine.isModelAvailable($0, provider: provider) }
 
                         DisclosureGroup("可用模型 (\(activeList.count))", isExpanded: $showCandidatePool) {
                             if activeList.isEmpty {
@@ -454,7 +491,7 @@ struct ModelsAndPolicyView: View {
                         .font(.callout.weight(.medium))
 
                         if !inactiveList.isEmpty {
-                            DisclosureGroup("已停用或异常模型 (\(inactiveList.count))", isExpanded: $showDisabledModels) {
+                            DisclosureGroup("全部中的不可用/停用模型 (\(inactiveList.count))", isExpanded: $showDisabledModels) {
                                 VStack(spacing: 6) {
                                     ForEach(inactiveList) { model in
                                         compactModelRow(model)

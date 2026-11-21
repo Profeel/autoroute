@@ -2,8 +2,8 @@
 
 ## 一键接入（推荐）
 
-1. 在 AutoRoute 配置健康模型、三档和策略，启动本地代理。
-2. 打开“Agent 接入”，选择 **Codex**。先查看预览；预览中的本地 token 显示为 `[REDACTED_LOCAL_TOKEN]`。
+1. 在 AutoRoute 添加提供商，选择或检测至少一个可用模型，并启动本地代理；默认使用均衡策略和自动档位。
+2. 打开“Agent 接入”，选择 **Codex**。先查看预览；预览展示将写入的托管字段，不显示现有配置或本地 token。
 3. 点击“备份并接入”。原 `~/.codex/config.toml` 会备份到 AutoRoute 的本地 `agent_backups` 目录，已有非托管 section 保留。
 4. 重启 Codex，发送一个普通请求，再在 AutoRoute 路由收据核对实际模型、协议、耗时和费用。
 
@@ -22,7 +22,7 @@ model_provider = "autoroute"
 name = "AutoRoute"
 base_url = "http://127.0.0.1:8765/v1"
 wire_api = "responses"
-requires_openai_auth = true
+requires_openai_auth = false
 http_headers = { "Authorization" = "Bearer <LOCAL_TOKEN>" }
 ```
 

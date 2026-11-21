@@ -63,11 +63,11 @@ open dist/AutoRoute.app
 
 ## 5-minute Quickstart
 
-1. **Discover or add a provider.** In the app, explicitly choose local discovery or add an OpenAI-compatible provider. Discovery reads supported local Agent configuration and sends lightweight health requests only after your action. Provider keys are stored in macOS Keychain.
-2. **Confirm tiers and policy.** Assign healthy low/medium/high models and choose cost-first, balanced, or quality-first routing. Missing prices remain unknown; they are never treated as free.
-3. **Copy the local credential.** Open Settings and copy the Base URL and local API token. This random Keychain-backed token is different from provider API keys.
-4. **Connect an Agent or use curl.** One-click integration previews changes, backs up existing configuration, and can restore it. Stable Agent aliases include `auto/agent/codex`, `auto/agent/claudeCode`, and `auto/agent/opencode`, with optional `/low`, `/medium`, or `/high` suffixes.
-5. **Validate through a real socket.** Onboarding sends `URLSession → 127.0.0.1 → authenticated proxy → upstream`. It warns about possible upstream charges. The mock path is marked **demo** and does not complete real onboarding or count as measured savings.
+1. **Connect a provider.** Add a provider and a compatible model, or explicitly discover local configuration. Discovery reads supported Agent configuration and probes enabled upstreams, which may incur charges. Newly discovered providers are disabled until you enable them. Keys are stored in macOS Keychain.
+2. **Preview and connect one Agent.** Review the managed settings, then confirm backup and write. Balanced routing and automatic tier assignments are the defaults; an existing backup can be restored.
+3. **Send the first request from that Agent.** Restart the Agent and make a normal request; the app distinguishes configuration written from a verified real Agent request. The standalone HTTP self-test, manual curl setup, policy settings and mock demo remain under advanced options.
+
+To use WorkBuddy as an upstream provider, select the preset for your region, save your API key, and test the connection to import the models available to your account. [WorkBuddy API keys](https://www.workbuddy.cn/profile/keys) · [WorkBuddy AI API keys](https://www.workbuddy.ai/profile/keys)
 
 ```bash
 export AUTOROUTE_BASE_URL='http://127.0.0.1:8765/v1'

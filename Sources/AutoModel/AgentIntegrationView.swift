@@ -7,14 +7,11 @@ struct AgentIntegrationView: View {
 
     @State private var feedbackMessage: String?
     @State private var feedbackIsError = false
-    @State private var previewPayload: ConfigPreviewPayload?
-
-    private struct ConfigPreviewPayload: Identifiable {
-        let id = UUID()
-        let kind: AgentKind
-        let before: String
-        let after: String
-    }
+    @State private var showBulkConfirmation = false
+    @State private var agentKeyInput = ""
+    @State private var showAgentKeyPlaintext = false
+    @State private var keyFeedbackMessage: String?
+    @State private var keyFeedbackIsError = false
 
     var body: some View {
         ScrollView {
@@ -42,6 +39,8 @@ struct AgentIntegrationView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
 
+                agentKeySettingsCard
+                manualAgentCard
                 ForEach(engine.agentStatuses) { status in
                     agentCard(for: status)
                 }
@@ -52,59 +51,211 @@ struct AgentIntegrationView: View {
         .onAppear {
             engine.refreshAgentStatuses()
         }
-        .sheet(item: $previewPayload) { payload in
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text("\(payload.kind.displayName) 配置变更预览")
-                        .font(.headline)
-                    Spacer()
-                    Button("关闭") {
-                        previewPayload = nil
-                    }
-                    .buttonStyle(.borderedProminent)
+        .confirmationDialog("将备份并配置全部已检测到的 Agent？", isPresented: $showBulkConfirmation, titleVisibility: .visible) {
+            Button("备份并配置全部") {
+                let result = engine.applyAllInstalledAgents()
+                feedbackIsError = !result.errors.isEmpty
+                feedbackMessage = result.errors.isEmpty
+                    ? "已写入 \(result.succeeded) 个 Agent。请重启并分别发送真实请求。"
+                    : "完成 \(result.succeeded) 个，失败：\(result.errors.joined(separator: "；"))"
+            }
+            Button("取消", role: .cancel) {}
+        }
+    }
+
+    private var agentKeySettingsCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Agent 接入密钥（API Key）")
+                    .font(.headline)
+                if engine.localModelAPIKey != nil {
+                    pillBadge("已设置自定义模型密钥", color: .green)
+                } else {
+                    pillBadge("默认管理 token", color: .secondary)
                 }
-                Text("以下为写入前（当前磁盘内容）与写入后（将注入 AutoRoute 网关与三档配置）的对比：")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("写入前（Before）")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        ScrollView {
-                            Text(payload.before.isEmpty ? "(空文件或尚不存在)" : payload.before)
-                                .font(.system(.caption2, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(8)
-                        }
-                        .background(Color(.controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                Spacer()
+                if engine.agentStatuses.contains(where: \.isConnectedToAutoModel) {
+                    Button("同步密钥到已接入 Agent") {
+                        let result = engine.syncConnectedAgentsToCurrentPort()
+                        keyFeedbackIsError = !result.errors.isEmpty
+                        keyFeedbackMessage = result.errors.isEmpty
+                            ? "已将当前密钥与端口同步到 \(result.succeeded) 个已接入 Agent。"
+                            : "同步完成 \(result.succeeded) 个，失败：\(result.errors.joined(separator: "；"))"
                     }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("写入后（After）")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.blue)
-                        ScrollView {
-                            Text(payload.after)
-                                .font(.system(.caption2, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(8)
-                        }
-                        .background(Color(.controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!engine.isLocalAPITokenPersistent)
                 }
             }
-            .padding(20)
-            .frame(minWidth: 760, minHeight: 460)
+
+            Text("设置后，一键接入各 Agent（含 DeepSeek Harness）及手动接入均优先使用此模型专用密钥（仅可调用 /v1/* 模型接口，无法调用管理接口）。允许 4–128 位字母、数字及 - . _ ~。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Group {
+                    if showAgentKeyPlaintext {
+                        TextField("输入新密钥，或点击右侧随机生成", text: $agentKeyInput)
+                    } else {
+                        SecureField("输入新密钥，或点击右侧随机生成", text: $agentKeyInput)
+                    }
+                }
+                .textFieldStyle(.roundedBorder)
+                .font(.caption.monospaced())
+
+                Button {
+                    showAgentKeyPlaintext.toggle()
+                } label: {
+                    Image(systemName: showAgentKeyPlaintext ? "eye.slash" : "eye")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help(showAgentKeyPlaintext ? "隐藏输入" : "显示输入")
+
+                Button("保存密钥") {
+                    do {
+                        let trimmed = agentKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        try engine.setLocalModelAPIKey(trimmed)
+                        agentKeyInput = ""
+                        keyFeedbackIsError = false
+                        keyFeedbackMessage = "模型密钥已保存并立即生效；如需写入已接入 Agent，可点击「同步密钥到已接入 Agent」或对应 Agent 的一键设置。"
+                    } catch {
+                        keyFeedbackIsError = true
+                        keyFeedbackMessage = "保存密钥失败：\(error.localizedDescription)"
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(!engine.isLocalAPITokenPersistent || agentKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Button("生成随机密钥") {
+                    do {
+                        let generated = try LocalAPITokenManager.generateModelAPIKey()
+                        try engine.setLocalModelAPIKey(generated)
+                        agentKeyInput = ""
+                        keyFeedbackIsError = false
+                        keyFeedbackMessage = "已生成并保存新的模型专用密钥。"
+                    } catch {
+                        keyFeedbackIsError = true
+                        keyFeedbackMessage = "生成密钥失败：\(error.localizedDescription)"
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!engine.isLocalAPITokenPersistent)
+
+                Button("复制当前密钥") {
+                    guard let key = engine.manualAgentAPIKey else { return }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(key, forType: .string)
+                    keyFeedbackIsError = false
+                    keyFeedbackMessage = "已复制当前 Agent 密钥，请仅粘贴到受信任的本机客户端。"
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(engine.manualAgentAPIKey == nil)
+
+                Button("恢复默认 token", role: .destructive) {
+                    do {
+                        try engine.clearLocalModelAPIKey()
+                        agentKeyInput = ""
+                        keyFeedbackIsError = false
+                        keyFeedbackMessage = "已清除自定义模型密钥，恢复使用本地管理 token。"
+                    } catch {
+                        keyFeedbackIsError = true
+                        keyFeedbackMessage = "清除失败：\(error.localizedDescription)"
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(engine.localModelAPIKey == nil && engine.localModelAPIKeyError == nil)
+            }
+
+            if let error = engine.localModelAPIKeyError {
+                Text("\(error) 请重新保存或清除后重试。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            if let keyFeedbackMessage {
+                Text(keyFeedbackMessage)
+                    .font(.caption)
+                    .foregroundStyle(keyFeedbackIsError ? Color.red : Color.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07), lineWidth: 1))
+    }
+
+    private var manualAgentCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("其他 Agent")
+                .font(.headline)
+            Text("在客户端中手动填写以下地址、密钥和模型；不会修改客户端配置文件。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !engine.proxyState.isRunning {
+                Text("代理当前未运行；启动后可使用以下地址。")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            manualValueRow("OpenAI 兼容 Base URL", value: engine.manualAgentRootURL + "/v1")
+            manualValueRow("Anthropic Base URL", value: engine.manualAgentRootURL)
+            Text("Anthropic 客户端通常会自动追加 /v1/messages；请按客户端的地址约定填写。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            manualValueRow("模型", value: "auto")
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("API 密钥").font(.caption.weight(.medium))
+                    Text(engine.localModelAPIKeyError != nil
+                         ? "当前密钥状态暂不可确认。"
+                         : (engine.localModelAPIKey == nil
+                            ? "未设置自定义模型密钥时使用管理 token，可访问本地管理接口。"
+                            : "当前使用自定义模型密钥，仅可调用模型接口。"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("复制密钥") {
+                    guard let key = engine.manualAgentAPIKey else { return }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(key, forType: .string)
+                    feedbackIsError = false
+                    feedbackMessage = "已复制本地密钥，请仅粘贴到受信任的本机客户端。"
+                }
+                .disabled(engine.manualAgentAPIKey == nil)
+            }
+            if let error = engine.localModelAPIKeyError {
+                Text("\(error) 请在「设置 → 通用与代理」中重试。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            Text("可在上方「Agent 接入密钥」或「设置 → 通用与代理」中设置、生成或更换模型专用密钥。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07), lineWidth: 1))
+    }
+
+    private func manualValueRow(_ label: String, value: String) -> some View {
+        HStack {
+            Text(label).font(.caption.weight(.medium))
+            Text(value).font(.caption.monospaced()).textSelection(.enabled)
+            Spacer()
+            Button("复制") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(value, forType: .string)
+            }
+            .controlSize(.small)
+            .accessibilityLabel("复制\(label)")
         }
     }
 
     private var localCredentialBlockingBanner: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
                 Label("本地 API token 未持久化，Agent 接入已阻断", systemImage: "exclamationmark.lock.fill")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.red)
@@ -118,8 +269,13 @@ struct AgentIntegrationView: View {
                 Button("检查并重试保存凭据") {
                     do {
                         try engine.retryPersistingLocalAPIToken()
+                        if !engine.proxyState.isRunning {
+                            engine.startProxy()
+                        }
                         feedbackIsError = false
-                        feedbackMessage = "本地 token 已持久化，现在可以接入 Agent。"
+                        feedbackMessage = engine.proxyState.isRunning
+                            ? "本地 token 已持久化，本地代理已启动，现在可以接入 Agent。"
+                            : "本地 token 已持久化，现在可以接入 Agent。"
                     } catch {
                         feedbackIsError = true
                         feedbackMessage = "仍无法持久化本地凭据：\(error.localizedDescription)"
@@ -127,13 +283,13 @@ struct AgentIntegrationView: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
-            .padding(6)
-        }
+            .padding(12)
+            .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.red.opacity(0.25), lineWidth: 1))
     }
 
     private var headerBannerCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("一键将 AutoRoute 本地网关与低 / 中 / 高三档模型配置到各 AI Agent")
@@ -152,20 +308,9 @@ struct AgentIntegrationView: View {
                     }
                     .buttonStyle(.bordered)
 
-                    Button {
-                        let res = engine.applyAllInstalledAgents()
-                        if res.errors.isEmpty {
-                            feedbackIsError = false
-                            feedbackMessage = "已成功将 AutoRoute 配置写入 \(res.succeeded) 个已检测到的 Agent。"
-                        } else {
-                            feedbackIsError = true
-                            feedbackMessage = "完成 \(res.succeeded) 个，失败：\(res.errors.joined(separator: "；"))"
-                        }
-                    } label: {
-                        Label("一键配置全部已安装 Agent", systemImage: "bolt.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!engine.isLocalAPITokenPersistent)
+                    Button("批量配置（高级）") { showBulkConfirmation = true }
+                        .buttonStyle(.bordered)
+                        .disabled(!engine.isLocalAPITokenPersistent)
                 }
 
                 Divider()
@@ -209,16 +354,16 @@ struct AgentIntegrationView: View {
                     }
                 }
             }
-            .padding(6)
-        }
+            .padding(12)
+            .background(Color(.controlBackgroundColor).opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07), lineWidth: 1))
     }
 
     private func agentCard(for status: AgentIntegrationStatus) -> some View {
         let binding = engine.binding(for: status.kind)
         let modelOptions = buildModelOptions(currentBinding: binding)
 
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 12) {
                 // Header row
                 HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -227,7 +372,7 @@ struct AgentIntegrationView: View {
                                 .font(.headline)
 
                             if status.isConnectedToAutoModel {
-                                pillBadge("已接入 AutoRoute", color: .green)
+                                pillBadge("配置已写入", color: .blue)
                             } else if status.isInstalled {
                                 pillBadge("已检测到本地配置", color: .blue)
                             } else {
@@ -310,8 +455,8 @@ struct AgentIntegrationView: View {
                             Text("接入模型与三档映射设置（可修改）：")
                                 .font(.caption.weight(.semibold))
                             Spacer()
-                            Button("重置为推荐 auto / 三档") {
-                                engine.updateAgentBinding(AgentModelBinding(), for: status.kind)
+                            Button("重置为推荐 Agent 别名") {
+                                engine.updateAgentBinding(.stableIdentity(for: status.kind), for: status.kind)
                             }
                             .buttonStyle(.borderless)
                             .font(.caption)
@@ -380,72 +525,11 @@ struct AgentIntegrationView: View {
                 }
                 .font(.caption.weight(.medium))
 
-                // Action buttons
-                HStack(spacing: 10) {
-                    Button {
-                        do {
-                            let updated = try engine.applyAgentIntegration(kind: status.kind)
-                            feedbackIsError = false
-                            feedbackMessage = "已成功将 AutoRoute 写入「\(updated.kind.displayName)」(\(updated.configFilePath))。"
-                        } catch {
-                            feedbackIsError = true
-                            feedbackMessage = "配置 \(status.kind.displayName) 失败: \(error.localizedDescription)"
-                        }
-                    } label: {
-                        Label(
-                            status.isConnectedToAutoModel ? "更新并重新写入配置" : "一键接入 AutoRoute",
-                            systemImage: "arrow.right.circle.fill"
-                        )
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!engine.isLocalAPITokenPersistent)
-
-                    Button {
-                        do {
-                            let preview = try engine.agentConfigService.previewAgentConfig(
-                                kind: status.kind,
-                                binding: engine.binding(for: status.kind),
-                                proxyPort: engine.config.proxySettings.port,
-                                localAPIToken: engine.localAPIToken,
-                                resolvedTierDisplayNames: engine.resolvedTierDisplayNames()
-                            )
-                            previewPayload = ConfigPreviewPayload(kind: status.kind, before: preview.before, after: preview.after)
-                        } catch {
-                            feedbackIsError = true
-                            feedbackMessage = "生成预览失败: \(error.localizedDescription)"
-                        }
-                    } label: {
-                        Label("预览变更", systemImage: "doc.text.magnifyingglass")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!engine.isLocalAPITokenPersistent)
-
-                    Button(role: .destructive) {
-                        do {
-                            let restored = try engine.restoreAgentIntegration(kind: status.kind)
-                            feedbackIsError = false
-                            feedbackMessage = "已断开「\(restored.kind.displayName)」并从备份还原原配置。"
-                        } catch {
-                            feedbackIsError = true
-                            feedbackMessage = "恢复 \(status.kind.displayName) 失败: \(error.localizedDescription)"
-                        }
-                    } label: {
-                        Label("断开并恢复原配置", systemImage: "arrow.uturn.backward")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!status.hasBackup)
-
-                    Spacer()
-
-                    if !engine.proxyState.isRunning {
-                        Text("⚠️ 本地代理未运行，建议先启动代理")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                }
-            }
-            .padding(6)
+                AgentConnectionCard(engine: engine, status: status)
         }
+        .padding(12)
+        .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07), lineWidth: 1))
     }
 
     private struct ModelPickerOption: Identifiable {
@@ -466,8 +550,10 @@ struct AgentIntegrationView: View {
         ]
 
         var seen = Set(options.map(\.id))
+        let codexProviderIDs = Set(engine.config.providers.filter { $0.apiProtocol == .codexChatGPT }.map(\.id))
         for model in engine.healthyAvailableModels() where !seen.contains(model.modelID) {
-            options.append(ModelPickerOption(id: model.modelID, label: "\(model.displayName) (\(model.modelID))"))
+            let tag = codexProviderIDs.contains(model.providerID) ? " [Codex 订阅]" : ""
+            options.append(ModelPickerOption(id: model.modelID, label: "\(model.displayName)\(tag) (\(model.modelID))"))
             seen.insert(model.modelID)
         }
 

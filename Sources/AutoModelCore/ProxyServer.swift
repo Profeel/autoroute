@@ -45,11 +45,12 @@ public final class ProxyServer: @unchecked Sendable {
             return
         }
 
-        let securityContext = await MainActor.run { (engine.localAPIToken, engine.config.proxySettings.port) }
+        let securityContext = await MainActor.run { (engine.localAPIToken, engine.config.proxySettings.port, engine.localModelAPIKey) }
         if let rejection = LocalAPIRequestSecurity.rejection(
             for: req,
             port: securityContext.1,
-            token: securityContext.0
+            token: securityContext.0,
+            modelAPIKey: securityContext.2
         ) {
             writer.sendJSON(
                 statusCode: rejection.statusCode,
@@ -142,6 +143,7 @@ public final class ProxyServer: @unchecked Sendable {
                     ]
                 }
             }
+            let todayUsage = engine.todayUsageSummary()
             return [
                 "status": "ok",
                 "app": "AutoRoute",
@@ -153,6 +155,8 @@ public final class ProxyServer: @unchecked Sendable {
                 "provider_count": engine.config.providers.count,
                 "model_count": engine.config.models.count,
                 "receipt_count": engine.callHistory.count,
+                "today_call_count": todayUsage.callCount,
+                "today_tokens": todayUsage.totalTokens,
                 "tiers": tiersDict
             ]
         }
@@ -262,6 +266,7 @@ public final class ProxyServer: @unchecked Sendable {
             clientName: clientName,
             endpointPath: "/v1/chat/completions",
             agentHeader: req.header("X-AutoModel-Agent"),
+            clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
             onStreamChunk: chunkCallback
         )
@@ -306,9 +311,14 @@ public final class ProxyServer: @unchecked Sendable {
         let isStream = (openAIPayload["stream"] as? Bool) ?? false
         let sessionHeader = req.header("X-AutoModel-Session")
         let streamStarted = StreamFlagBox()
+        let nativeAnthropicStream = StreamFlagBox()
         let translator = AnthropicStreamTranslator()
+        let passthroughHeaders = NativeAnthropicRouting.passthroughHeaders(from: req)
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
+            if headers["X-AutoModel-Wire-Format"] == "anthropic-native" {
+                nativeAnthropicStream.markStarted()
+            }
             streamStarted.markStarted()
             guard writer.startChunkedStream(statusCode: 200, headers: headers) else {
                 throw ClientStreamDisconnectedError()
@@ -316,9 +326,15 @@ public final class ProxyServer: @unchecked Sendable {
         } : nil
 
         let chunkCallback: (@Sendable (Data) async throws -> Void)? = isStream ? { @Sendable chunkData in
-            for eventData in translator.translateChunk(chunkData) {
-                guard writer.writeStreamChunk(eventData) else {
+            if nativeAnthropicStream.wasStarted {
+                guard writer.writeStreamChunk(chunkData) else {
                     throw ClientStreamDisconnectedError()
+                }
+            } else {
+                for eventData in translator.translateChunk(chunkData) {
+                    guard writer.writeStreamChunk(eventData) else {
+                        throw ClientStreamDisconnectedError()
+                    }
                 }
             }
         } : nil
@@ -330,15 +346,23 @@ public final class ProxyServer: @unchecked Sendable {
             clientName: detectClientAgent(req: req, endpointPath: "/v1/messages", payload: openAIPayload),
             endpointPath: "/v1/messages",
             agentHeader: req.header("X-AutoModel-Agent"),
+            nativeAnthropicPayload: rawJSON,
+            nativeAnthropicHeaders: passthroughHeaders,
+            clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
             onStreamChunk: chunkCallback
         )
 
+        let isNativeAnthropicResponse = outcome.headers["X-AutoModel-Wire-Format"] == "anthropic-native"
         if isStream && streamStarted.wasStarted {
-            for tailEvent in translator.finishEvents() {
-                _ = writer.writeStreamChunk(tailEvent)
+            if !nativeAnthropicStream.wasStarted {
+                for tailEvent in translator.finishEvents() {
+                    _ = writer.writeStreamChunk(tailEvent)
+                }
             }
             writer.finishStream()
+        } else if isNativeAnthropicResponse {
+            writer.sendJSON(statusCode: outcome.httpStatusCode, headers: outcome.headers, body: outcome.responseBody)
         } else if outcome.httpStatusCode == 200,
                   let openAIObj = try? JSONSerialization.jsonObject(with: outcome.responseBody) as? [String: Any] {
             let anthropicObj = ProtocolAdapters.openAIToAnthropicResponse(
@@ -417,6 +441,7 @@ public final class ProxyServer: @unchecked Sendable {
             endpointPath: "/v1/responses",
             agentHeader: req.header("X-AutoModel-Agent"),
             nativeResponsesPayload: useNativeResponses ? NativeResponsesRouting.wirePayload(rawJSON) : nil,
+            clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
             onStreamChunk: chunkCallback
         )
@@ -629,6 +654,7 @@ public final class ProxyServer: @unchecked Sendable {
                 let lower = trimmed.lowercased()
                 if lower.contains("hermes") { return "Hermes Agent" }
                 if lower.contains("openclaw") { return "OpenClaw" }
+                if lower.contains("deepseek") || lower == "dsh" { return "DeepSeek Harness" }
                 return trimmed
             }
         }
@@ -636,12 +662,14 @@ public final class ProxyServer: @unchecked Sendable {
         if referer.contains("hermes") { return "Hermes Agent" }
         if referer.contains("openclaw") { return "OpenClaw" }
         if referer.contains("opencode") { return "OpenCode" }
+        if referer.contains("deepseek") { return "DeepSeek Harness" }
 
         let ua = (req.header("User-Agent") ?? "").lowercased()
         if ua.contains("claude") { return "Claude Code" }
         if ua.contains("codex") { return "Codex" }
         if ua.contains("opencode") { return "OpenCode" }
         if ua.contains("hermes") { return "Hermes Agent" }
+        if ua.contains("deepseek-harness") || ua.contains("deepseek harness") || ua.contains("dsh/") { return "DeepSeek Harness" }
         if ua.contains("openclaw") { return "OpenClaw" }
         if ua.contains("cursor") { return "Cursor" }
         if ua.contains("cline") || ua.contains("roo") { return "Cline" }

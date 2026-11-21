@@ -52,12 +52,13 @@ public extension AutoModelEngine {
             throw OnboardingValidationError.proxyUnavailable(proxyState.statusText)
         }
 
-        let existingIDs = Set(callHistory.map(\.id))
+        let sessionID = "onboarding-\(UUID().uuidString)"
         var request = URLRequest(url: URL(string: "\(config.proxySettings.baseURLString)/chat/completions")!)
         request.httpMethod = "POST"
         request.timeoutInterval = 90
         request.setValue("Bearer \(localAPIToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(sessionID, forHTTPHeaderField: "X-AutoModel-Session")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "model": "auto",
             "stream": false,
@@ -84,7 +85,7 @@ public extension AutoModelEngine {
                 ?? "未知错误"
             throw OnboardingValidationError.httpFailure(http.statusCode, message)
         }
-        guard let record = callHistory.first(where: { !existingIDs.contains($0.id) }) else {
+        guard let record = callHistory.first(where: { $0.requestFeatures.conversationFingerprint == sessionID }) else {
             throw OnboardingValidationError.missingReceipt
         }
         let isDemo = record.executionOrigin == .demo

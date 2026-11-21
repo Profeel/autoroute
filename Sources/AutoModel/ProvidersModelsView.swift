@@ -1,48 +1,84 @@
+import AppKit
 import AutoModelCore
 import SwiftUI
 
 struct ProvidersModelsView: View {
     @ObservedObject var engine: AutoModelEngine
 
+    @State private var viewMode: ProvidersViewMode = .byProvider
     @State private var selectedProviderID: UUID?
     @State private var showingProviderSheet = false
     @State private var editingProvider: ProviderConfig?
     @State private var showingModelSheet = false
     @State private var editingModel: ModelConfig?
-    @State private var discoveredModelIDs: [String] = []
-    @State private var discoveryProviderID: UUID?
+    @State private var showingCodexSubscriptionSheet = false
     @State private var feedbackMessage: String?
     @State private var isTestingConnection = false
-    @State private var modelFilter: ModelHealthFilter = .all
 
-    enum ModelHealthFilter: String, CaseIterable {
-        case all = "全部"
-        case availableOnly = "实测可用"
-        case evictedOnly = "已自动剔除"
+    enum ProvidersViewMode: String, CaseIterable {
+        case byProvider = "按提供商接入"
+        case autoGroups = "同模型自动分组"
+    }
+
+    private var selectedProvider: ProviderConfig? {
+        if let id = selectedProviderID, let found = engine.config.providers.first(where: { $0.id == id }) {
+            return found
+        }
+        return engine.config.providers.first
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            discoveryToolbar
-            Divider()
-            HStack(spacing: 0) {
-                providerListColumn
-                    .frame(minWidth: 280, idealWidth: 320, maxWidth: 360)
-                Divider()
-                providerDetailColumn
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 12) {
+            // 1. Minimalist Top Bar
+            topToolbar
+
+            // 2. Public Benchmark Scatter Frontier Chart (lights up connected models)
+            PublicBenchmarkChartView(engine: engine)
+
+            if let feedbackMessage {
+                HStack(spacing: 8) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text(feedbackMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        self.feedbackMessage = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color(.controlBackgroundColor).opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            // 3. Main Content: Opt-in Providers OR Auto Same-Model Groups
+            if viewMode == .byProvider {
+                providerOptInWorkspace
+            } else {
+                autoModelGroupsWorkspace
             }
         }
-        .navigationTitle("供应商")
+        .padding(14)
         .sheet(isPresented: $showingProviderSheet) {
             ProviderEditorSheet(
                 existingProvider: editingProvider,
-                existingHasKey: editingProvider.map { engine.hasAPIKey(for: $0.id) } ?? false
-            ) { provider, apiKey in
+                existingKeyStatus: editingProvider.map { engine.cachedAPIKey(for: $0.id) } ?? .missing
+            ) { provider, apiKeys, selectedPreset, seedRecommendedModels in
+                let wasNew = (editingProvider == nil)
                 do {
-                    try engine.upsertProvider(provider, apiKey: apiKey)
+                    feedbackMessage = try applyProviderEditorSave(
+                        engine: engine,
+                        provider: provider,
+                        apiKeys: apiKeys,
+                        selectedPreset: wasNew ? selectedPreset : nil,
+                        seedRecommendedModels: seedRecommendedModels
+                    )
                     selectedProviderID = provider.id
-                    feedbackMessage = "已保存供应商「\(provider.name)」，API Key 已加密存入 macOS Keychain。"
                 } catch {
                     feedbackMessage = "保存失败: \(error.localizedDescription)"
                 }
@@ -59,6 +95,15 @@ struct ProvidersModelsView: View {
                 }
             }
         }
+        .sheet(isPresented: $showingCodexSubscriptionSheet) {
+            CodexSubscriptionSheet(
+                engine: engine,
+                onConnected: { providerID, message in
+                    selectedProviderID = providerID
+                    feedbackMessage = message
+                }
+            )
+        }
         .onAppear {
             if selectedProviderID == nil {
                 selectedProviderID = engine.config.providers.first?.id
@@ -66,287 +111,187 @@ struct ProvidersModelsView: View {
         }
     }
 
-    private var discoveryToolbar: some View {
-        let healthyCount = engine.config.models.filter { $0.isEnabled && !$0.isAutoEvicted && $0.availabilityStatus == .available }.count
-        let evictedCount = engine.config.models.filter { $0.isAutoEvicted || $0.availabilityStatus != .available }.count
-        return HStack(spacing: 12) {
+    private var topToolbar: some View {
+        HStack(spacing: 12) {
+            Picker("视图", selection: $viewMode) {
+                ForEach(ProvidersViewMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 240)
+
+            let enabledCount = engine.config.providers.filter(\.isEnabled).count
+            Text("已接入 \(enabledCount)/\(engine.config.providers.count) 个提供商")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
             Button {
                 Task {
                     let summary = await engine.discoverAndProbeLocalModels()
-                    feedbackMessage = "本机扫面完成：新增 \(summary.discoveredProvidersCount) 个供应商、\(summary.discoveredModelsCount) 个模型；实测 \(summary.probedModelsCount) 个模型后，\(summary.healthyModelsCount) 个可用，\(summary.evictedModelsCount) 个不可用已自动剔除。"
+                    feedbackMessage = "本机扫描完成：发现 \(summary.discoveredProvidersCount) 个来源、\(summary.discoveredModelsCount) 个模型；请通过开关选择要接入路由池的提供商。"
                 }
             } label: {
                 if engine.isDiscoveringAndProbing {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                        Text("正在发掘与测活...")
+                        Text("扫描中…")
                     }
                 } else {
-                    Label("自动发掘本机模型并测活剔除", systemImage: "radar")
+                    Label("重新扫描本机", systemImage: "arrow.clockwise")
                 }
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.bordered)
+            .controlSize(.small)
             .disabled(engine.isDiscoveringAndProbing)
 
-            Button {
-                let count = engine.fillReferencePricingForUnpricedModels()
-                feedbackMessage = count > 0
-                    ? "已为 \(count) 个未配置单价的模型补全公开参考价格。"
-                    : "当前模型均已配置单价，或暂无匹配的公开参考价格。"
-            } label: {
-                Label("填充参考单价", systemImage: "dollarsign.circle")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-
-            if let progress = engine.probeProgressText {
-                Text(progress)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            } else if let summary = engine.lastDiscoverySummary {
-                Text("最近巡检: \(summary.timestamp.formatted(date: .omitted, time: .shortened))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            HStack(spacing: 8) {
-                Text("可用 \(healthyCount)")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Color.green.opacity(0.15))
-                    .foregroundStyle(.green)
-                    .clipShape(Capsule())
-
-                Text("已剔除 \(evictedCount)")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(evictedCount > 0 ? Color.red.opacity(0.15) : Color.secondary.opacity(0.12))
-                    .foregroundStyle(evictedCount > 0 ? .red : .secondary)
-                    .clipShape(Capsule())
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Color(.controlBackgroundColor).opacity(0.5))
-    }
-
-    private var tierQuickStrip: some View {
-        let healthy = engine.healthyAvailableModels()
-        return HStack(spacing: 12) {
-            Label("三档配置:", systemImage: "square.stack.3d.up")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            ForEach(ModelTier.allCases) { tier in
-                let assigned = engine.model(for: tier)
-                let color: Color = (tier == .low ? .green : (tier == .medium ? .blue : .purple))
-                HStack(spacing: 6) {
-                    Text(tier.shortName)
-                        .font(.caption2.weight(.bold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(color.opacity(0.15))
-                        .foregroundStyle(color)
-                        .clipShape(Capsule())
-
-                    Picker(tier.shortName, selection: Binding(
-                        get: { engine.config.policy.modelID(for: tier) },
-                        set: { newID in
-                            engine.setTierModel(tier: tier, modelUUID: newID, isManual: newID != nil)
-                        }
-                    )) {
-                        Text("未分配").tag(UUID?.none)
-                        ForEach(healthy) { m in
-                            Text(m.displayName).tag(UUID?.some(m.id))
-                        }
-                        if let assigned, !healthy.contains(where: { $0.id == assigned.id }) {
-                            Text("\(assigned.displayName) [不可用]").tag(UUID?.some(assigned.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .controlSize(.small)
-                    .frame(maxWidth: 190)
-                }
-            }
-
-            Spacer()
-
-            Button("自动重配三档") {
-                engine.autoConfigureModelTiers(forceResetManual: true)
-                feedbackMessage = "已从当前可用模型中重新自动分配低 / 中 / 高三档。"
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(healthy.isEmpty)
-
-            Button("填充参考单价") {
-                let updatedCount = engine.fillReferencePricingForUnpricedModels()
-                if updatedCount > 0 {
-                    feedbackMessage = "已为 \(updatedCount) 个未配置价格的模型填充公开参考单价（可在右侧表格修改）。"
-                } else {
-                    feedbackMessage = "所有已配置模型已有单价，或暂无匹配的公开参考单价。"
-                }
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("仅对未填写单价的模型匹配公开参考价格，不会覆盖你手动设置的价格")
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-        .background(Color(.controlBackgroundColor).opacity(0.28))
-    }
-
-    private var selectedProvider: ProviderConfig? {
-        if let id = selectedProviderID, let found = engine.config.providers.first(where: { $0.id == id }) {
-            return found
-        }
-        return engine.config.providers.first
-    }
-
-    private var providerListColumn: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("供应商 (\(engine.config.providers.count))")
-                    .font(.headline)
-                Spacer()
-                Button {
+            Menu {
+                Button("添加 API 提供商") {
                     editingProvider = nil
                     showingProviderSheet = true
-                } label: {
-                    Label("添加供应商", systemImage: "plus")
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                Button("接入 Codex 订阅账号") {
+                    showingCodexSubscriptionSheet = true
+                }
+            } label: {
+                Label("添加", systemImage: "plus")
             }
-            .padding(12)
+            .menuStyle(.borderedButton)
+            .controlSize(.small)
+        }
+    }
 
-            Divider()
-
-            if engine.config.providers.isEmpty {
-                ContentUnavailableView {
-                    Label("尚未添加供应商", systemImage: "server.rack")
-                } description: {
-                    Text("点击右上角“添加供应商”，填写您的 OpenAI 兼容厂商、中转站或本地服务地址。")
-                }
-                .frame(maxHeight: .infinity)
-            } else {
-                List(engine.config.providers, selection: $selectedProviderID) { provider in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(provider.name)
-                                .font(.callout.weight(.semibold))
-                            Spacer()
-                            ProviderStatusBadge(status: provider.healthStatus)
-                        }
-                        Text(provider.baseURL)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        HStack(spacing: 6) {
-                            let providerModels = engine.config.models.filter { $0.providerID == provider.id }
-                            let okCount = providerModels.filter { !$0.isAutoEvicted && $0.availabilityStatus == .available }.count
-                            let evictedCount = providerModels.count - okCount
-                            Text("\(okCount) 可用" + (evictedCount > 0 ? " / \(evictedCount) 剔除" : ""))
-                            if provider.apiProtocol != .openAIChatCompletions {
-                                Text(provider.apiProtocol.displayName)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(Color.accentColor.opacity(0.12))
-                                    .foregroundStyle(Color.accentColor)
-                                    .clipShape(Capsule())
-                            }
-                            if let src = provider.discoveredSource {
-                                Text("· \(src)")
-                                    .lineLimit(1)
-                            } else if engine.hasAPIKey(for: provider.id) {
-                                Label("Keychain", systemImage: "key.fill")
-                                    .foregroundStyle(.green)
-                            }
-                            if !provider.isEnabled {
-                                Text("已禁用")
-                                    .foregroundStyle(.orange)
-                            }
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 4)
+    private var providerOptInWorkspace: some View {
+        HSplitView {
+            // Left: Providers list with Opt-in Toggle
+            List(engine.config.providers, selection: $selectedProviderID) { provider in
+                providerOptInRow(provider)
                     .tag(provider.id)
-                }
             }
-        }
-    }
+            .listStyle(.inset)
+            .frame(minWidth: 270, idealWidth: 310, maxWidth: 360)
 
-    private var providerDetailColumn: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let feedbackMessage {
-                HStack {
-                    Image(systemName: "info.circle.fill")
-                        .foregroundStyle(Color.accentColor)
-                    Text(feedbackMessage)
-                        .font(.callout)
-                    Spacer()
-                    Button("关闭") { self.feedbackMessage = nil }
-                        .buttonStyle(.plain)
-                        .font(.caption)
-                }
-                .padding(10)
-                .background(Color.accentColor.opacity(0.1))
-            }
-
+            // Right: Selected Provider Detail & Models
             if let provider = selectedProvider {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        providerHeaderCard(provider)
-
-                        if discoveryProviderID == provider.id && !discoveredModelIDs.isEmpty {
-                            discoveredModelsCard(provider)
-                        }
-
-                        modelsSection(provider)
-                    }
-                    .padding(16)
-                }
+                providerDetailView(provider)
+                    .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ContentUnavailableView {
-                    Label("请选择或添加供应商", systemImage: "network")
-                } description: {
-                    Text("添加供应商后，即可在此配置多个模型及其单价、能力标签和默认用途。")
+                VStack(spacing: 10) {
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tertiary)
+                    Text("暂无提供商配置")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        Button("扫描本机配置") {
+                            Task { _ = await engine.discoverAndProbeLocalModels() }
+                        }
+                        .buttonStyle(.bordered)
+                        Button("+ 添加提供商") {
+                            editingProvider = nil
+                            showingProviderSheet = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .background(Color(.controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+        )
     }
 
-    private func providerHeaderCard(_ provider: ProviderConfig) -> some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
+    private func providerOptInRow(_ provider: ProviderConfig) -> some View {
+        let models = engine.config.models.filter { $0.providerID == provider.id }
+        let enabledModels = models.filter(\.isEnabled).count
+        let sourceText = provider.discoverySourceLabel ?? provider.discoveredSource
+
+        return HStack(spacing: 10) {
+            Circle()
+                .fill(statusColor(for: provider))
+                .frame(width: 7, height: 7)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(provider.name)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    if provider.isAutoDiscovered && !provider.isEnabled {
+                        Text("未接入")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.14), in: Capsule())
+                    }
+                }
+                HStack(spacing: 6) {
+                    if let sourceText {
+                        Text(sourceText)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                    Text("\(enabledModels)/\(models.count) 模型")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { provider.isEnabled },
+                set: { newValue in
+                    var updated = provider
+                    updated.isEnabled = newValue
+                    do {
+                        try engine.upsertProvider(updated, apiKey: nil)
+                        feedbackMessage = newValue
+                            ? "已接入「\(provider.name)」，其健康模型已加入可用路由池与 Bench 榜单。"
+                            : "已停用「\(provider.name)」，其模型已从路由池移除。"
+                    } catch {
+                        feedbackMessage = "切换失败: \(error.localizedDescription)"
+                    }
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func providerDetailView(_ provider: ProviderConfig) -> some View {
+        let models = engine.config.models.filter { $0.providerID == provider.id }
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 8) {
                             Text(provider.name)
-                                .font(.title3.bold())
-                            ProviderStatusBadge(status: provider.healthStatus)
-                            if !provider.isEnabled {
-                                Text("已禁用")
-                                    .font(.caption)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.orange.opacity(0.18))
-                                    .foregroundStyle(.orange)
-                                    .clipShape(Capsule())
-                            }
+                                .font(.title3.weight(.semibold))
+                            Text(provider.isEnabled ? "已接入路由池" : "仅本机发现（未接入）")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(provider.isEnabled ? .green : .secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background((provider.isEnabled ? Color.green : Color.secondary).opacity(0.14), in: Capsule())
                         }
-                        Text("Base URL: \(provider.normalizedBaseURL)")
+                        Text(provider.baseURL)
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
-                        Text("API Key 存储: \(engine.hasAPIKey(for: provider.id) ? "已保存在 macOS Keychain（不写入明文配置）" : "未设置（仅适用于免密本地服务）")")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        if let source = provider.discoverySourceLabel ?? provider.discoveredSource {
+                            Text("来源：\(source)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
 
                     Spacer()
@@ -354,16 +299,25 @@ struct ProvidersModelsView: View {
                     HStack(spacing: 8) {
                         Button {
                             Task {
-                                await runConnectionTest(provider: provider)
+                                isTestingConnection = true
+                                let result = await engine.testProviderConnection(providerID: provider.id)
+                                isTestingConnection = false
+                                switch result {
+                                case .success(let models):
+                                    feedbackMessage = "连通性测试成功，发现 \(models.count) 个模型。"
+                                case .failure(let err):
+                                    feedbackMessage = "连通性测试失败：\(err.localizedDescription)"
+                                }
                             }
                         } label: {
                             if isTestingConnection {
                                 ProgressView().controlSize(.small)
                             } else {
-                                Label("测试连接 & 拉取模型", systemImage: "antenna.radiowaves.left.and.right")
+                                Text("测试连通性")
                             }
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                         .disabled(isTestingConnection)
 
                         Button("编辑") {
@@ -371,6 +325,7 @@ struct ProvidersModelsView: View {
                             showingProviderSheet = true
                         }
                         .buttonStyle(.bordered)
+                        .controlSize(.small)
 
                         Button(role: .destructive) {
                             engine.deleteProvider(id: provider.id)
@@ -379,616 +334,227 @@ struct ProvidersModelsView: View {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.bordered)
-                    }
-                }
-
-                if let err = provider.lastErrorMessage, !err.isEmpty {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.red)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("最近一次连接检查异常")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.red)
-                            Text(err)
-                                .font(.caption)
-                                .foregroundStyle(.red)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-            }
-            .padding(4)
-        } label: {
-            Label("供应商信息", systemImage: "building.2")
-                .font(.headline)
-        }
-    }
-
-    private func discoveredModelsCard(_ provider: ProviderConfig) -> some View {
-        let existingIDs = Set(engine.config.models.filter { $0.providerID == provider.id }.map(\.modelID))
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("上游 /v1/models 返回了 \(discoveredModelIDs.count) 个模型，点击即可添加到路由池：")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                FlowLayout(spacing: 8) {
-                    ForEach(discoveredModelIDs, id: \.self) { modelID in
-                        let added = existingIDs.contains(modelID)
-                        Button {
-                            if !added {
-                                let newModel = ModelConfig(providerID: provider.id, modelID: modelID)
-                                editingModel = newModel
-                                showingModelSheet = true
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: added ? "checkmark.circle.fill" : "plus.circle")
-                                Text(modelID)
-                            }
-                        }
-                        .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .disabled(added)
                     }
                 }
-            }
-            .padding(4)
-        } label: {
-            Label("发现的上游模型", systemImage: "sparkles")
-                .font(.subheadline.weight(.semibold))
-        }
-    }
 
-    private func modelsSection(_ provider: ProviderConfig) -> some View {
-        let allModels = engine.config.models.filter { $0.providerID == provider.id }
-        let filteredModels = allModels.filter { model in
-            switch modelFilter {
-            case .all: return true
-            case .availableOnly: return !model.isAutoEvicted && model.availabilityStatus == .available
-            case .evictedOnly: return model.isAutoEvicted || model.availabilityStatus != .available
-            }
-        }
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
+                Divider()
+
                 HStack {
-                    Text("已配置模型 (\(allModels.count))")
+                    Text("模型列表 (\(models.count))")
                         .font(.subheadline.weight(.semibold))
-
-                    Picker("筛选", selection: $modelFilter) {
-                        ForEach(ModelHealthFilter.allCases, id: \.self) { f in
-                            Text(f.rawValue).tag(f)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 240)
-
                     Spacer()
-
-                    Button {
-                        Task {
-                            await engine.probeProviderModels(providerID: provider.id)
-                            feedbackMessage = "已完成对「\(provider.name)」全部模型的测活与不可用剔除。"
-                        }
-                    } label: {
-                        Label("测活该供应商模型", systemImage: "stethoscope")
+                    Button("+ 添加模型") {
+                        editingModel = nil
+                        showingModelSheet = true
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .disabled(engine.isDiscoveringAndProbing || allModels.isEmpty)
-
-                    Button {
-                        editingModel = nil
-                        showingModelSheet = true
-                    } label: {
-                        Label("手动添加模型", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
                 }
 
-                if filteredModels.isEmpty {
-                    Text(allModels.isEmpty
-                         ? "该供应商下还没有模型。请至少添加两个可用模型（可从上方自动拉取或手动添加），以便路由器进行对比和切换。"
-                         : "当前筛选条件下没有模型。")
-                        .font(.callout)
+                if models.isEmpty {
+                    Text("该提供商暂无模型，可点击「测试连通性」或「+ 添加模型」。")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 12)
                 } else {
-                    ForEach(filteredModels) { model in
-                        modelRowCard(model)
+                    VStack(spacing: 6) {
+                        ForEach(models) { model in
+                            modelRow(model, providerEnabled: provider.isEnabled)
+                        }
                     }
                 }
             }
-            .padding(4)
-        } label: {
-            Label("模型目录与定价", systemImage: "square.stack.3d.up")
-                .font(.headline)
+            .padding(16)
         }
     }
 
-    private func modelRowCard(_ model: ModelConfig) -> some View {
-        let evicted = model.isAutoEvicted || model.availabilityStatus != .available
-        return VStack(alignment: .leading, spacing: 6) {
+    private func modelRow(_ model: ModelConfig, providerEnabled: Bool) -> some View {
+        let canonical = CanonicalModelNormalizer.canonicalID(for: model)
+        return HStack(spacing: 10) {
+            Toggle("", isOn: Binding(
+                get: { model.isEnabled },
+                set: { newValue in
+                    var updated = model
+                    updated.isEnabled = newValue
+                    engine.upsertModel(updated)
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .disabled(!providerEnabled)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(model.displayName)
+                        .font(.callout.weight(.medium))
+                    if !canonical.isEmpty {
+                        Text(canonical)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                HStack(spacing: 10) {
+                    if let inp = model.inputPricePerMillion, let out = model.outputPricePerMillion {
+                        Text(String(format: "$%.2f / $%.2f per 1M", inp, out))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("未配置价格")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    if let lat = model.lastProbeLatencyMs {
+                        Text(AutoModelFormatter.formatMs(lat))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Spacer()
+
+            if let cooldownSec = engine.cooldownRemainingSeconds(for: model.id) {
+                Text("冷却 \(cooldownSec)s")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.14), in: Capsule())
+            }
+
+            Button("编辑") {
+                editingModel = model
+                showingModelSheet = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var autoModelGroupsWorkspace: some View {
+        let groups = engine.autoModelGroups(connectedOnly: false)
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Toggle("", isOn: Binding(
-                    get: { model.isEnabled },
-                    set: { next in
-                        var updated = model
-                        updated.isEnabled = next
-                        engine.upsertModel(updated)
+                Toggle("开启同模型自动分组与组内可用性故障转移", isOn: Binding(
+                    get: { engine.config.policy.enableAutoSameModelGrouping },
+                    set: { newVal in
+                        engine.updatePolicy { $0.enableAutoSameModelGrouping = newVal }
                     }
                 ))
-                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                Spacer()
+                Text("共 \(groups.count) 个逻辑模型组")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 4)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(model.displayName)
-                            .font(.callout.weight(.semibold))
-                            .strikethrough(evicted, color: .red)
-                        if model.displayName != model.modelID {
-                            Text("(\(model.modelID))")
-                                .font(.caption.monospaced())
+            if groups.isEmpty {
+                Text("暂无模型，请先扫描或添加提供商。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(groups) { group in
+                            autoGroupCard(group)
+                        }
+                    }
+                    .padding(.bottom, 8)
+                }
+            }
+        }
+    }
+
+    private func autoGroupCard(_ group: AutoModelGroup) -> some View {
+        let connectedCount = group.connectedChannels.count
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(group.displayName)
+                    .font(.callout.weight(.semibold))
+                Text(group.canonicalID)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Text(connectedCount > 1 ? "\(connectedCount)通道自动分组" : "\(connectedCount) 个已接入通道")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(connectedCount > 1 ? .blue : .secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background((connectedCount > 1 ? Color.blue : Color.secondary).opacity(0.12), in: Capsule())
+            }
+
+            VStack(spacing: 4) {
+                ForEach(group.channels) { ch in
+                    let isPreferred = group.activeChannel?.id == ch.id
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(ch.isHealthy ? Color.green : (ch.isCoolingDown ? Color.orange : Color.secondary.opacity(0.4)))
+                            .frame(width: 6, height: 6)
+                        Text(ch.providerName)
+                            .font(.caption.weight(isPreferred ? .semibold : .regular))
+                        Text(ch.modelConfig.modelID)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                        Spacer()
+                        if let lat = ch.avgLatencyMs {
+                            Text(AutoModelFormatter.formatMs(lat))
+                                .font(.caption2.monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
-                        if model.isAutoEvicted {
-                            Text("已自动剔除 · \(model.availabilityStatus.displayName)")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.red.opacity(0.16))
-                                .foregroundStyle(.red)
-                                .clipShape(Capsule())
-                        } else if model.availabilityStatus != .available {
-                            Text(model.availabilityStatus.displayName)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.red.opacity(0.15))
-                                .foregroundStyle(.red)
-                                .clipShape(Capsule())
-                        } else if let probeMs = model.lastProbeLatencyMs {
-                            Text("实测 \(Int(probeMs.rounded())) ms")
-                                .font(.caption2.weight(.medium))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.green.opacity(0.15))
+                        if isPreferred {
+                            Text("首选健康")
+                                .font(.system(size: 10, weight: .medium))
                                 .foregroundStyle(.green)
-                                .clipShape(Capsule())
-                        }
-                        if let src = model.discoveredSource {
-                            Text(src)
-                                .font(.caption2)
-                                .padding(.horizontal, 5)
+                                .padding(.horizontal, 6)
                                 .padding(.vertical, 1)
-                                .background(Color.secondary.opacity(0.12))
-                                .clipShape(Capsule())
+                                .background(Color.green.opacity(0.14), in: Capsule())
+                        } else if ch.isCoolingDown, let rem = ch.cooldownRemainingSec {
+                            Text("冷却 \(Int(rem.rounded()))s")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Color.orange.opacity(0.14), in: Capsule())
+                        } else if !ch.isConnected {
+                            Text("未接入")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("可用备选")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
                         }
                     }
-
-                    HStack(spacing: 10) {
-                        Text("用途: \(model.defaultRole.displayName)")
-                        Text("上下文: \(model.contextWindow / 1000)k")
-                        Text("质量 \(model.qualityScore) · 速度 \(model.speedScore)")
-                        Text(AutoModelFormatter.formatPricePair(input: model.inputPricePerMillion, output: model.outputPricePerMillion))
-                            .foregroundStyle(model.hasCompletePricing ? Color.secondary : Color.orange)
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color(.windowBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
                 }
-
-                Spacer()
-
-                HStack(spacing: 4) {
-                    ForEach(Array(model.capabilities).sorted { $0.rawValue < $1.rawValue }, id: \.self) { cap in
-                        Text(cap.displayName)
-                            .font(.caption2)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.accentColor.opacity(0.12))
-                            .clipShape(Capsule())
-                    }
-                }
-
-                Button("重测") {
-                    Task {
-                        await engine.probeSingleModel(modelID: model.id)
-                    }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                if evicted {
-                    Button("恢复") {
-                        engine.restoreEvictedModel(id: model.id)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-
-                Button("编辑") {
-                    editingModel = model
-                    showingModelSheet = true
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button(role: .destructive) {
-                    engine.deleteModel(id: model.id)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-
-            if let note = model.lastAvailabilityNote, !note.isEmpty {
-                Text(evicted ? note : "健康检测: \(note)")
-                    .font(.caption)
-                    .foregroundStyle(evicted ? .red : .secondary)
-                    .padding(.leading, 28)
             }
         }
-        .padding(10)
-        .background(evicted ? Color.red.opacity(0.05) : Color(.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(12)
+        .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+        )
     }
 
-    private func runConnectionTest(provider: ProviderConfig) async {
-        isTestingConnection = true
-        defer { isTestingConnection = false }
-
-        let result = await engine.testProviderConnection(providerID: provider.id)
-        switch result {
-        case .success(let models):
-            discoveredModelIDs = models
-            discoveryProviderID = provider.id
-            feedbackMessage = "连接「\(provider.name)」成功，拉取到 \(models.count) 个可用模型。"
-        case .failure(let err):
-            feedbackMessage = "连接「\(provider.name)」失败：\(err.localizedDescription)"
-        }
-    }
-}
-
-struct ProviderStatusBadge: View {
-    let status: ProviderHealthStatus
-
-    var body: some View {
-        Text(status.displayName)
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.16))
-            .foregroundStyle(color)
-            .clipShape(Capsule())
-    }
-
-    private var color: Color {
-        switch status {
+    private func statusColor(for provider: ProviderConfig) -> Color {
+        if !provider.isEnabled { return .gray.opacity(0.5) }
+        switch provider.healthStatus {
         case .healthy: return .green
         case .checking: return .blue
-        case .unknown: return .secondary
+        case .unknown: return .orange
         case .authError, .networkError, .serverError: return .red
-        }
-    }
-}
-
-// MARK: - Provider Editor Sheet
-
-struct ProviderEditorSheet: View {
-    @Environment(\.dismiss) private var dismiss
-
-    let existingProvider: ProviderConfig?
-    let existingHasKey: Bool
-    let onSave: (ProviderConfig, String?) -> Void
-
-    @State private var name: String = ""
-    @State private var baseURL: String = ""
-    @State private var apiKeyInput: String = ""
-    @State private var clearKey: Bool = false
-    @State private var timeoutSeconds: Double = 60
-    @State private var isEnabled: Bool = true
-    @State private var validationError: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(existingProvider == nil ? "添加 OpenAI 兼容供应商" : "编辑供应商")
-                .font(.title3.bold())
-
-            Form {
-                TextField("名称（如：中转站 A / OpenAI / 本机 Ollama）", text: $name)
-                TextField("Base URL（如：https://api.example.com/v1）", text: $baseURL)
-                SecureField(
-                    existingHasKey ? "API Key（留空表示保留 Keychain 中已有密钥）" : "API Key（将保存在 macOS Keychain）",
-                    text: $apiKeyInput
-                )
-                if existingHasKey {
-                    Toggle("清除已保存的 API Key", isOn: $clearKey)
-                }
-                Toggle("启用该供应商", isOn: $isEnabled)
-                Stepper("请求超时: \(Int(timeoutSeconds)) 秒", value: $timeoutSeconds, in: 10...300, step: 10)
-            }
-            .formStyle(.grouped)
-
-            if let validationError {
-                Text(validationError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            HStack {
-                Text("安全承诺：API Key 仅保存在 macOS Keychain，绝不写入 config.json 或调用历史。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("取消") { dismiss() }
-                Button("保存") {
-                    save()
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(20)
-        .frame(width: 520)
-        .onAppear {
-            if let existing = existingProvider {
-                name = existing.name
-                baseURL = existing.baseURL
-                timeoutSeconds = existing.timeoutSeconds
-                isEnabled = existing.isEnabled
-            }
-        }
-    }
-
-    private func save() {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty else {
-            validationError = "请输入供应商名称。"
-            return
-        }
-        guard let parsed = URL(string: trimmedURL),
-              let scheme = parsed.scheme?.lowercased(),
-              (scheme == "http" || scheme == "https"),
-              parsed.host != nil else {
-            validationError = "请输入有效的 http:// 或 https:// Base URL。"
-            return
-        }
-
-        var updated = existingProvider ?? ProviderConfig(name: trimmedName, baseURL: trimmedURL)
-        updated.name = trimmedName
-        updated.baseURL = trimmedURL
-        updated.timeoutSeconds = timeoutSeconds
-        updated.isEnabled = isEnabled
-        if existingProvider?.baseURL != trimmedURL {
-            updated.healthStatus = .unknown
-            updated.lastErrorMessage = nil
-        }
-
-        let keyToApply: String?
-        if clearKey {
-            keyToApply = ""
-        } else if !apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            keyToApply = apiKeyInput
-        } else {
-            keyToApply = nil
-        }
-
-        onSave(updated, keyToApply)
-        dismiss()
-    }
-}
-
-// MARK: - Model Editor Sheet
-
-struct ModelEditorSheet: View {
-    @Environment(\.dismiss) private var dismiss
-
-    let providerID: UUID
-    let existingModel: ModelConfig?
-    let onSave: (ModelConfig) -> Void
-
-    @State private var modelID: String = ""
-    @State private var displayName: String = ""
-    @State private var hasPricing: Bool = true
-    @State private var inputPriceText: String = ""
-    @State private var outputPriceText: String = ""
-    @State private var contextWindow: Int = 128_000
-    @State private var capabilities: Set<ModelCapability> = [.chat]
-    @State private var defaultRole: ModelDefaultUsage = .general
-    @State private var qualityScore: Double = 75
-    @State private var speedScore: Double = 75
-    @State private var isEnabled: Bool = true
-    @State private var availability: ModelAvailabilityStatus = .available
-    @State private var validationError: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(existingModel == nil ? "添加模型" : "编辑模型")
-                .font(.title3.bold())
-
-            Form {
-                Section("基础信息") {
-                    TextField("上游 Model ID（如 gpt-4o-mini / claude-sonnet-4）", text: $modelID)
-                    TextField("展示名称（可选，默认同 Model ID）", text: $displayName)
-                    Picker("默认用途", selection: $defaultRole) {
-                        ForEach(ModelDefaultUsage.allCases, id: \.self) { role in
-                            Text(role.displayName).tag(role)
-                        }
-                    }
-                    Picker("可用状态", selection: $availability) {
-                        ForEach(ModelAvailabilityStatus.allCases, id: \.self) { st in
-                            Text(st.displayName).tag(st)
-                        }
-                    }
-                    Toggle("启用该模型参与路由", isOn: $isEnabled)
-                }
-
-                Section("价格设置（USD / 每百万 tokens）") {
-                    Toggle("配置模型单价（关闭后收据将显示“无法计算费用”）", isOn: $hasPricing)
-                    if hasPricing {
-                        TextField("输入单价 ($ / 1M tokens)", text: $inputPriceText)
-                        TextField("输出单价 ($ / 1M tokens)", text: $outputPriceText)
-                    }
-                }
-
-                Section("约束与能力标签") {
-                    Stepper("上下文上限: \(contextWindow) tokens", value: $contextWindow, in: 2048...2_000_000, step: 8192)
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("能力标签")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        FlowLayout(spacing: 8) {
-                            ForEach(ModelCapability.allCases, id: \.self) { cap in
-                                Toggle(cap.displayName, isOn: Binding(
-                                    get: { capabilities.contains(cap) },
-                                    set: { enabled in
-                                        if enabled { capabilities.insert(cap) } else { capabilities.remove(cap) }
-                                    }
-                                ))
-                                .toggleStyle(.checkbox)
-                            }
-                        }
-                    }
-                    HStack {
-                        Text("质量评分 (\(Int(qualityScore)))")
-                        Slider(value: $qualityScore, in: 10...100, step: 1)
-                    }
-                    HStack {
-                        Text("速度评分 (\(Int(speedScore)))")
-                        Slider(value: $speedScore, in: 10...100, step: 1)
-                    }
-                }
-            }
-            .formStyle(.grouped)
-
-            if let validationError {
-                Text(validationError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            HStack {
-                Spacer()
-                Button("取消") { dismiss() }
-                Button("保存模型") {
-                    save()
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(20)
-        .frame(width: 560, height: 620)
-        .onAppear {
-            if let existing = existingModel {
-                modelID = existing.modelID
-                displayName = existing.displayName
-                hasPricing = existing.hasCompletePricing
-                if let inp = existing.inputPricePerMillion {
-                    inputPriceText = String(inp)
-                }
-                if let out = existing.outputPricePerMillion {
-                    outputPriceText = String(out)
-                }
-                contextWindow = existing.contextWindow
-                capabilities = existing.capabilities
-                defaultRole = existing.defaultRole
-                qualityScore = Double(existing.qualityScore)
-                speedScore = Double(existing.speedScore)
-                isEnabled = existing.isEnabled
-                availability = existing.availabilityStatus
-            }
-        }
-    }
-
-    private func save() {
-        let trimmedID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedID.isEmpty else {
-            validationError = "请输入上游 Model ID。"
-            return
-        }
-
-        var inPrice: Double? = nil
-        var outPrice: Double? = nil
-        if hasPricing {
-            let trimmedIn = inputPriceText.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trimmedOut = outputPriceText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmedIn.isEmpty && trimmedOut.isEmpty {
-                hasPricing = false
-            } else {
-                guard let parsedIn = Double(trimmedIn), parsedIn >= 0,
-                      let parsedOut = Double(trimmedOut), parsedOut >= 0 else {
-                    validationError = "请输入有效的非负输入/输出单价，或关闭“配置模型单价”。"
-                    return
-                }
-                inPrice = parsedIn
-                outPrice = parsedOut
-            }
-        }
-
-        var updated = existingModel ?? ModelConfig(providerID: providerID, modelID: trimmedID)
-        updated.providerID = existingModel?.providerID ?? providerID
-        updated.modelID = trimmedID
-        updated.displayName = displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmedID : displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        updated.inputPricePerMillion = inPrice
-        updated.outputPricePerMillion = outPrice
-        updated.contextWindow = contextWindow
-        updated.capabilities = capabilities
-        updated.defaultRole = defaultRole
-        updated.qualityScore = Int(qualityScore)
-        updated.speedScore = Int(speedScore)
-        updated.isEnabled = isEnabled
-        updated.availabilityStatus = availability
-        if availability == .available {
-            updated.lastAvailabilityNote = nil
-        }
-
-        onSave(updated)
-        dismiss()
-    }
-}
-
-struct FlowLayout: Layout {
-    var spacing: CGFloat = 8
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let width = proposal.width ?? 400
-        var x: CGFloat = 0
-        var y: CGFloat = 0
-        var lineHeight: CGFloat = 0
-
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x + size.width > width && x > 0 {
-                x = 0
-                y += lineHeight + spacing
-                lineHeight = 0
-            }
-            lineHeight = max(lineHeight, size.height)
-            x += size.width + spacing
-        }
-        return CGSize(width: width, height: y + lineHeight)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX
-        var y = bounds.minY
-        var lineHeight: CGFloat = 0
-
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x + size.width > bounds.maxX && x > bounds.minX {
-                x = bounds.minX
-                y += lineHeight + spacing
-                lineHeight = 0
-            }
-            subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
-            lineHeight = max(lineHeight, size.height)
-            x += size.width + spacing
         }
     }
 }

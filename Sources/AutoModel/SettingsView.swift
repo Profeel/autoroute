@@ -7,29 +7,65 @@ struct SettingsView: View {
     @ObservedObject var engine: AutoModelEngine
     var onShowOnboarding: (() -> Void)? = nil
 
+    @State private var selectedSection: SettingsSection = .generalAndProxy
     @State private var portInput: String = ""
+    @State private var modelKeyInput: String = ""
+    @State private var modelKeyFeedback: String?
+    @State private var modelKeyFeedbackIsError = false
     @State private var feedbackMessage: String?
     @State private var launchAtLoginEnabled: Bool = (SMAppService.mainApp.status == .enabled)
     @State private var showClearHistoryConfirmation = false
+    @State private var isCheckingUpdate = false
+    @State private var updateCheckResult: UpdateCheckResult?
+
+    enum SettingsSection: String, CaseIterable {
+        case generalAndProxy = "通用与代理"
+        case budgetAndPrivacy = "预算与隐私"
+        case diagnosticsAndAbout = "诊断与关于"
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                if !engine.isLocalAPITokenPersistent {
-                    localTokenBlockingBanner
+        VStack(spacing: 0) {
+            HStack {
+                Picker("设置分组", selection: $selectedSection) {
+                    ForEach(SettingsSection.allCases, id: \.self) { section in
+                        Text(section.rawValue).tag(section)
+                    }
                 }
-                if engine.portSyncNeededForConnectedAgents {
-                    portSyncBanner
-                }
-                proxyConfigCard
-                localSimulatorCard
-                BudgetSettingsCard(engine: engine)
-                LocalMetricsSettingsCard(engine: engine)
-                probeAuditLogsCard
-                privacyAndDataCard
-                openSourceAboutCard
+                .pickerStyle(.segmented)
+                .frame(width: 300)
+                Spacer()
             }
-            .padding(20)
+            .padding(.horizontal, 20)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if !engine.isLocalAPITokenPersistent {
+                        localTokenBlockingBanner
+                    }
+                    if engine.portSyncNeededForConnectedAgents {
+                        portSyncBanner
+                    }
+
+                    switch selectedSection {
+                    case .generalAndProxy:
+                        proxyConfigCard
+                        localSimulatorCard
+                    case .budgetAndPrivacy:
+                        BudgetSettingsCard(engine: engine)
+                        LocalMetricsSettingsCard(engine: engine)
+                        privacyAndDataCard
+                    case .diagnosticsAndAbout:
+                        probeAuditLogsCard
+                        openSourceAboutCard
+                    }
+                }
+                .padding(20)
+            }
         }
         .navigationTitle("设置")
         .onAppear {
@@ -73,7 +109,12 @@ struct SettingsView: View {
                 Button("检查并重试保存凭据") {
                     do {
                         try engine.retryPersistingLocalAPIToken()
-                        feedbackMessage = "本地 API token 已持久化，现在可以启动代理并接入 Agent。"
+                        if !engine.proxyState.isRunning {
+                            engine.startProxy()
+                        }
+                        feedbackMessage = engine.proxyState.isRunning
+                            ? "本地 API token 已持久化，本地代理已启动。"
+                            : "本地 API token 已持久化，现在可以启动代理并接入 Agent。"
                     } catch {
                         feedbackMessage = "仍无法持久化本地凭据：\(error.localizedDescription)"
                     }
@@ -175,7 +216,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("本地 API 凭据")
                         .font(.callout.weight(.medium))
-                    Text("所有模型、对话和本地管理接口都需要此 token；供应商密钥使用独立 Keychain 条目。不要把 token 提交到 Git 或写入公开日志。")
+                    Text("管理 token 可访问模型和本地管理接口，现有自动配置的 Agent 继续使用它。自定义模型密钥仅可访问模型接口；供应商密钥使用独立 Keychain 条目。不要把密钥提交到 Git 或写入公开日志。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     HStack(spacing: 8) {
@@ -196,6 +237,78 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                }
+
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("自定义默认模型密钥")
+                        .font(.callout.weight(.medium))
+                    Text("可选；供手动接入的 Agent 使用。只允许 4–128 个英文字母、数字及 - . _ ~；较短密钥容易被本机其他程序猜中。清除后使用管理 token。更换或清除后，请更新使用旧密钥的客户端。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        SecureField("输入新模型密钥", text: $modelKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                        Button(engine.localModelAPIKey == nil ? "保存密钥" : "更换密钥") {
+                            do {
+                                try engine.setLocalModelAPIKey(modelKeyInput)
+                                modelKeyInput = ""
+                                modelKeyFeedbackIsError = false
+                                modelKeyFeedback = "模型密钥已保存并立即生效。"
+                            } catch {
+                                modelKeyFeedbackIsError = true
+                                modelKeyFeedback = "模型密钥保存失败：\(error.localizedDescription)"
+                            }
+                        }
+                        .disabled(!engine.isLocalAPITokenPersistent || modelKeyInput.isEmpty)
+                        Button("复制当前密钥") {
+                            guard let key = engine.manualAgentAPIKey else { return }
+                            copyToPasteboard(key)
+                            modelKeyFeedbackIsError = false
+                            modelKeyFeedback = "已复制当前密钥，请仅粘贴到受信任的本机客户端。"
+                        }
+                        .disabled(engine.manualAgentAPIKey == nil)
+                        Button("清除自定义密钥", role: .destructive) {
+                            do {
+                                try engine.clearLocalModelAPIKey()
+                                modelKeyInput = ""
+                                modelKeyFeedbackIsError = false
+                                modelKeyFeedback = "自定义模型密钥已清除。"
+                            } catch {
+                                modelKeyFeedbackIsError = true
+                                modelKeyFeedback = "模型密钥清除失败：\(error.localizedDescription)"
+                            }
+                        }
+                        .disabled(engine.localModelAPIKey == nil && engine.localModelAPIKeyError == nil)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    if let error = engine.localModelAPIKeyError {
+                        HStack {
+                            Text(error).foregroundStyle(.red)
+                            Button("重试读取") {
+                                do {
+                                    try engine.reloadLocalModelAPIKey()
+                                    modelKeyFeedbackIsError = false
+                                    modelKeyFeedback = "已重新读取模型密钥。"
+                                } catch {
+                                    modelKeyFeedbackIsError = true
+                                    modelKeyFeedback = "模型密钥读取失败：\(error.localizedDescription)"
+                                }
+                            }
+                            .disabled(!engine.isLocalAPITokenPersistent)
+                        }
+                        .font(.caption)
+                    } else {
+                        Text(engine.localModelAPIKey == nil ? "当前：管理 token（可访问本地管理接口）" : "当前：自定义模型密钥（仅模型接口）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let modelKeyFeedback {
+                        Text(modelKeyFeedback)
+                            .font(.caption)
+                            .foregroundStyle(modelKeyFeedbackIsError ? Color.red : Color.secondary)
+                    }
                 }
 
                 Toggle("打开 App 时自动启动本地代理", isOn: Binding(
@@ -313,6 +426,44 @@ struct SettingsView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 Toggle(isOn: Binding(
+                    get: { engine.config.privacySettings.enableSystemNotifications },
+                    set: { engine.setSystemNotificationsEnabled($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("异常与预算预警发送 macOS 系统通知")
+                            .font(.callout.weight(.medium))
+                        Text("预算达到预警/硬上限、供应商密钥鉴权失败、档位全部冷却或端口冲突时主动提醒（同类事件 15 分钟内防刷屏）。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Divider()
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("SQLite 历史保留周期")
+                            .font(.callout.weight(.medium))
+                        Text("当前已持久化 \(engine.totalStoredRecordCount()) 条调用明细（WAL 模式按单条增量追加，首页默认展示最近 500 条）。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { engine.config.privacySettings.historyRetentionDays },
+                        set: { engine.setHistoryRetentionDays($0) }
+                    )) {
+                        Text("30 天").tag(30)
+                        Text("90 天").tag(90)
+                        Text("365 天").tag(365)
+                        Text("永久保留").tag(0)
+                    }
+                    .frame(width: 120)
+                }
+
+                Divider()
+
+                Toggle(isOn: Binding(
                     get: { engine.config.privacySettings.recordRequestBody },
                     set: { engine.setRecordRequestBody($0) }
                 )) {
@@ -355,7 +506,8 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("配置文件路径（不含任何 API Key）: \(engine.persistence.configFileURL.path)")
-                    Text("调用历史路径: \(engine.persistence.historyFileURL.path)")
+                    Text("SQLite 历史库路径 (WAL): \(engine.persistence.historyDBFileURL.path)")
+                    Text("调用历史镜像路径: \(engine.persistence.historyFileURL.path)")
                 }
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
@@ -394,12 +546,54 @@ struct SettingsView: View {
 
     private var openSourceAboutCard: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("AutoRoute · 开源 macOS 本地多模型路由器 (MIT License)")
-                    .font(.callout.weight(.semibold))
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("AutoRoute v\(UpdateCheckService.currentAppVersion()) · 开源 macOS 本地多模型路由器 (MIT License)")
+                        .font(.callout.weight(.semibold))
+                    Spacer()
+                    Button(isCheckingUpdate ? "检查中…" : "检查更新") {
+                        Task {
+                            isCheckingUpdate = true
+                            updateCheckResult = await UpdateCheckService.checkForUpdates()
+                            isCheckingUpdate = false
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isCheckingUpdate)
+                }
+
+                if let result = updateCheckResult {
+                    switch result {
+                    case .upToDate(let current):
+                        Text("当前已是最新版本 (v\(current))。")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    case .updateAvailable(let current, let release):
+                        HStack(spacing: 8) {
+                            Text("发现新版本 v\(release.version)（当前 v\(current)）")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.orange)
+                            Button("前往 GitHub Release 下载") {
+                                NSWorkspace.shared.open(release.releaseURL)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                        }
+                    case .noPublishedRelease(let current):
+                        Text("当前版本 v\(current)；GitHub 仓库尚未创建正式公开 Release。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .failed(let msg):
+                        Text(msg)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
                 Text("• 开源版无需注册账号、不依赖托管中转服务、不发送遥测数据。")
-                Text("• 本机兼容接口：`POST /v1/chat/completions`（OpenAI Chat Completions 普通与流式）、`POST /v1/messages`（Anthropic Messages 普通与流式）、`POST /v1/responses`（OpenAI Responses 普通与流式）及 `GET /v1/models`。")
-                Text("• 思考模型兼容：自动分离并透传 `reasoning_content` / `reasoning`，避免冷启动误判。")
+                Text("• 本机兼容接口：`POST /v1/chat/completions`（OpenAI Chat Completions 普通与流式）、`POST /v1/messages`（Anthropic Messages 原生透传与兼容转换）、`POST /v1/responses`（OpenAI Responses 原生透传与兼容转换）及 `GET /v1/models`。")
+                Text("• 思考模型与 Prompt 缓存兼容：自动分离透传 `reasoning_content` / `thinking`，精准解析并计费缓存读写 Token。")
                 Text("• 已知限制：暂未实现 `/v1/embeddings` 与图片生成接口；跨协议转换以文本与 Tool Calls 为主。")
                 if let onShowOnboarding {
                     Button("查看首次使用引导") {
@@ -414,7 +608,7 @@ struct SettingsView: View {
             .foregroundStyle(.secondary)
             .padding(6)
         } label: {
-            Label("开源说明与兼容范围", systemImage: "info.circle")
+            Label("开源说明与版本更新", systemImage: "info.circle")
                 .font(.headline)
         }
     }

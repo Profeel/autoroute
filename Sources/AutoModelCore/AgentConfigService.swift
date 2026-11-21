@@ -92,6 +92,8 @@ public final class AgentConfigService: @unchecked Sendable {
             return homeDirectory.appendingPathComponent(".hermes/config.yaml")
         case .claudeCode:
             return homeDirectory.appendingPathComponent(".claude/settings.json")
+        case .deepseekHarness:
+            return homeDirectory.appendingPathComponent(".dsh/profiles/desktop/cordis.patch.yml")
         case .shellAndContinue:
             return homeDirectory.appendingPathComponent(".automodel/agent-env.sh")
         }
@@ -99,6 +101,10 @@ public final class AgentConfigService: @unchecked Sendable {
 
     private func continueConfigURL() -> URL {
         homeDirectory.appendingPathComponent(".continue/config.json")
+    }
+
+    public func dshCredentialsURL() -> URL {
+        homeDirectory.appendingPathComponent(".dsh/.credentials.yaml")
     }
 
     private func manifestURL() -> URL {
@@ -132,14 +138,12 @@ public final class AgentConfigService: @unchecked Sendable {
                 )
             }
             let providerKey = extractTopLevelTOMLString(text: text, key: "model_provider")
-            let providerBase = extractTOMLSectionString(text: text, section: "model_providers.autoroute", key: "base_url")
-                ?? extractTOMLSectionString(text: text, section: "model_providers.automodel", key: "base_url")
-            let base = providerBase ?? extractTopLevelTOMLString(text: text, key: "openai_base_url")
+            let base = providerKey.flatMap {
+                extractTOMLSectionString(text: text, section: "model_providers.\($0)", key: "base_url")
+            }
             let model = extractTopLevelTOMLString(text: text, key: "model")
-            let connected = providerKey == "autoroute"
-                || isPointingAtAutoModel(baseURL: base, port: proxyPort)
-                || text.contains("# autoroute:")
-                || text.contains("# automodel:")
+            let connected = (providerKey == "autoroute" || providerKey == "automodel")
+                && isPointingAtAutoModel(baseURL: base, port: proxyPort, requiresV1: true)
             return AgentIntegrationStatus(
                 kind: kind,
                 configFilePath: configURL.path,
@@ -182,7 +186,7 @@ public final class AgentConfigService: @unchecked Sendable {
                     activeBase = b
                 }
             }
-            let connected = (model?.hasPrefix("automodel/") == true) && isPointingAtAutoModel(baseURL: autoBase, port: proxyPort)
+            let connected = (model?.hasPrefix("automodel/") == true) && isPointingAtAutoModel(baseURL: autoBase, port: proxyPort, requiresV1: true)
             let summary = [model, smallModel.map { "轻量: \($0)" }].compactMap { $0 }.joined(separator: " | ")
             return AgentIntegrationStatus(
                 kind: kind,
@@ -209,7 +213,7 @@ public final class AgentConfigService: @unchecked Sendable {
                 )
             }
             let parsed = inspectHermesYAML(text: text)
-            let connected = (parsed.provider == "automodel") && isPointingAtAutoModel(baseURL: parsed.baseURL, port: proxyPort)
+            let connected = (parsed.provider == "automodel") && isPointingAtAutoModel(baseURL: parsed.baseURL, port: proxyPort, requiresV1: true)
             return AgentIntegrationStatus(
                 kind: kind,
                 configFilePath: configURL.path,
@@ -258,6 +262,40 @@ public final class AgentConfigService: @unchecked Sendable {
                     : "检测到 ~/.claude/settings.json，可保留 hooks 并一键接入本地 /v1/messages 转换网关。"
             )
 
+        case .deepseekHarness:
+            let desktopDirExists = fileManager.fileExists(atPath: homeDirectory.appendingPathComponent(".dsh/profiles/desktop").path)
+            let dshDirExists = fileManager.fileExists(atPath: homeDirectory.appendingPathComponent(".dsh").path)
+            let fileExists = fileManager.fileExists(atPath: configURL.path)
+            let installed = desktopDirExists || dshDirExists || fileExists
+            let patchText = fileExists ? (try? String(contentsOf: configURL, encoding: .utf8)) : nil
+            let credsText = try? String(contentsOf: dshCredentialsURL(), encoding: .utf8)
+            let parsed = DeepSeekHarnessConfigSupport.inspect(patchText: patchText, credentialsText: credsText)
+            let pointsAtProxy = isPointingAtAutoModel(baseURL: parsed.automodelBaseURL, port: proxyPort, requiresV1: true)
+            let connected = (parsed.defaultProvider == DeepSeekHarnessConfigSupport.providerID)
+                && pointsAtProxy
+                && parsed.hasCredentialRef
+            let summary = [parsed.defaultProvider, parsed.defaultModel].compactMap { $0 }.joined(separator: "/")
+            let note: String
+            if connected {
+                note = "已注册 automodel 供应商并写入凭据引用 \(parsed.automodelAPIKeyEnv ?? DeepSeekHarnessConfigSupport.credentialRefName) 到 ~/.dsh/.credentials.yaml。"
+            } else if parsed.defaultProvider == DeepSeekHarnessConfigSupport.providerID && pointsAtProxy && !parsed.hasCredentialRef {
+                note = "配置已指向 AutoRoute，但 ~/.dsh/.credentials.yaml 缺少凭据引用 \(parsed.automodelAPIKeyEnv ?? DeepSeekHarnessConfigSupport.credentialRefName)；请重新一键写入。"
+            } else if installed {
+                note = "检测到 DeepSeek Harness (~/.dsh)，保留其他插件配置与登录态，可一键接入 AutoRoute。"
+            } else {
+                note = "未检测到 ~/.dsh/profiles/desktop；仍可点击「一键设置」预生成 DeepSeek Harness 配置。"
+            }
+            return AgentIntegrationStatus(
+                kind: kind,
+                configFilePath: configURL.path,
+                isInstalled: installed,
+                isConnectedToAutoModel: connected,
+                hasBackup: hasBackup,
+                currentBaseURL: parsed.automodelBaseURL,
+                currentModelSummary: summary.isEmpty ? nil : summary,
+                statusNote: note
+            )
+
         case .shellAndContinue:
             let scriptExists = fileManager.fileExists(atPath: configURL.path)
             let continueURL = continueConfigURL()
@@ -271,7 +309,7 @@ public final class AgentConfigService: @unchecked Sendable {
                 let high = extractExportValue(in: content, name: "AUTOMODEL_HIGH_MODEL") ?? "auto/high"
                 modelSummary = "低:\(low) | 中:\(med) | 高:\(high)"
             }
-            let connected = scriptExists && isPointingAtAutoModel(baseURL: currentBase, port: proxyPort)
+            let connected = scriptExists && isPointingAtAutoModel(baseURL: currentBase, port: proxyPort, requiresV1: true)
             let note = continueExists
                 ? "检测到 Continue 配置 (~/.continue/config.json)，应用时将同步注入并生成 ~/.automodel/agent-env.sh。"
                 : "生成 source ~/.automodel/agent-env.sh 环境变量，适用于 Cursor、Aider 及各类 CLI。"
@@ -290,6 +328,10 @@ public final class AgentConfigService: @unchecked Sendable {
 
     // MARK: - Apply & Restore
 
+    public func configurationUpdatedAt(for kind: AgentKind) -> Date? {
+        (try? fileManager.attributesOfItem(atPath: primaryConfigURL(for: kind).path)[.modificationDate]) as? Date
+    }
+
     public func previewAgentConfig(
         kind: AgentKind,
         binding: AgentModelBinding,
@@ -303,6 +345,7 @@ public final class AgentConfigService: @unchecked Sendable {
         let scratchHome = fileManager.temporaryDirectory.appendingPathComponent("AutoModelPreview-\(UUID().uuidString)", isDirectory: true)
         let scratchBackup = scratchHome.appendingPathComponent("_backups", isDirectory: true)
         defer { try? fileManager.removeItem(at: scratchHome) }
+        try fileManager.createDirectory(at: scratchHome, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 
         let previewService = AgentConfigService(homeDirectory: scratchHome, backupDirectory: scratchBackup)
         let targetURL = previewService.primaryConfigURL(for: kind)
@@ -310,6 +353,14 @@ public final class AgentConfigService: @unchecked Sendable {
             try fileManager.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try Data(contentsOf: originalURL)
             try data.write(to: targetURL)
+        }
+        if kind == .deepseekHarness {
+            let origCreds = dshCredentialsURL()
+            if fileManager.fileExists(atPath: origCreds.path) {
+                let targetCreds = previewService.dshCredentialsURL()
+                try fileManager.createDirectory(at: targetCreds.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(contentsOf: origCreds).write(to: targetCreds)
+            }
         }
         _ = try previewService.applyAgentConfig(
             kind: kind,
@@ -349,6 +400,14 @@ public final class AgentConfigService: @unchecked Sendable {
             try applyHermesConfig(at: configURL, baseURL: baseURL, binding: binding, localAPIToken: localAPIToken)
         case .claudeCode:
             try applyClaudeCodeConfig(at: configURL, baseURL: baseURL, binding: binding, localAPIToken: localAPIToken)
+        case .deepseekHarness:
+            try applyDeepSeekHarnessConfig(
+                at: configURL,
+                baseURL: baseURL,
+                binding: binding,
+                localAPIToken: localAPIToken,
+                tierLabels: resolvedTierDisplayNames
+            )
         case .shellAndContinue:
             try applyShellAndContinue(envURL: configURL, baseURL: baseURL, binding: binding, localAPIToken: localAPIToken)
         }
@@ -390,9 +449,14 @@ public final class AgentConfigService: @unchecked Sendable {
                 try restoreHermesConfig(at: targetURL, originalData: originalData)
             case .claudeCode:
                 try restoreClaudeCodeConfig(at: targetURL, originalData: originalData)
+            case .deepseekHarness:
+                try restoreDeepSeekHarnessPatch(at: targetURL, originalData: originalData)
             case .shellAndContinue:
                 try restoreShellEnvironment(at: targetURL, originalData: originalData)
             }
+        }
+        if kind == .deepseekHarness {
+            try restoreDeepSeekHarnessCredentials(at: dshCredentialsURL())
         }
         if kind == .shellAndContinue {
             try restoreContinueConfig(at: continueConfigURL())
@@ -403,6 +467,8 @@ public final class AgentConfigService: @unchecked Sendable {
         }
         try? fileManager.removeItem(at: backupFileURL)
         try? fileManager.removeItem(at: backupDirectory.appendingPathComponent("continue_config.json.bak"))
+        try? fileManager.removeItem(at: backupDirectory.appendingPathComponent("dsh_credentials.yaml.bak"))
+        try? fileManager.removeItem(at: backupDirectory.appendingPathComponent("dsh_credentials_state.json"))
         try? fileManager.removeItem(at: managedSnapshotURL(for: kind))
         try? fileManager.removeItem(at: managedContinueSnapshotURL())
 
@@ -997,6 +1063,80 @@ public final class AgentConfigService: @unchecked Sendable {
         try outData.write(to: url, options: .atomic)
     }
 
+    private func applyDeepSeekHarnessConfig(
+        at patchURL: URL,
+        baseURL: String,
+        binding: AgentModelBinding,
+        localAPIToken: String,
+        tierLabels: [ModelTier: String]
+    ) throws {
+        try fileManager.createDirectory(at: patchURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let existingPatch = fileManager.fileExists(atPath: patchURL.path)
+            ? try String(contentsOf: patchURL, encoding: .utf8)
+            : nil
+        let nextPatch = try DeepSeekHarnessConfigSupport.applyPatch(
+            existingText: existingPatch,
+            baseURL: baseURL,
+            binding: binding,
+            tierLabels: tierLabels
+        )
+
+        let credsURL = dshCredentialsURL()
+        let credsStateURL = backupDirectory.appendingPathComponent("dsh_credentials_state.json")
+        let credsBakURL = backupDirectory.appendingPathComponent("dsh_credentials.yaml.bak")
+        if !fileManager.fileExists(atPath: credsStateURL.path) {
+            try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
+            let credsExisted = fileManager.fileExists(atPath: credsURL.path)
+            if credsExisted {
+                try Data(contentsOf: credsURL).write(to: credsBakURL, options: .atomic)
+            }
+            let stateData = try JSONSerialization.data(withJSONObject: ["originalFileExisted": credsExisted])
+            try stateData.write(to: credsStateURL, options: .atomic)
+        }
+
+        let existingCreds = fileManager.fileExists(atPath: credsURL.path)
+            ? try String(contentsOf: credsURL, encoding: .utf8)
+            : nil
+        let nextCreds = try DeepSeekHarnessConfigSupport.upsertCredentialRef(
+            existingText: existingCreds,
+            secretValue: localAPIToken
+        )
+
+        try DeepSeekHarnessConfigSupport.writeOwnerOnlyFile(nextCreds, to: credsURL, fileManager: fileManager)
+        try nextPatch.write(to: patchURL, atomically: true, encoding: .utf8)
+    }
+
+    private func restoreDeepSeekHarnessPatch(at url: URL, originalData: Data?) throws {
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        let currentText = try String(contentsOf: url, encoding: .utf8)
+        let originalText = originalData.flatMap { String(data: $0, encoding: .utf8) }
+        if let restored = try DeepSeekHarnessConfigSupport.restorePatch(currentText: currentText, originalText: originalText) {
+            try restored.write(to: url, atomically: true, encoding: .utf8)
+        } else {
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
+    private func restoreDeepSeekHarnessCredentials(at credsURL: URL) throws {
+        guard fileManager.fileExists(atPath: credsURL.path) else { return }
+        let credsStateURL = backupDirectory.appendingPathComponent("dsh_credentials_state.json")
+        var originalExisted = true
+        if let stateData = try? Data(contentsOf: credsStateURL),
+           let obj = try? JSONSerialization.jsonObject(with: stateData) as? [String: Any],
+           let existed = obj["originalFileExisted"] as? Bool {
+            originalExisted = existed
+        }
+        let currentCreds = try String(contentsOf: credsURL, encoding: .utf8)
+        if let updated = DeepSeekHarnessConfigSupport.removeCredentialRef(
+            existingText: currentCreds,
+            originalFileExisted: originalExisted
+        ) {
+            try DeepSeekHarnessConfigSupport.writeOwnerOnlyFile(updated, to: credsURL, fileManager: fileManager)
+        } else {
+            try? fileManager.removeItem(at: credsURL)
+        }
+    }
+
     private func applyShellAndContinue(envURL: URL, baseURL: String, binding: AgentModelBinding, localAPIToken: String) throws {
         try fileManager.createDirectory(at: envURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let script = """
@@ -1043,10 +1183,13 @@ public final class AgentConfigService: @unchecked Sendable {
 
     // MARK: - Text Parsing / Editing Utilities
 
-    private func isPointingAtAutoModel(baseURL: String?, port: Int) -> Bool {
-        guard let baseURL else { return false }
-        let lower = baseURL.lowercased()
-        return lower.contains("127.0.0.1:\(port)") || lower.contains("localhost:\(port)")
+    private func isPointingAtAutoModel(baseURL: String?, port: Int, requiresV1: Bool = false) -> Bool {
+        guard let baseURL, let url = URLComponents(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.scheme?.lowercased() == "http", let host = url.host?.lowercased(),
+              host == "127.0.0.1" || host == "localhost",
+              url.port == port, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else { return false }
+        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return path == "v1" || (!requiresV1 && path.isEmpty)
     }
 
     private func isTopLevelTOMLKey(line trimmed: String, key: String) -> Bool {

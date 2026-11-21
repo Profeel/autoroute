@@ -347,6 +347,24 @@ final class P0SecurityTests: XCTestCase {
     }
 
     @MainActor
+    func testRecoveryAfterKeychainReadCancellationPreservesExistingToken() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AutoRouteKeychainRecovery-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let keychain = ThrowingLocalTokenKeychain()
+        try keychain.setLocalAPIToken("existing-test-token")
+        keychain.failLocalTokenReads = true
+        let engine = AutoModelEngine(persistence: LocalPersistenceStore(baseDirectoryURL: directory), keychain: keychain, autoStartProxyIfConfigured: false)
+        XCTAssertFalse(engine.isLocalAPITokenPersistent)
+        keychain.failLocalTokenReads = false
+        let readsBeforeRetry = keychain.localTokenReadCount
+        try engine.retryPersistingLocalAPIToken()
+        XCTAssertEqual(keychain.localTokenReadCount - readsBeforeRetry, 1, "An existing token only needs one Keychain read per retry")
+        XCTAssertEqual(try keychain.getLocalAPIToken(), "existing-test-token")
+        XCTAssertEqual(engine.localAPIToken, "existing-test-token")
+        XCTAssertTrue(engine.isLocalAPITokenPersistent)
+    }
+
+    @MainActor
     func testUnpersistedLocalTokenBlocksAutoProxyAndAgentWritesUntilRecovery() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AutoRouteTokenPersistence-\(UUID().uuidString)", isDirectory: true)
@@ -410,6 +428,8 @@ final class P0SecurityTests: XCTestCase {
 
 private final class ThrowingLocalTokenKeychain: KeychainServiceProtocol, @unchecked Sendable {
     var failLocalTokenWrites = false
+    var failLocalTokenReads = false
+    private(set) var localTokenReadCount = 0
     private var keys: [UUID: String] = [:]
     private var localToken: String?
 
@@ -427,7 +447,14 @@ private final class ThrowingLocalTokenKeychain: KeychainServiceProtocol, @unchec
         localToken = token
     }
 
-    func getLocalAPIToken() throws -> String? { localToken }
+    func getLocalAPIToken() throws -> String? {
+        localTokenReadCount += 1
+        if failLocalTokenReads { throw KeychainError.unexpectedStatus(errSecUserCanceled) }
+        return localToken
+    }
+    func setLocalModelAPIKey(_ key: String) throws {}
+    func getLocalModelAPIKey() throws -> String? { nil }
+    func deleteLocalModelAPIKey() throws {}
     func allKnownSecretValues() -> [String] { Array(keys.values) + [localToken].compactMap { $0 } }
     func clearAll() throws { keys.removeAll(); localToken = nil }
 }

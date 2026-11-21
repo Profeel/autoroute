@@ -4,28 +4,60 @@ public struct DiscoveredProviderEntry: Sendable {
     public var name: String
     public var baseURL: String
     public var apiKey: String?
+    public var apiKeys: [String]
     public var source: String
     public var models: [DiscoveredModelEntry]
     public var apiProtocol: ProviderProtocol
     public var accountID: String?
+    public var customHeaders: [String: String]
+    public var passThroughHeaderNames: [String]
+    public var proxyURL: String?
+    public var presetID: String?
+    public var codexAccounts: [CodexSubscriptionAccount]
 
     public init(
         name: String,
         baseURL: String,
         apiKey: String?,
+        apiKeys: [String]? = nil,
         source: String,
         models: [DiscoveredModelEntry],
         apiProtocol: ProviderProtocol = .openAIChatCompletions,
-        accountID: String? = nil
+        accountID: String? = nil,
+        customHeaders: [String: String] = [:],
+        passThroughHeaderNames: [String] = [],
+        proxyURL: String? = nil,
+        presetID: String? = nil,
+        codexAccounts: [CodexSubscriptionAccount] = []
     ) {
+        let normalizedKeys: [String]
+        if let apiKeys {
+            normalizedKeys = APIKeyPoolCodec.normalize(apiKeys)
+        } else if let apiKey {
+            normalizedKeys = APIKeyPoolCodec.normalize([apiKey])
+        } else if !codexAccounts.isEmpty {
+            normalizedKeys = APIKeyPoolCodec.normalize(codexAccounts.map(\.accessToken))
+        } else {
+            normalizedKeys = []
+        }
         self.name = name
         self.baseURL = baseURL
-        self.apiKey = apiKey
+        self.apiKeys = normalizedKeys
+        self.apiKey = normalizedKeys.first
         self.source = source
         self.models = models
         self.apiProtocol = apiProtocol
-        self.accountID = accountID
+        self.accountID = accountID ?? codexAccounts.first?.accountID
+        self.customHeaders = customHeaders
+        self.passThroughHeaderNames = passThroughHeaderNames
+        self.proxyURL = proxyURL?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.presetID = presetID
+        self.codexAccounts = codexAccounts
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 public struct DiscoveredModelEntry: Sendable {
@@ -76,12 +108,29 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
 
             let key = "\(norm)|\(incoming.apiProtocol.rawValue)"
             if var existing = providersByBaseURL[key] {
-                if (existing.apiKey == nil || existing.apiKey?.isEmpty == true),
-                   let newKey = incoming.apiKey, !newKey.isEmpty {
-                    existing.apiKey = newKey
+                let mergedKeys = APIKeyPoolCodec.normalize(existing.apiKeys + incoming.apiKeys)
+                existing.apiKeys = mergedKeys
+                existing.apiKey = mergedKeys.first
+                if !incoming.codexAccounts.isEmpty {
+                    existing.codexAccounts = CodexAccountPoolCodec.mergeAccounts(
+                        existing: existing.codexAccounts,
+                        incoming: incoming.codexAccounts
+                    )
                 }
                 if existing.accountID == nil, let acct = incoming.accountID, !acct.isEmpty {
                     existing.accountID = acct
+                }
+                for (hk, hv) in incoming.customHeaders where existing.customHeaders[hk] == nil {
+                    existing.customHeaders[hk] = hv
+                }
+                for headerName in incoming.passThroughHeaderNames where !existing.passThroughHeaderNames.contains(where: { $0.caseInsensitiveCompare(headerName) == .orderedSame }) {
+                    existing.passThroughHeaderNames.append(headerName)
+                }
+                if existing.proxyURL == nil, let proxy = incoming.proxyURL {
+                    existing.proxyURL = proxy
+                }
+                if existing.presetID == nil, let preset = incoming.presetID {
+                    existing.presetID = preset
                 }
                 if !existing.source.contains(incoming.source) {
                     existing.source += ", \(incoming.source)"
@@ -300,52 +349,22 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
             return nil
         }
 
-        // Collect available Codex models from models_cache*.json
-        var modelSlugs: [String] = []
-        var slugSet = Set<String>()
-        for cacheName in ["models_cache.json", "models_cache.local.json", "models_cache.codex_work_desktop.json"] {
-            let cacheURL = codexDir.appendingPathComponent(cacheName)
-            guard let data = try? Data(contentsOf: cacheURL),
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let models = root["models"] as? [[String: Any]] else {
-                continue
-            }
-            for item in models {
-                guard let slug = (item["slug"] as? String) ?? (item["id"] as? String),
-                      !slug.isEmpty,
-                      !isRecursiveAutoModelID(slug) else {
-                    continue
-                }
-                let visibility = (item["visibility"] as? String)?.lowercased() ?? "list"
-                if visibility == "hide" || slug == "codex-auto-review" {
-                    continue
-                }
-                if slugSet.insert(slug).inserted {
-                    modelSlugs.append(slug)
-                }
-            }
-            if !modelSlugs.isEmpty { break }
-        }
+        let modelSlugs = CodexAuthFileParser.collectModelSlugs(codexDir: codexDir)
+            .filter { !isRecursiveAutoModelID($0) }
 
-        if modelSlugs.isEmpty {
-            modelSlugs = ["gpt-5.4", "gpt-5.3-codex", "codex-mini-latest"]
-        }
-
-        if let tokens = authRoot["tokens"] as? [String: Any],
-           let accessToken = (tokens["access_token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !accessToken.isEmpty {
-            let accountID = (tokens["account_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let account = CodexAuthFileParser.parseAuthFile(at: authURL) {
             let models = modelSlugs.map {
                 buildDiscoveredModel(modelID: $0, metadata: [:], source: "codex/auth.json")
             }
             return DiscoveredProviderEntry(
                 name: "Codex 订阅 (ChatGPT)",
                 baseURL: "https://chatgpt.com/backend-api/codex",
-                apiKey: accessToken,
+                apiKey: account.accessToken,
                 source: "codex/auth.json",
                 models: models,
                 apiProtocol: .codexChatGPT,
-                accountID: (accountID?.isEmpty == false) ? accountID : nil
+                accountID: account.accountID,
+                codexAccounts: [account]
             )
         }
 
@@ -454,8 +473,18 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
     }
 
     private func parseMagpieProviders(at url: URL) -> [DiscoveredProviderEntry] {
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let data = try? Data(contentsOf: url) else {
+            return []
+        }
+        return Self.parseMagpieProviders(from: data, sourceLabel: "magpie/providers.json", requireAPIKey: true)
+    }
+
+    public static func parseMagpieProviders(
+        from data: Data,
+        sourceLabel: String = "magpie/providers.json",
+        requireAPIKey: Bool = true
+    ) -> [DiscoveredProviderEntry] {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let providers = root["providers"] as? [[String: Any]] else {
             return []
         }
@@ -464,23 +493,30 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
         for p in providers {
             if (p["off"] as? Bool) == true { continue }
             let id = (p["id"] as? String) ?? ""
-            if id.isEmpty || id.lowercased() == "automodel" { continue }
+            if id.isEmpty || id.lowercased() == "automodel" || id.lowercased() == "autoroute" { continue }
 
-            var resolvedKey = (p["key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if (resolvedKey == nil || resolvedKey?.isEmpty == true),
-               let keysArr = p["keys"] as? [String] {
-                resolvedKey = keysArr.first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            var rawKeys: [String] = []
+            if let singleKey = p["key"] as? String {
+                rawKeys.append(singleKey)
             }
-            guard let apiKey = resolvedKey, !apiKey.isEmpty else { continue }
+            if let keysArr = p["keys"] as? [String] {
+                rawKeys.append(contentsOf: keysArr)
+            }
+            let apiKeys = APIKeyPoolCodec.normalize(rawKeys)
+            if requireAPIKey && apiKeys.isEmpty { continue }
 
             let chatURL = (p["chat"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let responsesURL = (p["responses"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let anthropicURL = (p["anthropic"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawModels = (p["models"] as? [String] ?? []).filter { !$0.isEmpty && !isRecursiveAutoModelIDStatic($0) }
+            let modelsAreClaudeOnly = !rawModels.isEmpty && rawModels.allSatisfy { $0.lowercased().contains("claude") }
 
             let baseURL: String
             let proto: ProviderProtocol
-            if let chatURL, !chatURL.isEmpty {
+            if modelsAreClaudeOnly, let anthropicURL, !anthropicURL.isEmpty {
+                baseURL = anthropicURL
+                proto = .anthropicMessages
+            } else if let chatURL, !chatURL.isEmpty {
                 baseURL = chatURL
                 proto = .openAIChatCompletions
             } else if let responsesURL, !responsesURL.isEmpty {
@@ -493,18 +529,49 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
                 continue
             }
 
-            let rawModels = p["models"] as? [String] ?? []
-            let models = rawModels.filter { !$0.isEmpty && !isRecursiveAutoModelID($0) }.map {
-                buildDiscoveredModel(modelID: $0, metadata: [:], source: "magpie/providers.json")
+            var customHeaders: [String: String] = [:]
+            if let hdrs = p["headers"] as? [String: Any] {
+                for (k, v) in hdrs {
+                    let cleanKey = k.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let cleanVal = String(describing: v).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleanKey.isEmpty && !cleanVal.isEmpty {
+                        customHeaders[cleanKey] = cleanVal
+                    }
+                }
             }
+            let passHeaders = (p["passHeaders"] as? [String] ?? [])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let proxyURL = (p["proxy"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+
+            let contextsDict = p["contexts"] as? [String: Any]
+            let wildcardContext = (contextsDict?["*"] as? Int) ?? (contextsDict?["*"] as? NSNumber)?.intValue
+
+            let models = rawModels.map { modelID -> DiscoveredModelEntry in
+                var entry = buildDiscoveredModelStatic(modelID: modelID, metadata: [:], source: sourceLabel)
+                if let exactCtx = (contextsDict?[modelID] as? Int) ?? (contextsDict?[modelID] as? NSNumber)?.intValue,
+                   exactCtx >= 1024 {
+                    entry.contextWindow = exactCtx
+                } else if let wildcardContext, wildcardContext >= 1024 {
+                    entry.contextWindow = wildcardContext
+                }
+                return entry
+            }
+
             let displayName = (p["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? id
+            let matchedPresetID = ProviderPresetCatalog.matchPreset(baseURL: baseURL, name: id)?.id
             entries.append(DiscoveredProviderEntry(
                 name: displayName,
                 baseURL: baseURL,
-                apiKey: apiKey,
-                source: "magpie/providers.json",
+                apiKey: apiKeys.first,
+                apiKeys: apiKeys,
+                source: sourceLabel,
                 models: models,
-                apiProtocol: proto
+                apiProtocol: proto,
+                customHeaders: customHeaders,
+                passThroughHeaderNames: passHeaders,
+                proxyURL: proxyURL,
+                presetID: matchedPresetID
             ))
         }
         return entries
@@ -676,6 +743,10 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
 
     // MARK: - Model Metadata Inference
 
+    public static func buildDiscoveredModelPublic(modelID: String, metadata: [String: Any] = [:], source: String) -> DiscoveredModelEntry {
+        buildDiscoveredModelStatic(modelID: modelID, metadata: metadata, source: source)
+    }
+
     private func buildDiscoveredModel(modelID: String, metadata: [String: Any], source: String) -> DiscoveredModelEntry {
         Self.buildDiscoveredModelStatic(modelID: modelID, metadata: metadata, source: source)
     }
@@ -687,7 +758,7 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
         let outputPrice = costDict?["output"] as? Double ?? (costDict?["output"] as? Int).map(Double.init)
 
         let limitDict = metadata["limit"] as? [String: Any]
-        let contextWindow = (limitDict?["context"] as? Int) ?? 128_000
+        let contextWindow = (limitDict?["context"] as? Int) ?? (modelID.lowercased().contains("gpt-5") ? 272_000 : 128_000)
 
         let modalitiesDict = metadata["modalities"] as? [String: Any]
         let inputMods = modalitiesDict?["input"] as? [String] ?? []
@@ -699,10 +770,10 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
         if inputMods.contains("image") || lower.contains("vision") || lower.contains("image") || lower.contains("gpt-") || lower.contains("claude-") || lower.contains("gemini-") {
             caps.insert(.vision)
         }
-        if hasReasoningFlag || hasVariants || lower.contains("opus") || lower.contains("pro") || lower.contains("reasoning") || lower.contains("k3") || lower.contains("gpt-6") {
+        if hasReasoningFlag || hasVariants || lower.contains("opus") || lower.contains("pro") || lower.contains("reasoning") || lower.contains("k3") || lower.contains("gpt-6") || lower.contains("gpt-5") || lower.contains("codex") || lower.hasPrefix("o3") || lower.hasPrefix("o4") {
             caps.insert(.reasoning)
         }
-        if lower.contains("coder") || lower.contains("code") || lower.contains("codex") || lower.contains("sonnet") || lower.contains("opus") || lower.contains("glm-5.3") {
+        if lower.contains("coder") || lower.contains("code") || lower.contains("codex") || lower.contains("gpt-5") || lower.contains("sonnet") || lower.contains("opus") || lower.contains("glm-5.3") {
             caps.insert(.coding)
         }
         if lower.contains("gpt-") || lower.contains("claude-") || lower.contains("gemini-") || lower.contains("glm-") || lower.contains("deepseek") {
@@ -713,25 +784,25 @@ public final class LocalModelDiscoveryService: @unchecked Sendable {
         let quality: Int
         let speed: Int
 
-        if lower.contains("flash") || lower.contains("lite") || lower.contains("haiku") || lower.contains("mini") || lower.contains("eco") {
+        if lower.contains("flash") || lower.contains("lite") || lower.contains("haiku") || lower.contains("mini") || lower.contains("eco") || lower.contains("spark") {
             role = .fastEconomy
-            quality = 70
+            quality = 75
             speed = 92
-        } else if lower.contains("coder") || lower.contains("codex") || lower.contains("-code") {
-            role = .coding
-            quality = 88
-            speed = 76
-        } else if lower.contains("opus") || lower.contains("pro") || lower.contains("terra") || lower.contains("sol") || lower.contains("k3") || lower.contains("671b") || lower.contains("480b") {
+        } else if lower.contains("codex-max") || lower.contains("gpt-5.4") || lower.contains("opus") || lower.contains("pro") || lower.contains("terra") || lower.contains("sol") || lower.contains("k3") || lower.contains("671b") || lower.contains("480b") || lower.hasPrefix("o3") {
             role = .complexReasoning
             quality = 94
-            speed = 65
+            speed = 68
+        } else if lower.contains("coder") || lower.contains("codex") || lower.contains("-code") {
+            role = .coding
+            quality = 90
+            speed = 78
         } else if lower.contains("vision") {
             role = .vision
             quality = 82
             speed = 78
         } else {
             role = .general
-            quality = 80
+            quality = 82
             speed = 80
         }
 

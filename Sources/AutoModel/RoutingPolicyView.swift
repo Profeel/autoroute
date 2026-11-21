@@ -380,11 +380,25 @@ struct RoutingPolicyView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("多轮会话保持模型稳定（缓存保护）")
                             .font(.callout.weight(.medium))
-                        Text("同一多轮会话在同一策略版本下保持选定模型，避免因单轮微小价差频繁切换导致上下文缓存失效。")
+                        Text("优先沿用同一会话的模型，减少工具续跑与频繁切换造成的缓存损失。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                Toggle(isOn: Binding(
+                    get: { engine.config.policy.enablePhaseDowngradeHysteresis },
+                    set: { val in engine.updatePolicy { $0.enablePhaseDowngradeHysteresis = val } }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("按会话阶段自动升降档")
+                            .font(.callout.weight(.medium))
+                        Text("均衡策略在新用户回合按任务升档，连续两个常规回合后可降档。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(!engine.config.policy.enableSessionStickiness)
 
                 Divider()
 

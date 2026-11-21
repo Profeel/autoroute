@@ -4,8 +4,8 @@ import Combine
 import SwiftUI
 
 public enum SidebarTab: String, CaseIterable, Identifiable {
-    case history = "首页"
-    case modelsAndPolicy = "供应商"
+    case history = "路由概览"
+    case modelsAndPolicy = "提供商"
     case agents = "Agent 接入"
     case settings = "设置"
 
@@ -13,7 +13,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
-        case .history: return "house"
+        case .history: return "arrow.triangle.branch"
         case .modelsAndPolicy: return "server.rack"
         case .agents: return "link.badge.plus"
         case .settings: return "gearshape"
@@ -89,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pop = NSPopover()
         pop.behavior = .transient
         pop.animates = true
-        pop.contentSize = NSSize(width: 360, height: 470)
+        pop.contentSize = NSSize(width: 320, height: 380)
         pop.contentViewController = NSHostingController(
             rootView: MenuBarPopoverView(
                 engine: engine,
@@ -128,13 +128,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updateStatusButtonAppearance()
             }
             .store(in: &cancellables)
+
+        engine.$dailyUsageLedger
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusButtonAppearance()
+            }
+            .store(in: &cancellables)
+
+        engine.$cooldownUntilByModelID
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusButtonAppearance()
+            }
+            .store(in: &cancellables)
     }
 
     private func updateStatusButtonAppearance() {
         guard let button = statusItem?.button else { return }
-        let symbolName = engine.proxyState.isRunning ? "arrow.triangle.branch" : "exclamationmark.triangle"
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "AutoRoute")
-        button.toolTip = "AutoRoute — \(engine.proxyState.statusText) · 策略: \(engine.config.policy.activeStrategy.displayName)"
+        let alert = engine.currentAlertLevel()
+        let today = engine.todayUsageSummary()
+        switch alert {
+        case .normal:
+            let img = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "AutoRoute")
+            img?.isTemplate = true
+            button.image = img
+            button.contentTintColor = nil
+            button.toolTip = "AutoRoute — \(engine.proxyState.statusText) · 今日 \(today.callCount) 轮 · 策略: \(engine.config.policy.activeStrategy.displayName)"
+        case .warning(let detail):
+            let img = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "AutoRoute 预警")
+            img?.isTemplate = true
+            button.image = img
+            button.contentTintColor = .systemOrange
+            button.toolTip = "AutoRoute（提醒）— \(detail) · 今日 \(today.callCount) 轮"
+        case .error(let detail):
+            let img = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "AutoRoute 异常")
+            img?.isTemplate = true
+            button.image = img
+            button.contentTintColor = .systemRed
+            button.toolTip = "AutoRoute（异常）— \(detail)"
+        }
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {
@@ -193,14 +226,26 @@ struct MainContentView: View {
     var body: some View {
         NavigationSplitView {
             List(SidebarTab.allCases, selection: $selectedTab) { tab in
-                Label(tab.rawValue, systemImage: tab.systemImage)
-                    .tag(tab)
+                HStack {
+                    Label(tab.rawValue, systemImage: tab.systemImage)
+                    Spacer()
+                    if tab == .modelsAndPolicy && !engine.config.providers.isEmpty {
+                        let enabledCount = engine.config.providers.filter(\.isEnabled).count
+                        Text("\(enabledCount)/\(engine.config.providers.count)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.14), in: Capsule())
+                    }
+                }
+                .tag(tab)
             }
             .listStyle(.sidebar)
             .safeAreaInset(edge: .bottom) {
                 sidebarStatusFooter
             }
-            .navigationSplitViewColumnWidth(min: 175, ideal: 195, max: 230)
+            .navigationSplitViewColumnWidth(min: 195, ideal: 215, max: 250)
         } detail: {
             VStack(spacing: 0) {
                 if case .portConflict(let occupiedPort, let suggested) = engine.proxyState {
@@ -217,7 +262,8 @@ struct MainContentView: View {
                         },
                         onNavigateToProviders: {
                             selectedTab = .modelsAndPolicy
-                        }
+                        },
+                        onNavigate: { selectedTab = $0 }
                     )
                 case .modelsAndPolicy:
                     ProvidersModelsView(engine: engine)
@@ -231,6 +277,19 @@ struct MainContentView: View {
             }
         }
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("路由策略", selection: Binding(
+                    get: { engine.config.policy.activeStrategy },
+                    set: { engine.setStrategy($0) }
+                )) {
+                    Text("省钱").tag(RoutingStrategyPreset.costFirst)
+                    Text("均衡").tag(RoutingStrategyPreset.balanced)
+                    Text("质量").tag(RoutingStrategyPreset.qualityFirst)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 210)
+                .help("全局切换路由策略：省钱 / 均衡 / 质量")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     showTestBenchSheet = true
@@ -283,6 +342,11 @@ struct MainContentView: View {
                     onOpenTestBench: {
                         showOnboardingSheet = false
                         showTestBenchSheet = true
+                    },
+                    onOpenReceipt: { id in
+                        showOnboardingSheet = false
+                        selectedTab = .history
+                        navigationState.requestedRecordID = id
                     }
                 )
             }
@@ -308,59 +372,60 @@ struct MainContentView: View {
     }
 
     private var sidebarStatusFooter: some View {
-        let cal = Calendar.current
-        let todayRecords = engine.callHistory.filter { cal.isDateInToday($0.timestamp) }
-        let todayTokens = todayRecords.compactMap { $0.finalUsage?.totalTokens }.reduce(0, +)
-        let todayTokensLabel = todayTokens >= 1_000_000
-            ? String(format: "%.2fM", Double(todayTokens) / 1_000_000.0)
-            : (todayTokens >= 1000 ? String(format: "%.1fk", Double(todayTokens) / 1000.0) : "\(todayTokens)")
-
-        return VStack(alignment: .leading, spacing: 6) {
+        return VStack(alignment: .leading, spacing: 8) {
             Divider()
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(engine.proxyState.isRunning ? Color.green : Color.red)
-                    .frame(width: 8, height: 8)
-                Text(engine.proxyState.statusText)
-                    .font(.caption.weight(.medium))
-                    .lineLimit(1)
-            }
 
-            Text("今日 \(todayRecords.count) 轮 · \(todayTokensLabel) tok")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            Text(engine.config.proxySettings.baseURLString)
-                .font(.caption2.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            HStack(spacing: 6) {
-                Button(copiedAddressToast ? "已复制" : "复制地址") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(engine.config.proxySettings.baseURLString, forType: .string)
-                    copiedAddressToast = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                        copiedAddressToast = false
+            // Card 2: Proxy Status Card
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(engine.proxyState.isRunning ? Color.green : Color.red)
+                        .frame(width: 7, height: 7)
+                    Text(engine.proxyState.statusText)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                    Spacer()
+                    Button(engine.proxyState.isRunning ? "停止" : "启动") {
+                        if engine.proxyState.isRunning {
+                            engine.stopProxy()
+                        } else {
+                            engine.startProxy()
+                        }
                     }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
 
-                Button(engine.proxyState.isRunning ? "停止" : "启动") {
-                    if engine.proxyState.isRunning {
-                        engine.stopProxy()
-                    } else {
-                        engine.startProxy()
+                HStack(spacing: 4) {
+                    Text(engine.config.proxySettings.baseURLString)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(engine.config.proxySettings.baseURLString, forType: .string)
+                        copiedAddressToast = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            copiedAddressToast = false
+                        }
+                    } label: {
+                        Image(systemName: copiedAddressToast ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
                     }
+                    .buttonStyle(.borderless)
+                    .help("复制本地代理地址")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
             }
+            .padding(9)
+            .background(Color(.controlBackgroundColor).opacity(0.85), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+            )
         }
-        .padding(12)
-        .background(Color(.controlBackgroundColor).opacity(0.6))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
     }
 
     private func portConflictBanner(occupiedPort: Int, suggested: Int?) -> some View {

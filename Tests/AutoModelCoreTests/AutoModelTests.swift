@@ -591,12 +591,20 @@ final class AutoModelTests: XCTestCase {
         )
         XCTAssertEqual(summary.discoveredProvidersCount, 2)
         XCTAssertEqual(summary.discoveredModelsCount, 5)
-        XCTAssertEqual(summary.healthyModelsCount, 2)
-        XCTAssertEqual(summary.evictedModelsCount, 3)
+        XCTAssertEqual(summary.probedModelsCount, 0)
+        XCTAssertTrue(engine.config.providers.allSatisfy { !$0.isEnabled })
+        for var provider in engine.config.providers {
+            provider.isEnabled = true
+            try engine.upsertProvider(provider, apiKeys: nil)
+        }
+        let probeSummary = await engine.probeAllEnabledModels()
+        XCTAssertEqual(probeSummary.healthyModelsCount, 2)
+        XCTAssertEqual(probeSummary.evictedModelsCount, 3)
 
         // Discovered key stored in Keychain, never leaked in config.json
         let liveProvider = try XCTUnwrap(engine.config.providers.first { $0.name == "local-relay" })
         XCTAssertEqual(try keychain.getAPIKey(for: liveProvider.id), "sk-discovered-opencode-777")
+        try await store.flush()
         let configText = try String(contentsOf: store.configFileURL, encoding: .utf8)
         XCTAssertFalse(configText.contains("sk-discovered-opencode-777"))
 
@@ -723,9 +731,10 @@ final class AutoModelTests: XCTestCase {
         let explicitHigh = engine.router.route(requestedModel: "auto/high", features: lowFeatures, providers: engine.config.providers, models: engine.config.models, policy: engine.config.policy)
         XCTAssertEqual(explicitHigh.selectedModelID, "mock-opus-high")
 
-        // Under balanced mode, model=auto maps simple QA -> Low, coding -> Medium, architecture reasoning -> High
+        // Under balanced mode, lightweight extraction -> Low, scoped coding -> Medium, architecture -> High.
         engine.setStrategy(.balanced)
-        let qaDecision = engine.router.route(requestedModel: "auto", features: lowFeatures, providers: engine.config.providers, models: engine.config.models, policy: engine.config.policy)
+        let extraction = RequestFeatureExtractor.extract(from: ["messages": [["role": "user", "content": "Extract order numbers from the list"]]])
+        let qaDecision = engine.router.route(requestedModel: "auto", features: extraction, providers: engine.config.providers, models: engine.config.models, policy: engine.config.policy)
         XCTAssertEqual(qaDecision.selectedModelID, "mock-flash-mini")
         XCTAssertTrue(qaDecision.matchedRules.contains(where: { $0.contains("三档路由命中") && $0.contains("低档") }))
 
@@ -1496,7 +1505,8 @@ final class AutoModelTests: XCTestCase {
             lowTierModelID: fastModel.id,
             mediumTierModelID: fastModel.id,
             highTierModelID: reasonerModel.id,
-            preferTierMappingInAuto: true
+            preferTierMappingInAuto: true,
+            enablePhaseDowngradeHysteresis: false
         )
         let dExplore = router.route(requestedModel: "auto", features: exploreFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: strongStickyPolicy)
         XCTAssertEqual(dExplore.selectedModelID, "fast-flash")
@@ -1504,7 +1514,7 @@ final class AutoModelTests: XCTestCase {
         XCTAssertEqual(dExplore.subtaskCategory, .explorationSearch)
         router.recordSuccessfulSessionModel(fingerprint: exploreFeatures.conversationFingerprint, modelUUID: fastModel.id, policyVersion: 1)
 
-        // 2. Strong stickiness (default): multi-turn conversation stays locked to fast-flash without mid-session switching
+        // 2. Explicitly disabling phase switching keeps the multi-turn conversation on fast-flash.
         let debugFeatures = RequestFeatureExtractor.extract(from: [
             "model": "auto",
             "messages": [
@@ -1515,7 +1525,7 @@ final class AutoModelTests: XCTestCase {
             ]
         ], sessionHeader: "sess-effort-1")
         XCTAssertEqual(debugFeatures.subtaskCategory, .deepDebugging)
-        XCTAssertEqual(debugFeatures.recommendedEffort, .max)
+        XCTAssertEqual(debugFeatures.recommendedEffort, .high)
 
         let dSticky = router.route(requestedModel: "auto", features: debugFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: strongStickyPolicy)
         XCTAssertEqual(dSticky.selectedModelID, "fast-flash")
@@ -1525,7 +1535,7 @@ final class AutoModelTests: XCTestCase {
         dynamicPolicy.enablePhaseDowngradeHysteresis = true
         let dDebug = router.route(requestedModel: "auto", features: debugFeatures, providers: [provider], models: [fastModel, reasonerModel], policy: dynamicPolicy)
         XCTAssertEqual(dDebug.selectedModelID, "deep-reasoner")
-        XCTAssertEqual(dDebug.selectedEffort, .max)
+        XCTAssertEqual(dDebug.selectedEffort, .high)
         XCTAssertEqual(dDebug.subtaskCategory, .deepDebugging)
         XCTAssertNotNil(dDebug.routingReasonNote)
     }
@@ -1627,7 +1637,8 @@ final class AutoModelTests: XCTestCase {
                 costStatus: .calculated,
                 primaryAttemptCostUSD: cost,
                 retryAttemptsCostUSD: 0,
-                totalCostUSD: cost
+                totalCostUSD: cost,
+                executionOrigin: .real
             )
         }
 
@@ -2584,7 +2595,8 @@ final class AutoModelTests: XCTestCase {
                 costStatus: .calculated,
                 primaryAttemptCostUSD: cost,
                 retryAttemptsCostUSD: 0,
-                totalCostUSD: cost
+                totalCostUSD: cost,
+                executionOrigin: .real
             )
         }
 

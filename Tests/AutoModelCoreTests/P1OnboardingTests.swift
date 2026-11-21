@@ -26,6 +26,7 @@ final class P1OnboardingTests: XCTestCase {
         XCTAssertEqual(result.record.status, .success)
         XCTAssertEqual(result.record.source, .externalProxy)
         XCTAssertEqual(result.record.endpointPath, "/v1/chat/completions")
+        XCTAssertTrue(result.record.requestFeatures.conversationFingerprint?.hasPrefix("onboarding-") == true)
         XCTAssertNotNil(result.record.executedModelID)
         XCTAssertNotNil(result.record.decision.routingReasonNote)
         XCTAssertFalse(engine.config.privacySettings.hasCompletedOnboarding)

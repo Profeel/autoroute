@@ -267,7 +267,12 @@ struct RoutingReceiptView: View {
                     kpiTile(
                         title: "本轮 Tokens",
                         value: record.finalUsage.map { formatTokens($0.totalTokens) } ?? "—",
-                        sub: record.finalUsage.map { "\($0.promptTokens)入 / \($0.completionTokens)出" } ?? "无用量"
+                        sub: record.finalUsage.map { usage in
+                            if let rate = usage.cacheHitRate {
+                                return "\(usage.promptTokens)入 / \(usage.completionTokens)出 · 缓存 \(Int((rate * 100).rounded()))%"
+                            }
+                            return "\(usage.promptTokens)入 / \(usage.completionTokens)出"
+                        } ?? "无用量"
                     )
                     Divider().frame(height: 26)
                     kpiTile(

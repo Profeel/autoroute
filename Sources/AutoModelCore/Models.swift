@@ -1,5 +1,9 @@
 import Foundation
 
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
 // MARK: - Provider & Model Configuration
 
 public enum ProviderHealthStatus: String, Codable, CaseIterable, Sendable {
@@ -27,6 +31,7 @@ public enum ProviderProtocol: String, Codable, CaseIterable, Hashable, Sendable 
     case openAIResponses = "openai_responses"
     case codexChatGPT = "codex_chatgpt"
     case anthropicMessages = "anthropic_messages"
+    case workBuddy = "workbuddy"
 
     public var displayName: String {
         switch self {
@@ -34,6 +39,19 @@ public enum ProviderProtocol: String, Codable, CaseIterable, Hashable, Sendable 
         case .openAIResponses: return "OpenAI Responses"
         case .codexChatGPT: return "Codex 订阅 (ChatGPT)"
         case .anthropicMessages: return "Anthropic Messages"
+        case .workBuddy: return "WorkBuddy API Key"
+        }
+    }
+}
+
+public enum ProviderKeyRotationStrategy: String, Codable, CaseIterable, Hashable, Sendable {
+    case roundRobin = "round_robin"
+    case priorityFailover = "priority_failover"
+
+    public var displayName: String {
+        switch self {
+        case .roundRobin: return "轮询均衡"
+        case .priorityFailover: return "主备顺延"
         }
     }
 }
@@ -53,9 +71,31 @@ public struct ProviderConfig: Identifiable, Codable, Equatable, Hashable, Sendab
     public var discoveredSource: String?
     public var apiProtocol: ProviderProtocol
     public var accountID: String?
+    /// Optional per-provider concurrency cap; nil means unlimited.
+    public var maxConcurrentRequests: Int?
+    /// Optional built-in preset identifier (e.g. "deepseek", "anthropic", "openrouter").
+    public var presetID: String?
+    /// Custom upstream HTTP headers added on every request (non-secret metadata or gateway routing headers).
+    public var customHeaders: [String: String]
+    /// Client request header names allowed to pass through to upstream (e.g. "X-Session-Id").
+    public var passThroughHeaderNames: [String]
+    /// Optional per-provider HTTP/HTTPS/SOCKS5 proxy URL (e.g. "http://127.0.0.1:7890").
+    public var proxyURL: String?
+    /// Key rotation strategy when multiple API keys are stored in Keychain for this provider.
+    public var keyRotationStrategy: ProviderKeyRotationStrategy
+    /// Non-sensitive count of keys configured in Keychain (allows UI badges without background Keychain reads).
+    public var configuredKeyCount: Int
+    /// Non-sensitive metadata summaries for Codex/ChatGPT subscription accounts in this provider's pool.
+    public var subscriptionAccounts: [CodexAccountSummary]
+    /// Human-readable discovery origin label (e.g. "本机发现 ~/.antigravity").
+    public var discoverySourceLabel: String?
+    /// Whether this provider was discovered automatically from local configuration.
+    public var isAutoDiscovered: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, name, baseURL, isEnabled, timeoutSeconds, healthStatus, lastErrorMessage, lastCheckedAt, createdAt, discoveredSource, apiProtocol, accountID
+        case id, name, baseURL, isEnabled, timeoutSeconds, healthStatus, lastErrorMessage, lastCheckedAt, createdAt, discoveredSource, apiProtocol, accountID, maxConcurrentRequests
+        case presetID, customHeaders, passThroughHeaderNames, proxyURL, keyRotationStrategy, configuredKeyCount, subscriptionAccounts
+        case discoverySourceLabel, isAutoDiscovered
     }
 
     public init(
@@ -70,7 +110,17 @@ public struct ProviderConfig: Identifiable, Codable, Equatable, Hashable, Sendab
         createdAt: Date = Date(),
         discoveredSource: String? = nil,
         apiProtocol: ProviderProtocol = .openAIChatCompletions,
-        accountID: String? = nil
+        accountID: String? = nil,
+        maxConcurrentRequests: Int? = nil,
+        presetID: String? = nil,
+        customHeaders: [String: String] = [:],
+        passThroughHeaderNames: [String] = [],
+        proxyURL: String? = nil,
+        keyRotationStrategy: ProviderKeyRotationStrategy = .roundRobin,
+        configuredKeyCount: Int = 0,
+        subscriptionAccounts: [CodexAccountSummary] = [],
+        discoverySourceLabel: String? = nil,
+        isAutoDiscovered: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -84,6 +134,16 @@ public struct ProviderConfig: Identifiable, Codable, Equatable, Hashable, Sendab
         self.discoveredSource = discoveredSource
         self.apiProtocol = apiProtocol
         self.accountID = accountID
+        self.maxConcurrentRequests = maxConcurrentRequests.flatMap { $0 > 0 ? $0 : nil }
+        self.presetID = presetID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.customHeaders = customHeaders
+        self.passThroughHeaderNames = passThroughHeaderNames
+        self.proxyURL = proxyURL?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.keyRotationStrategy = keyRotationStrategy
+        self.configuredKeyCount = max(0, configuredKeyCount)
+        self.subscriptionAccounts = subscriptionAccounts
+        self.discoverySourceLabel = discoverySourceLabel?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.isAutoDiscovered = isAutoDiscovered
     }
 
     public init(from decoder: Decoder) throws {
@@ -100,6 +160,17 @@ public struct ProviderConfig: Identifiable, Codable, Equatable, Hashable, Sendab
         discoveredSource = try c.decodeIfPresent(String.self, forKey: .discoveredSource)
         apiProtocol = try c.decodeIfPresent(ProviderProtocol.self, forKey: .apiProtocol) ?? .openAIChatCompletions
         accountID = try c.decodeIfPresent(String.self, forKey: .accountID)
+        let rawMaxConc = try c.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests)
+        maxConcurrentRequests = rawMaxConc.flatMap { $0 > 0 ? $0 : nil }
+        presetID = try c.decodeIfPresent(String.self, forKey: .presetID)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        customHeaders = try c.decodeIfPresent([String: String].self, forKey: .customHeaders) ?? [:]
+        passThroughHeaderNames = try c.decodeIfPresent([String].self, forKey: .passThroughHeaderNames) ?? []
+        proxyURL = try c.decodeIfPresent(String.self, forKey: .proxyURL)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        keyRotationStrategy = try c.decodeIfPresent(ProviderKeyRotationStrategy.self, forKey: .keyRotationStrategy) ?? .roundRobin
+        configuredKeyCount = max(0, try c.decodeIfPresent(Int.self, forKey: .configuredKeyCount) ?? 0)
+        subscriptionAccounts = try c.decodeIfPresent([CodexAccountSummary].self, forKey: .subscriptionAccounts) ?? []
+        discoverySourceLabel = try c.decodeIfPresent(String.self, forKey: .discoverySourceLabel)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        isAutoDiscovered = try c.decodeIfPresent(Bool.self, forKey: .isAutoDiscovered) ?? false
     }
 
     /// Normalized base URL without trailing slash or trailing `/v1` duplication.
@@ -190,6 +261,12 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
     public var inputPricePerMillion: Double?
     /// USD per 1M output tokens. nil means user has not configured pricing.
     public var outputPricePerMillion: Double?
+    /// Optional USD per 1M prompt-cache read tokens. nil uses family default or inputPricePerMillion.
+    public var cachedInputPricePerMillion: Double?
+    /// Optional USD per 1M prompt-cache creation tokens. nil uses family default or inputPricePerMillion.
+    public var cacheCreationPricePerMillion: Double?
+    /// Optional soft RPM cap used to spill traffic to same-tier backups before hitting upstream 429.
+    public var maxRequestsPerMinute: Int?
     public var contextWindow: Int
     public var capabilities: Set<ModelCapability>
     public var defaultRole: ModelDefaultUsage
@@ -203,6 +280,8 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
     public var isAutoEvicted: Bool
     public var lastProbeLatencyMs: Double?
     public var lastProbedAt: Date?
+    /// Optional explicit canonical model identifier overriding automatic normalization (e.g. "claude-3.7-sonnet").
+    public var canonicalModelID: String?
 
     public init(
         id: UUID = UUID(),
@@ -212,6 +291,9 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         isEnabled: Bool = true,
         inputPricePerMillion: Double? = nil,
         outputPricePerMillion: Double? = nil,
+        cachedInputPricePerMillion: Double? = nil,
+        cacheCreationPricePerMillion: Double? = nil,
+        maxRequestsPerMinute: Int? = nil,
         contextWindow: Int = 128_000,
         capabilities: Set<ModelCapability> = [.chat],
         defaultRole: ModelDefaultUsage = .general,
@@ -222,7 +304,8 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         discoveredSource: String? = nil,
         isAutoEvicted: Bool = false,
         lastProbeLatencyMs: Double? = nil,
-        lastProbedAt: Date? = nil
+        lastProbedAt: Date? = nil,
+        canonicalModelID: String? = nil
     ) {
         self.id = id
         self.providerID = providerID
@@ -231,6 +314,9 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         self.isEnabled = isEnabled
         self.inputPricePerMillion = inputPricePerMillion
         self.outputPricePerMillion = outputPricePerMillion
+        self.cachedInputPricePerMillion = cachedInputPricePerMillion
+        self.cacheCreationPricePerMillion = cacheCreationPricePerMillion
+        self.maxRequestsPerMinute = maxRequestsPerMinute.flatMap { $0 > 0 ? $0 : nil }
         self.contextWindow = max(1024, contextWindow)
         self.capabilities = capabilities
         self.defaultRole = defaultRole
@@ -242,14 +328,18 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         self.isAutoEvicted = isAutoEvicted
         self.lastProbeLatencyMs = lastProbeLatencyMs
         self.lastProbedAt = lastProbedAt
+        self.canonicalModelID = canonicalModelID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
     enum CodingKeys: String, CodingKey {
         case id, providerID, modelID, displayName, isEnabled
-        case inputPricePerMillion, outputPricePerMillion, contextWindow
+        case inputPricePerMillion, outputPricePerMillion
+        case cachedInputPricePerMillion, cacheCreationPricePerMillion, maxRequestsPerMinute
+        case contextWindow
         case capabilities, defaultRole, qualityScore, speedScore
         case availabilityStatus, lastAvailabilityNote
         case discoveredSource, isAutoEvicted, lastProbeLatencyMs, lastProbedAt
+        case canonicalModelID
     }
 
     public init(from decoder: Decoder) throws {
@@ -261,6 +351,10 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
         inputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .inputPricePerMillion)
         outputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .outputPricePerMillion)
+        cachedInputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .cachedInputPricePerMillion)
+        cacheCreationPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .cacheCreationPricePerMillion)
+        let rawRPM = try c.decodeIfPresent(Int.self, forKey: .maxRequestsPerMinute)
+        maxRequestsPerMinute = rawRPM.flatMap { $0 > 0 ? $0 : nil }
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow) ?? 128_000
         capabilities = try c.decodeIfPresent(Set<ModelCapability>.self, forKey: .capabilities) ?? [.chat]
         defaultRole = try c.decodeIfPresent(ModelDefaultUsage.self, forKey: .defaultRole) ?? .general
@@ -272,6 +366,7 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         isAutoEvicted = try c.decodeIfPresent(Bool.self, forKey: .isAutoEvicted) ?? false
         lastProbeLatencyMs = try c.decodeIfPresent(Double.self, forKey: .lastProbeLatencyMs)
         lastProbedAt = try c.decodeIfPresent(Date.self, forKey: .lastProbedAt)
+        canonicalModelID = try c.decodeIfPresent(String.self, forKey: .canonicalModelID)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
     public var hasCompletePricing: Bool {
@@ -294,11 +389,61 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         let outCost = (Double(max(0, completionTokens)) / 1_000_000.0) * outputPrice
         return inCost + outCost
     }
+
+    public var effectiveCachedInputPricePerMillion: Double? {
+        if let explicit = cachedInputPricePerMillion { return max(0, explicit) }
+        guard let inputPrice = inputPricePerMillion else { return nil }
+        let lower = modelID.lowercased()
+        if lower.contains("claude") || lower.contains("deepseek") || lower.contains("gemini") {
+            return inputPrice * 0.10
+        }
+        if lower.contains("gpt-5") || lower.contains("gpt-4.1") || lower.contains("o3") || lower.contains("o4") {
+            return inputPrice * 0.25
+        }
+        if lower.contains("gpt-4o") || lower.contains("o1") {
+            return inputPrice * 0.50
+        }
+        return inputPrice
+    }
+
+    public var effectiveCacheCreationPricePerMillion: Double? {
+        if let explicit = cacheCreationPricePerMillion { return max(0, explicit) }
+        guard let inputPrice = inputPricePerMillion else { return nil }
+        let lower = modelID.lowercased()
+        if lower.contains("claude") {
+            return inputPrice * 1.25
+        }
+        return inputPrice
+    }
+
+    public func calculateCostUSD(usage: TokenUsage) -> Double? {
+        guard let inputPrice = inputPricePerMillion, let outputPrice = outputPricePerMillion else {
+            return nil
+        }
+        let cachedRead = max(0, usage.cachedInputTokens ?? 0)
+        let cacheCreate = max(0, usage.cacheCreationTokens ?? 0)
+        if cachedRead == 0 && cacheCreate == 0 {
+            return calculateCostUSD(promptTokens: usage.promptTokens, completionTokens: usage.completionTokens)
+        }
+        let totalPrompt = max(0, usage.promptTokens)
+        let clampedRead = min(totalPrompt, cachedRead)
+        let clampedCreate = min(max(0, totalPrompt - clampedRead), cacheCreate)
+        let uncachedPrompt = max(0, totalPrompt - clampedRead - clampedCreate)
+
+        let readPrice = effectiveCachedInputPricePerMillion ?? inputPrice
+        let createPrice = effectiveCacheCreationPricePerMillion ?? inputPrice
+
+        let uncachedCost = (Double(uncachedPrompt) / 1_000_000.0) * inputPrice
+        let readCost = (Double(clampedRead) / 1_000_000.0) * readPrice
+        let createCost = (Double(clampedCreate) / 1_000_000.0) * createPrice
+        let outCost = (Double(max(0, usage.completionTokens)) / 1_000_000.0) * outputPrice
+        return uncachedCost + readCost + createCost + outCost
+    }
 }
 
 // MARK: - Model Tiers & Routing Policy & Settings
 
-public enum ModelTier: String, Codable, CaseIterable, Identifiable, Sendable {
+public enum ModelTier: String, Codable, CaseIterable, Identifiable, CodingKeyRepresentable, Sendable {
     case low = "low"
     case medium = "medium"
     case high = "high"
@@ -357,6 +502,7 @@ public enum AgentKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case opencode = "opencode"
     case hermes = "hermes"
     case claudeCode = "claude_code"
+    case deepseekHarness = "deepseek_harness"
     case shellAndContinue = "shell_and_continue"
 
     public var id: String { rawValue }
@@ -367,6 +513,7 @@ public enum AgentKind: String, Codable, CaseIterable, Identifiable, Sendable {
         case .opencode: return "OpenCode"
         case .hermes: return "Hermes Agent"
         case .claudeCode: return "Claude Code"
+        case .deepseekHarness: return "DeepSeek Harness"
         case .shellAndContinue: return "Shell / Continue 通用配置"
         }
     }
@@ -381,6 +528,8 @@ public enum AgentKind: String, Codable, CaseIterable, Identifiable, Sendable {
             return "在 ~/.hermes/config.yaml 写入 automodel 供应商、默认模型与三档映射"
         case .claudeCode:
             return "在 ~/.claude/settings.json 的 env 中写入本地 /v1/messages 网关地址与 Haiku(低)/Sonnet(中)/Opus(高) 三档映射"
+        case .deepseekHarness:
+            return "在 ~/.dsh/profiles/desktop/cordis.patch.yml 注册 automodel 供应商与默认模型，并将 API Key 写入 ~/.dsh/.credentials.yaml"
         case .shellAndContinue:
             return "生成 ~/.automodel/agent-env.sh 环境变量脚本（兼容 Cursor/CLI），并同步更新 ~/.continue/config.json（若存在）"
         }
@@ -406,7 +555,7 @@ public struct AgentModelBinding: Codable, Equatable, Sendable {
     }
 }
 
-public enum RoutingStrategyPreset: String, Codable, CaseIterable, Sendable {
+public enum RoutingStrategyPreset: String, Codable, CaseIterable, CodingKeyRepresentable, Sendable {
     case costFirst = "cost_first"
     case balanced = "balanced"
     case qualityFirst = "quality_first"
@@ -428,6 +577,16 @@ public enum RoutingStrategyPreset: String, Codable, CaseIterable, Sendable {
         case .qualityFirst:
             return "优先选择能力与质量评分最高的模型，适合复杂代码、推理与多步骤任务"
         }
+    }
+}
+
+public struct TierModelAssignment: Codable, Equatable, Sendable {
+    public var primaryModelID: UUID?
+    public var backupModelIDs: [UUID]
+
+    public init(primaryModelID: UUID? = nil, backupModelIDs: [UUID] = []) {
+        self.primaryModelID = primaryModelID
+        self.backupModelIDs = backupModelIDs
     }
 }
 
@@ -458,6 +617,10 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
     public var lowTierIsManual: Bool
     public var mediumTierIsManual: Bool
     public var highTierIsManual: Bool
+    /// Automatically group identical logical models across enabled providers for availability failover.
+    public var enableAutoSameModelGrouping: Bool
+    /// Per-strategy memory of primary & backup model assignments (falls back to global tier fields when absent).
+    public var perStrategyTiers: [RoutingStrategyPreset: [ModelTier: TierModelAssignment]]
 
     public init(
         policyVersion: Int = 1,
@@ -479,11 +642,13 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         highTierBackupModelIDs: [UUID] = [],
         autoConfigureTiers: Bool = true,
         preferTierMappingInAuto: Bool = true,
-        enablePhaseDowngradeHysteresis: Bool = false,
+        enablePhaseDowngradeHysteresis: Bool = true,
         strictThreeTierPoolOnly: Bool = true,
         lowTierIsManual: Bool = false,
         mediumTierIsManual: Bool = false,
-        highTierIsManual: Bool = false
+        highTierIsManual: Bool = false,
+        enableAutoSameModelGrouping: Bool = true,
+        perStrategyTiers: [RoutingStrategyPreset: [ModelTier: TierModelAssignment]] = [:]
     ) {
         self.policyVersion = policyVersion
         self.activeStrategy = activeStrategy
@@ -509,6 +674,8 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         self.lowTierIsManual = lowTierIsManual
         self.mediumTierIsManual = mediumTierIsManual
         self.highTierIsManual = highTierIsManual
+        self.enableAutoSameModelGrouping = enableAutoSameModelGrouping
+        self.perStrategyTiers = perStrategyTiers
     }
 
     enum CodingKeys: String, CodingKey {
@@ -521,6 +688,7 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         case autoConfigureTiers, preferTierMappingInAuto
         case enablePhaseDowngradeHysteresis, strictThreeTierPoolOnly
         case lowTierIsManual, mediumTierIsManual, highTierIsManual
+        case enableAutoSameModelGrouping, perStrategyTiers
     }
 
     public init(from decoder: Decoder) throws {
@@ -544,11 +712,13 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         highTierBackupModelIDs = try c.decodeIfPresent([UUID].self, forKey: .highTierBackupModelIDs) ?? []
         autoConfigureTiers = try c.decodeIfPresent(Bool.self, forKey: .autoConfigureTiers) ?? true
         preferTierMappingInAuto = try c.decodeIfPresent(Bool.self, forKey: .preferTierMappingInAuto) ?? true
-        enablePhaseDowngradeHysteresis = try c.decodeIfPresent(Bool.self, forKey: .enablePhaseDowngradeHysteresis) ?? false
+        enablePhaseDowngradeHysteresis = try c.decodeIfPresent(Bool.self, forKey: .enablePhaseDowngradeHysteresis) ?? true
         strictThreeTierPoolOnly = try c.decodeIfPresent(Bool.self, forKey: .strictThreeTierPoolOnly) ?? true
         lowTierIsManual = try c.decodeIfPresent(Bool.self, forKey: .lowTierIsManual) ?? false
         mediumTierIsManual = try c.decodeIfPresent(Bool.self, forKey: .mediumTierIsManual) ?? false
         highTierIsManual = try c.decodeIfPresent(Bool.self, forKey: .highTierIsManual) ?? false
+        enableAutoSameModelGrouping = try c.decodeIfPresent(Bool.self, forKey: .enableAutoSameModelGrouping) ?? true
+        perStrategyTiers = try c.decodeIfPresent([RoutingStrategyPreset: [ModelTier: TierModelAssignment]].self, forKey: .perStrategyTiers) ?? [:]
     }
 
     public func modelID(for tier: ModelTier) -> UUID? {
@@ -597,6 +767,71 @@ public struct RoutingPolicyConfig: Codable, Equatable, Sendable {
         case .low: lowTierBackupModelIDs = deduped
         case .medium: mediumTierBackupModelIDs = deduped
         case .high: highTierBackupModelIDs = deduped
+        }
+        var strategyMap = perStrategyTiers[activeStrategy] ?? [:]
+        strategyMap[tier] = TierModelAssignment(primaryModelID: primary, backupModelIDs: deduped)
+        perStrategyTiers[activeStrategy] = strategyMap
+    }
+
+    public func tierAssignment(for tier: ModelTier, strategy: RoutingStrategyPreset? = nil) -> TierModelAssignment {
+        let targetStrategy = strategy ?? activeStrategy
+        if let assignment = perStrategyTiers[targetStrategy]?[tier],
+           assignment.primaryModelID != nil || !assignment.backupModelIDs.isEmpty {
+            return assignment
+        }
+        return TierModelAssignment(
+            primaryModelID: modelID(for: tier),
+            backupModelIDs: backupModelIDs(for: tier)
+        )
+    }
+
+    public mutating func setTierAssignment(
+        _ assignment: TierModelAssignment,
+        for tier: ModelTier,
+        strategy: RoutingStrategyPreset? = nil
+    ) {
+        let targetStrategy = strategy ?? activeStrategy
+        var dedupedBackups: [UUID] = []
+        for bid in assignment.backupModelIDs where bid != assignment.primaryModelID && !dedupedBackups.contains(bid) {
+            dedupedBackups.append(bid)
+        }
+        let normalized = TierModelAssignment(primaryModelID: assignment.primaryModelID, backupModelIDs: dedupedBackups)
+        var strategyMap = perStrategyTiers[targetStrategy] ?? [:]
+        strategyMap[tier] = normalized
+        perStrategyTiers[targetStrategy] = strategyMap
+
+        if targetStrategy == activeStrategy {
+            switch tier {
+            case .low:
+                lowTierModelID = normalized.primaryModelID
+                lowTierBackupModelIDs = normalized.backupModelIDs
+                lowTierIsManual = true
+            case .medium:
+                mediumTierModelID = normalized.primaryModelID
+                mediumTierBackupModelIDs = normalized.backupModelIDs
+                mediumTierIsManual = true
+            case .high:
+                highTierModelID = normalized.primaryModelID
+                highTierBackupModelIDs = normalized.backupModelIDs
+                highTierIsManual = true
+            }
+        }
+    }
+
+    public mutating func applyStrategyTierSnapshot(_ strategy: RoutingStrategyPreset) {
+        activeStrategy = strategy
+        guard let snapshot = perStrategyTiers[strategy] else { return }
+        if let low = snapshot[.low] {
+            lowTierModelID = low.primaryModelID
+            lowTierBackupModelIDs = low.backupModelIDs
+        }
+        if let med = snapshot[.medium] {
+            mediumTierModelID = med.primaryModelID
+            mediumTierBackupModelIDs = med.backupModelIDs
+        }
+        if let high = snapshot[.high] {
+            highTierModelID = high.primaryModelID
+            highTierBackupModelIDs = high.backupModelIDs
         }
     }
 
@@ -706,20 +941,38 @@ public struct DiscoveryAndProbeSummary: Codable, Equatable, Sendable {
 public struct PrivacySettings: Codable, Equatable, Sendable {
     public var recordRequestBody: Bool
     public var hasCompletedOnboarding: Bool
+    /// Days to retain records in SQLite history store (0 = keep forever).
+    public var historyRetentionDays: Int
+    /// Send macOS notifications for budget alerts, auth errors, and tier degradation.
+    public var enableSystemNotifications: Bool
+    /// Check GitHub Releases for newer versions on launch (manual check always available).
+    public var autoCheckUpdates: Bool
 
-    public init(recordRequestBody: Bool = false, hasCompletedOnboarding: Bool = false) {
+    public init(
+        recordRequestBody: Bool = false,
+        hasCompletedOnboarding: Bool = false,
+        historyRetentionDays: Int = 90,
+        enableSystemNotifications: Bool = true,
+        autoCheckUpdates: Bool = false
+    ) {
         self.recordRequestBody = recordRequestBody
         self.hasCompletedOnboarding = hasCompletedOnboarding
+        self.historyRetentionDays = max(0, historyRetentionDays)
+        self.enableSystemNotifications = enableSystemNotifications
+        self.autoCheckUpdates = autoCheckUpdates
     }
 
     enum CodingKeys: String, CodingKey {
-        case recordRequestBody, hasCompletedOnboarding
+        case recordRequestBody, hasCompletedOnboarding, historyRetentionDays, enableSystemNotifications, autoCheckUpdates
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         recordRequestBody = try container.decodeIfPresent(Bool.self, forKey: .recordRequestBody) ?? false
         hasCompletedOnboarding = try container.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? false
+        historyRetentionDays = max(0, try container.decodeIfPresent(Int.self, forKey: .historyRetentionDays) ?? 90)
+        enableSystemNotifications = try container.decodeIfPresent(Bool.self, forKey: .enableSystemNotifications) ?? true
+        autoCheckUpdates = try container.decodeIfPresent(Bool.self, forKey: .autoCheckUpdates) ?? false
     }
 }
 
@@ -850,6 +1103,7 @@ public enum AgentSubtaskCategory: String, Codable, CaseIterable, Sendable {
     case explorationSearch = "exploration_search"
     case summarizationCompaction = "summarization_compaction"
     case routineCoding = "routine_coding"
+    case generalEngineering = "general_engineering"
     case toolOrchestration = "tool_orchestration"
     case architecturePlanning = "architecture_planning"
     case deepDebugging = "deep_debugging"
@@ -858,7 +1112,8 @@ public enum AgentSubtaskCategory: String, Codable, CaseIterable, Sendable {
         switch self {
         case .explorationSearch: return "检索与代码探索"
         case .summarizationCompaction: return "摘要与上下文整理"
-        case .routineCoding: return "常规代码实现"
+        case .routineCoding: return "范围明确的实现与文档"
+        case .generalEngineering: return "开放式工程与分析"
         case .toolOrchestration: return "工具编排与执行"
         case .architecturePlanning: return "架构设计与规划"
         case .deepDebugging: return "疑难调试与根因"
@@ -869,16 +1124,15 @@ public enum AgentSubtaskCategory: String, Codable, CaseIterable, Sendable {
         switch self {
         case .explorationSearch, .summarizationCompaction: return .low
         case .routineCoding, .toolOrchestration: return .medium
-        case .architecturePlanning, .deepDebugging: return .high
+        case .generalEngineering, .architecturePlanning, .deepDebugging: return .high
         }
     }
 
     public var recommendedEffort: ReasoningEffort {
         switch self {
         case .explorationSearch, .summarizationCompaction: return .low
-        case .routineCoding, .toolOrchestration: return .medium
-        case .architecturePlanning: return .high
-        case .deepDebugging: return .max
+        case .routineCoding, .generalEngineering, .toolOrchestration: return .medium
+        case .architecturePlanning, .deepDebugging: return .high
         }
     }
 
@@ -889,13 +1143,15 @@ public enum AgentSubtaskCategory: String, Codable, CaseIterable, Sendable {
         case .summarizationCompaction:
             return "上下文压缩、标题提取或简单问答，结构明确，采用轻量模型 + Low Effort 直出"
         case .routineCoding:
-            return "日常代码编写、局部修改与单测实现，选用主力编码模型 + Medium Effort 兼顾质量与速度"
+            return "范围明确的代码修改、单测和文档，优先使用中档与中等思考强度"
+        case .generalEngineering:
+            return "开放式工程、分析或意图不明的请求，从高档与中等思考强度起步"
         case .toolOrchestration:
             return "多步工具调用与终端指令编排，需稳定遵循工具 Schema 并保持会话状态一致"
         case .architecturePlanning:
             return "跨模块架构设计、方案权衡与复杂长文分析，筛选深度推理模型 + High Effort 避免设计返工"
         case .deepDebugging:
-            return "疑难报错排查、堆栈根因分析或高复杂度推理，启用旗舰推理模型 + Max Effort 深度推演"
+            return "疑难报错排查、堆栈根因分析或高复杂度推理，采用旗舰推理模型与高思考强度"
         }
     }
 }
@@ -920,11 +1176,12 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
     public var recommendedEffort: ReasoningEffort
     public var subtaskSummary: String?
     public var clientProvidedEffort: ReasoningEffort?
+    public var isUserTurnBoundary: Bool?
 
     enum CodingKeys: String, CodingKey {
         case messageCount, estimatedInputTokens, tokenEstimateConfidence, requiresTools, requiresVision, requiresJSONMode
         case isStreaming, detectedTaskType, conversationFingerprint, isMultiTurn
-        case subtaskCategory, recommendedEffort, subtaskSummary, clientProvidedEffort
+        case subtaskCategory, recommendedEffort, subtaskSummary, clientProvidedEffort, isUserTurnBoundary
     }
 
     public init(
@@ -941,7 +1198,8 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         subtaskCategory: AgentSubtaskCategory? = nil,
         recommendedEffort: ReasoningEffort? = nil,
         subtaskSummary: String? = nil,
-        clientProvidedEffort: ReasoningEffort? = nil
+        clientProvidedEffort: ReasoningEffort? = nil,
+        isUserTurnBoundary: Bool? = nil
     ) {
         let resolvedSubtask = subtaskCategory ?? detectedTaskType.defaultSubtaskCategory
         self.messageCount = messageCount
@@ -958,6 +1216,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         self.recommendedEffort = recommendedEffort ?? resolvedSubtask.recommendedEffort
         self.subtaskSummary = subtaskSummary
         self.clientProvidedEffort = clientProvidedEffort
+        self.isUserTurnBoundary = isUserTurnBoundary
     }
 
     public init(from decoder: Decoder) throws {
@@ -978,6 +1237,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         recommendedEffort = try c.decodeIfPresent(ReasoningEffort.self, forKey: .recommendedEffort) ?? decodedSubtask.recommendedEffort
         subtaskSummary = try c.decodeIfPresent(String.self, forKey: .subtaskSummary)
         clientProvidedEffort = try c.decodeIfPresent(ReasoningEffort.self, forKey: .clientProvidedEffort)
+        isUserTurnBoundary = try c.decodeIfPresent(Bool.self, forKey: .isUserTurnBoundary)
     }
 }
 
@@ -1038,6 +1298,8 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
     public var agentID: String?
     public var agentIdentitySource: AgentIdentitySource?
     public var agentPolicyOverrideReason: String?
+    public var canonicalGroupID: String?
+    public var groupChannelSwitchTrace: [String]
 
     enum CodingKeys: String, CodingKey {
         case requestedModel, isAutoRouted, selectedModelUUID, selectedModelID, selectedDisplayName
@@ -1045,6 +1307,7 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
         case matchedRules, strategyName, policyVersion, deciderPluginID, decisionDurationMs, errorSummary
         case selectedEffort, subtaskCategory, routingReasonNote
         case agentID, agentIdentitySource, agentPolicyOverrideReason
+        case canonicalGroupID, groupChannelSwitchTrace
     }
 
     public init(
@@ -1068,7 +1331,9 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
         routingReasonNote: String? = nil,
         agentID: String? = nil,
         agentIdentitySource: AgentIdentitySource? = nil,
-        agentPolicyOverrideReason: String? = nil
+        agentPolicyOverrideReason: String? = nil,
+        canonicalGroupID: String? = nil,
+        groupChannelSwitchTrace: [String] = []
     ) {
         self.requestedModel = requestedModel
         self.isAutoRouted = isAutoRouted
@@ -1091,6 +1356,8 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
         self.agentID = agentID
         self.agentIdentitySource = agentIdentitySource
         self.agentPolicyOverrideReason = agentPolicyOverrideReason
+        self.canonicalGroupID = canonicalGroupID
+        self.groupChannelSwitchTrace = groupChannelSwitchTrace
     }
 
     public init(from decoder: Decoder) throws {
@@ -1116,6 +1383,8 @@ public struct RoutingDecision: Codable, Equatable, Sendable {
         agentID = try c.decodeIfPresent(String.self, forKey: .agentID)
         agentIdentitySource = try c.decodeIfPresent(AgentIdentitySource.self, forKey: .agentIdentitySource)
         agentPolicyOverrideReason = try c.decodeIfPresent(String.self, forKey: .agentPolicyOverrideReason)
+        canonicalGroupID = try c.decodeIfPresent(String.self, forKey: .canonicalGroupID)
+        groupChannelSwitchTrace = try c.decodeIfPresent([String].self, forKey: .groupChannelSwitchTrace) ?? []
     }
 }
 
@@ -1123,11 +1392,75 @@ public struct TokenUsage: Codable, Equatable, Sendable {
     public var promptTokens: Int
     public var completionTokens: Int
     public var totalTokens: Int
+    /// Prompt tokens served from provider prompt cache (included inside `promptTokens`).
+    public var cachedInputTokens: Int?
+    /// Prompt tokens written into provider prompt cache (included inside `promptTokens`).
+    public var cacheCreationTokens: Int?
 
-    public init(promptTokens: Int, completionTokens: Int, totalTokens: Int? = nil) {
+    public init(
+        promptTokens: Int,
+        completionTokens: Int,
+        totalTokens: Int? = nil,
+        cachedInputTokens: Int? = nil,
+        cacheCreationTokens: Int? = nil
+    ) {
         self.promptTokens = max(0, promptTokens)
         self.completionTokens = max(0, completionTokens)
         self.totalTokens = totalTokens ?? (max(0, promptTokens) + max(0, completionTokens))
+        self.cachedInputTokens = cachedInputTokens.flatMap { $0 > 0 ? $0 : nil }
+        self.cacheCreationTokens = cacheCreationTokens.flatMap { $0 > 0 ? $0 : nil }
+    }
+
+    public var cacheHitRate: Double? {
+        guard let cached = cachedInputTokens, cached > 0, promptTokens > 0 else { return nil }
+        return min(1.0, Double(cached) / Double(promptTokens))
+    }
+
+    /// Parses OpenAI Chat, OpenAI Responses, DeepSeek, and Anthropic usage objects,
+    /// normalizing prompt-cache read/write tokens into a consistent `TokenUsage`.
+    public static func parse(from rawUsage: [String: Any]) -> TokenUsage? {
+        let rawPrompt = rawUsage["prompt_tokens"] as? Int
+        let rawInput = rawUsage["input_tokens"] as? Int
+        let rawCompletion = (rawUsage["completion_tokens"] as? Int) ?? (rawUsage["output_tokens"] as? Int)
+        let cacheReadAnthropic = rawUsage["cache_read_input_tokens"] as? Int
+        let cacheCreateAnthropic = rawUsage["cache_creation_input_tokens"] as? Int
+
+        if rawPrompt == nil && rawInput == nil && rawCompletion == nil && cacheReadAnthropic == nil && cacheCreateAnthropic == nil {
+            return nil
+        }
+
+        let isAnthropicStyle = (cacheReadAnthropic != nil || cacheCreateAnthropic != nil) && rawPrompt == nil
+        if isAnthropicStyle {
+            let uncachedIn = max(0, rawInput ?? 0)
+            let readIn = max(0, cacheReadAnthropic ?? 0)
+            let createIn = max(0, cacheCreateAnthropic ?? 0)
+            let totalPrompt = uncachedIn + readIn + createIn
+            let out = max(0, rawCompletion ?? 0)
+            return TokenUsage(
+                promptTokens: totalPrompt,
+                completionTokens: out,
+                totalTokens: totalPrompt + out,
+                cachedInputTokens: readIn > 0 ? readIn : nil,
+                cacheCreationTokens: createIn > 0 ? createIn : nil
+            )
+        }
+
+        let promptDetails = rawUsage["prompt_tokens_details"] as? [String: Any]
+        let inputDetails = rawUsage["input_tokens_details"] as? [String: Any]
+        let cached = (promptDetails?["cached_tokens"] as? Int)
+            ?? (inputDetails?["cached_tokens"] as? Int)
+            ?? (rawUsage["prompt_cache_hit_tokens"] as? Int)
+
+        let prompt = max(0, rawPrompt ?? rawInput ?? 0)
+        let completion = max(0, rawCompletion ?? 0)
+        let total = rawUsage["total_tokens"] as? Int
+        return TokenUsage(
+            promptTokens: prompt,
+            completionTokens: completion,
+            totalTokens: total,
+            cachedInputTokens: cached,
+            cacheCreationTokens: nil
+        )
     }
 }
 
@@ -1177,6 +1510,7 @@ public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable 
     public var costStatus: CostCalculationStatus
     public var errorMessage: String?
     public var retryAfterSeconds: Double?
+    public var accountLabel: String?
 
     public init(
         id: UUID = UUID(),
@@ -1194,7 +1528,8 @@ public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable 
         usageEstimationMethod: String?,
         costUSD: Double?,
         costStatus: CostCalculationStatus,
-        errorMessage: String?
+        errorMessage: String?,
+        accountLabel: String? = nil
     ) {
         self.id = id
         self.attemptIndex = attemptIndex
@@ -1212,6 +1547,7 @@ public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable 
         self.costUSD = costUSD
         self.costStatus = costStatus
         self.errorMessage = errorMessage
+        self.accountLabel = accountLabel
     }
 }
 
@@ -1265,6 +1601,31 @@ public struct ComparisonAnalysis: Codable, Equatable, Sendable {
     }
 }
 
+public struct LiveRoutingState: Equatable, Sendable {
+    public var inFlightCount: Int
+    public var activeAgentName: String?
+    public var targetModelDisplayName: String?
+    public var targetTier: ModelTier?
+    public var lastCompletedSummary: String?
+    public var updatedAt: Date
+
+    public init(
+        inFlightCount: Int = 0,
+        activeAgentName: String? = nil,
+        targetModelDisplayName: String? = nil,
+        targetTier: ModelTier? = nil,
+        lastCompletedSummary: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.inFlightCount = inFlightCount
+        self.activeAgentName = activeAgentName
+        self.targetModelDisplayName = targetModelDisplayName
+        self.targetTier = targetTier
+        self.lastCompletedSummary = lastCompletedSummary
+        self.updatedAt = updatedAt
+    }
+}
+
 public struct RoutingImpactSummary: Equatable, Sendable {
     public var baselineModelDisplayName: String
     public var evaluatedTurnCount: Int
@@ -1276,7 +1637,11 @@ public struct RoutingImpactSummary: Equatable, Sendable {
     public var baselineAvgLatencyMs: Double?
     public var speedGainPercent: Double?
     public var speedSavedMsPerTurn: Double?
+    public var totalTimeSavedSeconds: Double?
+    public var actualTotalLatencyMs: Double
+    public var baselineTotalLatencyMs: Double?
     public var speedSampleCount: Int
+    public var speedComparedTurnCount: Int
     public var successRatePercent: Int
     public var retryCount: Int
     public var top10PercentCostSharePercent: Double?
@@ -1293,11 +1658,15 @@ public struct RoutingImpactSummary: Equatable, Sendable {
         baselineAvgLatencyMs: Double?,
         speedGainPercent: Double?,
         speedSavedMsPerTurn: Double?,
+        totalTimeSavedSeconds: Double? = nil,
+        actualTotalLatencyMs: Double = 0,
+        baselineTotalLatencyMs: Double? = nil,
         speedSampleCount: Int,
         successRatePercent: Int,
         retryCount: Int,
         top10PercentCostSharePercent: Double?,
-        speedBasisLabel: String
+        speedBasisLabel: String,
+        speedComparedTurnCount: Int = 0
     ) {
         self.baselineModelDisplayName = baselineModelDisplayName
         self.evaluatedTurnCount = evaluatedTurnCount
@@ -1309,7 +1678,11 @@ public struct RoutingImpactSummary: Equatable, Sendable {
         self.baselineAvgLatencyMs = baselineAvgLatencyMs
         self.speedGainPercent = speedGainPercent
         self.speedSavedMsPerTurn = speedSavedMsPerTurn
+        self.totalTimeSavedSeconds = totalTimeSavedSeconds
+        self.actualTotalLatencyMs = actualTotalLatencyMs
+        self.baselineTotalLatencyMs = baselineTotalLatencyMs
         self.speedSampleCount = speedSampleCount
+        self.speedComparedTurnCount = speedComparedTurnCount
         self.successRatePercent = successRatePercent
         self.retryCount = retryCount
         self.top10PercentCostSharePercent = top10PercentCostSharePercent

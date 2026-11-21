@@ -59,12 +59,9 @@ struct NativeResponsesObserver {
     }
 
     mutating func observeResponse(_ response: [String: Any]) {
-        if let rawUsage = response["usage"] as? [String: Any] {
-            let input = rawUsage["input_tokens"] as? Int
-            let output = rawUsage["output_tokens"] as? Int
-            if input != nil || output != nil {
-                usage = TokenUsage(promptTokens: input ?? 0, completionTokens: output ?? 0, totalTokens: rawUsage["total_tokens"] as? Int)
-            }
+        if let rawUsage = response["usage"] as? [String: Any],
+           let parsed = TokenUsage.parse(from: rawUsage) {
+            usage = parsed
         }
         let needsText = text.isEmpty
         let needsReasoning = reasoning.isEmpty
