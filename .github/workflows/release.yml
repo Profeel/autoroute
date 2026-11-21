@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   signed-notarized-release:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       AUTOROUTE_REQUIRE_DEVELOPER_ID: "1"
       NOTARYTOOL_KEYCHAIN_PROFILE: autoroute-notary
