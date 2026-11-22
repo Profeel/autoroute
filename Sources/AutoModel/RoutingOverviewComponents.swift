@@ -67,45 +67,23 @@ struct LiveRoutingBannerView: View {
                 Circle()
                     .fill(Color.green)
                     .frame(width: 8, height: 8)
-                Text("LIVE")
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.green)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(Color.green.opacity(0.14), in: RoundedRectangle(cornerRadius: 4))
-
-                Text("\(state.activeAgentName ?? "客户端") → \(state.targetModelDisplayName ?? "路由中…")")
-                    .font(.callout.weight(.medium))
+                Text("路由目标")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                Text(state.targetModelDisplayName ?? "路由中…")
+                    .font(.callout.weight(.semibold))
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(state.targetModelDisplayName ?? "路由中…")
+                    .accessibilityLabel("最近开始请求的初始路由目标：\(state.targetModelDisplayName ?? "路由中")；并发请求或重试可能使用其他模型")
 
-                if let tier = state.targetTier {
-                    Text(tier.shortName)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.12), in: Capsule())
-                }
+                Spacer(minLength: 0)
 
-                Spacer()
-
-                Text("正在生成中 (\(state.inFlightCount) 个进行中)…")
+                Text("\(state.inFlightCount) 个进行中")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-            } else if let summary = state.lastCompletedSummary {
-                Circle()
-                    .fill(Color.blue.opacity(0.75))
-                    .frame(width: 7, height: 7)
-                Text("最近路由")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(summary)
-                    .font(.callout)
-                    .lineLimit(1)
-                Spacer()
-                Text(state.updatedAt, style: .relative)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .fixedSize()
             } else {
                 Circle()
                     .fill(engine.proxyState.isRunning ? Color.green.opacity(0.7) : Color.secondary.opacity(0.5))
@@ -114,9 +92,6 @@ struct LiveRoutingBannerView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text(engine.config.proxySettings.baseURLString)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
             }
         }
         .padding(.horizontal, 12)
@@ -126,11 +101,14 @@ struct LiveRoutingBannerView: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
         )
+        .help(state.inFlightCount > 0 ? "显示最近开始请求的初始路由目标；并发请求或上游重试可能使用其他模型。" : "")
     }
 }
 
 struct StrategyTierStripView: View {
     @ObservedObject var engine: AutoModelEngine
+    var compact = false
+    var overview = false
     @State private var activePopoverTier: ModelTier?
 
     var body: some View {
@@ -141,9 +119,15 @@ struct StrategyTierStripView: View {
         let modelsByID = Dictionary(uniqueKeysWithValues: engine.config.models.map { ($0.id, $0) })
         let providersByID = Dictionary(uniqueKeysWithValues: engine.config.providers.map { ($0.id, $0) })
 
-        HStack(spacing: 10) {
+        let layout = compact
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
+            : AnyLayout(HStackLayout(spacing: 10))
+        return layout {
             ForEach(ModelTier.allCases) { tier in
-                let assignment = engine.config.policy.tierAssignment(for: tier)
+                let assignment = TierModelAssignment(
+                    primaryModelID: engine.config.policy.modelID(for: tier),
+                    backupModelIDs: engine.config.policy.backupModelIDs(for: tier)
+                )
                 let primaryModel = assignment.primaryModelID.flatMap { modelsByID[$0] }
                 let primaryProvider = primaryModel.flatMap { providersByID[$0.providerID] }
                 let channelCount: Int = {
@@ -156,55 +140,74 @@ struct StrategyTierStripView: View {
                     activePopoverTier = tier
                 } label: {
                     VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 6) {
-                            Text(tier.shortName)
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            if channelCount > 1 {
-                                Text("\(channelCount)通道")
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.blue)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(Color.blue.opacity(0.12), in: Capsule())
-                            }
-                            Spacer()
-                            Image(systemName: "slider.horizontal.3")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-
-                        HStack(spacing: 5) {
-                            if let primaryModel {
-                                ModelFamilyIcon(modelID: ModelPresentationIdentity.id(for: primaryModel))
+                        if overview {
+                            HStack(spacing: 6) {
+                                Text(tier.shortName)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize()
+                                Text(primaryModel?.displayName ?? "未配置模型")
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(primaryModel != nil ? .primary : .secondary)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 0)
+                                Image(systemName: "slider.horizontal.3")
                                     .font(.caption2)
+                                    .foregroundStyle(.tertiary)
                             }
-                            Text(primaryModel?.displayName ?? "未配置模型")
-                                .font(.callout.weight(.semibold))
-                                .foregroundStyle(primaryModel != nil ? .primary : .secondary)
-                                .lineLimit(1)
-                            if let providerName = primaryProvider?.name {
-                                Text("· \(providerName)")
+                        } else {
+                            HStack(spacing: 6) {
+                                Text(tier.shortName)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                if channelCount > 1 {
+                                    Text("\(channelCount)通道")
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.blue)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.blue.opacity(0.12), in: Capsule())
+                                }
+                                Spacer()
+                                Image(systemName: "slider.horizontal.3")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+
+                            HStack(spacing: 5) {
+                                if let primaryModel {
+                                    ModelFamilyIcon(modelID: ModelPresentationIdentity.id(for: primaryModel))
+                                        .font(.caption2)
+                                }
+                                Text(primaryModel?.displayName ?? "未配置模型")
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(primaryModel != nil ? .primary : .secondary)
+                                    .lineLimit(1)
+                                if let providerName = primaryProvider?.name {
+                                    Text("· \(providerName)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+
+                            if backupNames.isEmpty {
+                                Text("备用：自动同组/同档回退")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            } else {
+                                Text("备用：\(backupNames.joined(separator: " → "))")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                             }
                         }
-
-                        if backupNames.isEmpty {
-                            Text("备用：自动同组/同档回退")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                        } else {
-                            Text("备用：\(backupNames.joined(separator: " → "))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
+                    .frame(minHeight: overview ? 36 : nil, alignment: .leading)
+                    .padding(overview ? 8 : 10)
                     .background(Color(.controlBackgroundColor).opacity(0.75), in: RoundedRectangle(cornerRadius: 10))
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
@@ -212,6 +215,8 @@ struct StrategyTierStripView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .help("\(tier.shortName)主模型：\(primaryModel?.displayName ?? "未配置模型")；点击编辑")
+                .accessibilityLabel("\(tier.shortName)主模型：\(primaryModel?.displayName ?? "未配置模型")，点击编辑")
                 .popover(
                     isPresented: Binding(
                         get: { activePopoverTier == tier },
@@ -228,13 +233,17 @@ struct StrategyTierStripView: View {
 
 struct TodayOverviewChartsView: View {
     @ObservedObject var engine: AutoModelEngine
+    var compact = false
 
     var body: some View {
         let impact = engine.routingImpactSummary(todayOnly: true)
         let hourly = engine.todayHourlyTokenBuckets()
         let breakdown = engine.todayModelTokenBreakdown()
 
-        HStack(alignment: .top, spacing: 10) {
+        let layout = compact
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
+            : AnyLayout(HStackLayout(alignment: .top, spacing: 10))
+        return layout {
             // 1. Today vs Flagship Baseline
             todayImpactCard(impact: impact)
                 .frame(maxWidth: .infinity)
@@ -256,7 +265,7 @@ struct TodayOverviewChartsView: View {
                 Text("基准：\(impact.baselineModelDisplayName)")
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 if impact.evaluatedTurnCount > 0 {
-                    Text("\(impact.costSavedUSD >= 0 ? "估算节省" : "估算多支出") \(AutoModelFormatter.formatUSD(abs(impact.costSavedUSD)))")
+                    Text(impact.costSavedUSD == 0 ? "估算费用相同" : "\(impact.costSavedUSD > 0 ? "估算节省" : "估算多支出") \(AutoModelFormatter.formatUSD(abs(impact.costSavedUSD)))")
                         .font(.caption.weight(.semibold))
                     Text("费用可对比 \(impact.evaluatedTurnCount) 条")
                         .font(.caption2).foregroundStyle(.secondary)
@@ -410,7 +419,7 @@ struct SessionTaskDetailView: View {
 
     private struct TurnBarPoint: Identifiable {
         let id: UUID
-        let turnLabel: String
+        let turnNumber: Int
         let tokens: Int
         let modelID: String
     }
@@ -420,7 +429,7 @@ struct SessionTaskDetailView: View {
         let turnPoints: [TurnBarPoint] = recordsChronological.enumerated().map { idx, rec in
             TurnBarPoint(
                 id: rec.id,
-                turnLabel: "T\(idx + 1)",
+                turnNumber: idx + 1,
                 tokens: max(0, rec.finalUsage?.totalTokens ?? 0),
                 modelID: ModelPresentationIdentity.id(for: rec, models: engine.config.models)
             )
@@ -436,23 +445,35 @@ struct SessionTaskDetailView: View {
                         .lineLimit(2)
 
                     if let impact = sessionImpact {
-                        HStack(spacing: 12) {
-                            Label(
-                                String(format: "对比 %@ 省 $%.3f", impact.baselineModelDisplayName, max(0, impact.costSavedUSD)),
-                                systemImage: "arrow.down.circle.fill"
-                            )
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.green)
+                        VStack(alignment: .leading, spacing: 4) {
+                            if impact.evaluatedTurnCount > 0 {
+                                let costDescription = impact.costSavedUSD == 0
+                                    ? "费用相同"
+                                    : "\(impact.costSavedUSD > 0 ? "节省" : "多支出") \(AutoModelFormatter.formatUSD(abs(impact.costSavedUSD)))"
+                                Label("对比 \(impact.baselineModelDisplayName) \(costDescription)", systemImage: "dollarsign.circle.fill")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(impact.costSavedUSD > 0 ? Color.green : (impact.costSavedUSD < 0 ? Color.orange : Color.secondary))
+                            } else {
+                                Text("暂无可比费用")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
 
-                            if let sec = impact.totalTimeSavedSeconds, impact.speedSampleCount > 0 {
+                            if let baselineTotal = impact.baselineTotalLatencyMs,
+                               impact.speedSampleCount > 0, impact.speedComparedTurnCount > 0 {
+                                let sec = (baselineTotal - impact.actualTotalLatencyMs) / 1000
                                 Label(
-                                    String(format: "省 %.1f 秒", max(0, sec)),
+                                    sec == 0 ? "耗时相同" : String(format: "%@ %.1f 秒", sec > 0 ? "节省" : "增加", abs(sec)),
                                     systemImage: "bolt.circle.fill"
                                 )
                                 .font(.caption.monospacedDigit())
-                                .foregroundStyle(.blue)
+                                .foregroundStyle(sec < 0 ? Color.orange : Color.blue)
                             }
                         }
+                    } else {
+                        Text("暂无可比费用")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -482,11 +503,24 @@ struct SessionTaskDetailView: View {
                     } else {
                         Chart(turnPoints) { point in
                             BarMark(
-                                x: .value("轮次", point.turnLabel),
+                                x: .value("轮次", point.turnNumber),
                                 y: .value("Tokens", point.tokens)
                             )
                             .foregroundStyle(ModelChartPalette.color(for: point.modelID))
                             .cornerRadius(3)
+                        }
+                        .chartXScale(domain: 0.5...(Double(turnPoints.count) + 0.5))
+                        .chartXAxis {
+                            AxisMarks(values: routingTurnAxisValues(turnPoints.count)) { value in
+                                AxisGridLine()
+                                AxisValueLabel(anchor: turnPoints.count == 1 ? .top : (value.as(Int.self) == 1 ? .topLeading : (value.as(Int.self) == turnPoints.count ? .topTrailing : .top))) {
+                                    if let turn = value.as(Int.self) {
+                                        Text("T\(turn)")
+                                            .font(.caption2.monospacedDigit())
+                                            .fixedSize(horizontal: true, vertical: false)
+                                    }
+                                }
+                            }
                         }
                         .frame(height: 130)
                     }
@@ -595,5 +629,15 @@ struct SessionTaskDetailView: View {
             return String(format: "%.1fk", Double(count) / 1_000.0)
         }
         return "\(count)"
+    }
+}
+
+// Keep first and last turns visible while limiting labels in long sessions.
+func routingTurnAxisValues(_ count: Int) -> [Int] {
+    guard count > 0 else { return [] }
+    let labelCount = min(count, 6)
+    guard labelCount > 1 else { return [1] }
+    return (0..<labelCount).map { index in
+        1 + Int((Double(index) * Double(count - 1) / Double(labelCount - 1)).rounded())
     }
 }

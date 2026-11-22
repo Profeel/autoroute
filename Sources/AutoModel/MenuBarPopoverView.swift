@@ -23,19 +23,22 @@ struct MenuBarPopoverView: View {
     @State private var currentDayKey = DailyUsageLedger.dayKey(for: Date())
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ConnectionStatusView(engine: engine, onNavigate: { onOpenMainWindow($0, nil) }, onOpenReceipt: { onOpenMainWindow(.history, $0) })
-            ActivitySummaryView(engine: engine, onOpenReceipt: { onOpenMainWindow(.history, $0) })
-            liveRoutingRow
-            DisclosureGroup("策略与档位") { strategyAndTiersSection }
-
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ConnectionStatusView(engine: engine, onNavigate: { onOpenMainWindow($0, nil) }, onOpenReceipt: { onOpenMainWindow(.history, $0) })
+                    ActivitySummaryView(engine: engine, onOpenReceipt: { onOpenMainWindow(.history, $0) })
+                    liveRoutingRow
+                    DisclosureGroup("策略与档位") { strategyAndTiersSection }
+                }
+                .padding(14)
+            }
             Divider()
-
-            // 5. Footer: Open Main Window / Quit
             footerSection
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
         }
-        .padding(14)
-        .frame(width: 320)
+        .frame(width: 320, height: 380)
         .onAppear {
             currentDayKey = DailyUsageLedger.dayKey(for: Date())
         }
@@ -92,6 +95,7 @@ struct MenuBarPopoverView: View {
                 Text("质量").tag(RoutingStrategyPreset.qualityFirst)
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
 
             HStack(spacing: 6) {
                 ForEach(ModelTier.allCases) { tier in

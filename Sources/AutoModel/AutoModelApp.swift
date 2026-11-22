@@ -215,16 +215,24 @@ struct AutoModelApp: App {
     }
 }
 
+private struct SidebarFooterHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct MainContentView: View {
     @ObservedObject var engine: AutoModelEngine
     @ObservedObject var navigationState: AppNavigationState
     @State private var selectedTab: SidebarTab = .history
-    @State private var copiedAddressToast = false
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var sidebarFooterHeight: CGFloat = 220
     @State private var showTestBenchSheet = false
     @State private var showOnboardingSheet = false
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             List(SidebarTab.allCases, selection: $selectedTab) { tab in
                 HStack {
                     Label(tab.rawValue, systemImage: tab.systemImage)
@@ -262,8 +270,7 @@ struct MainContentView: View {
                         },
                         onNavigateToProviders: {
                             selectedTab = .modelsAndPolicy
-                        },
-                        onNavigate: { selectedTab = $0 }
+                        }
                     )
                 case .modelsAndPolicy:
                     ProvidersModelsView(engine: engine)
@@ -287,6 +294,7 @@ struct MainContentView: View {
                     Text("质量").tag(RoutingStrategyPreset.qualityFirst)
                 }
                 .pickerStyle(.segmented)
+                .labelsHidden()
                 .frame(width: 210)
                 .help("全局切换路由策略：省钱 / 均衡 / 质量")
             }
@@ -372,60 +380,36 @@ struct MainContentView: View {
     }
 
     private var sidebarStatusFooter: some View {
-        return VStack(alignment: .leading, spacing: 8) {
+        VStack(spacing: 0) {
             Divider()
-
-            // Card 2: Proxy Status Card
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(engine.proxyState.isRunning ? Color.green : Color.red)
-                        .frame(width: 7, height: 7)
-                    Text(engine.proxyState.statusText)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
-                    Spacer()
-                    Button(engine.proxyState.isRunning ? "停止" : "启动") {
-                        if engine.proxyState.isRunning {
-                            engine.stopProxy()
-                        } else {
-                            engine.startProxy()
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ConnectionStatusView(
+                        engine: engine,
+                        onNavigate: { selectedTab = $0 },
+                        onOpenReceipt: openSidebarReceipt,
+                        compact: true
+                    )
+                    ActivitySummaryView(engine: engine, onOpenReceipt: openSidebarReceipt, compact: true)
                 }
-
-                HStack(spacing: 4) {
-                    Text(engine.config.proxySettings.baseURLString)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer()
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(engine.config.proxySettings.baseURLString, forType: .string)
-                        copiedAddressToast = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            copiedAddressToast = false
-                        }
-                    } label: {
-                        Image(systemName: copiedAddressToast ? "checkmark" : "doc.on.doc")
-                            .font(.caption2)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear.preference(key: SidebarFooterHeightKey.self, value: geometry.size.height)
                     }
-                    .buttonStyle(.borderless)
-                    .help("复制本地代理地址")
                 }
             }
-            .padding(9)
-            .background(Color(.controlBackgroundColor).opacity(0.85), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
-            )
+            .frame(height: min(sidebarFooterHeight, 360))
+            .onPreferenceChange(SidebarFooterHeightKey.self) { height in
+                if height > 0 { sidebarFooterHeight = height }
+            }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+    }
+
+    private func openSidebarReceipt(_ id: UUID) {
+        selectedTab = .history
+        navigationState.requestedRecordID = id
     }
 
     private func portConflictBanner(occupiedPort: Int, suggested: Int?) -> some View {

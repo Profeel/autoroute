@@ -12,7 +12,10 @@ struct TierAssignmentPopover: View {
     }
 
     private var assignment: TierModelAssignment {
-        engine.config.policy.tierAssignment(for: tier, strategy: strategy)
+        TierModelAssignment(
+            primaryModelID: engine.config.policy.modelID(for: tier),
+            backupModelIDs: engine.config.policy.backupModelIDs(for: tier)
+        )
     }
 
     private var connectedModels: [(model: ModelConfig, provider: ProviderConfig)] {

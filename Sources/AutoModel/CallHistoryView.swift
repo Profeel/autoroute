@@ -7,15 +7,16 @@ struct CallHistoryView: View {
     var requestedRecordID: UUID? = nil
     var onConsumeRequestedRecord: (() -> Void)? = nil
     var onNavigateToProviders: (() -> Void)? = nil
-    var onNavigate: ((SidebarTab) -> Void)? = nil
 
     @State private var selectedRecordID: UUID?
     @State private var inspectedTurnRecord: CallRecord?
     @State private var filterMode: FilterMode = .all
     @State private var groupMode: GroupMode = .bySession
     @State private var searchText: String = ""
-    @State private var clearHistoryError: String?
-    @State private var showClearHistoryError = false
+    @State private var showStrategyDetails = false
+    @State private var showNarrowDetail = false
+    @State private var narrowDetailBeforeStrategy = false
+    @State private var usesSinglePane = false
     @State private var cachedFilteredRecords: [CallRecord] = []
     @State private var cachedSessionItems: [SessionSummaryItem] = []
     @State private var cachedSignature: String = ""
@@ -121,23 +122,9 @@ struct CallHistoryView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            ConnectionStatusView(engine: engine, onNavigate: { onNavigate?($0) }, onOpenReceipt: openReceipt)
-            ActivitySummaryView(engine: engine, onOpenReceipt: openReceipt)
-            DisclosureGroup("策略、档位与统计详情") {
-                VStack(spacing: 10) {
-                    LiveRoutingBannerView(engine: engine)
-                    StrategyTierStripView(engine: engine)
-                    SavingsDetailsView(engine: engine)
-                    TodayOverviewChartsView(engine: engine)
-                }.padding(.top, 6)
-            }
+            strategyOverview
 
-            // 4. History Split Workspace
-            VStack(spacing: 0) {
-                historyToolbar
-                Divider()
-                historySplitBody
-            }
+            historySplitBody
             .background(Color(.controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
@@ -178,104 +165,246 @@ struct CallHistoryView: View {
             }
             .frame(minWidth: 720, minHeight: 540)
         }
-        .alert("清除历史失败", isPresented: $showClearHistoryError) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(clearHistoryError ?? "未知错误")
+    }
+
+    private var strategyOverview: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    strategySummary.fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 8)
+                    strategyDetailsButton
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    strategySummary
+                    HStack {
+                        Spacer()
+                        strategyDetailsButton
+                    }
+                }
+            }
+            Text(engine.config.policy.preferTierMappingInAuto
+                 ? "全局三档主模型" : "全局三档主模型 · 自动路由未优先使用三档")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            StrategyTierStripView(engine: engine, overview: true)
+            LiveRoutingBannerView(engine: engine)
         }
     }
 
-    private var historyToolbar: some View {
-        HStack(spacing: 10) {
-            Picker("视图模式", selection: $groupMode) {
-                ForEach(GroupMode.allCases, id: \.self) { mode in
-                    Text(mode.rawValue).tag(mode)
+    private var strategySummary: some View {
+        let policy = engine.config.policy
+        let pinNote: String = {
+            guard let id = policy.pinnedModelID else { return "" }
+            let name = engine.config.models.first(where: { $0.id == id })?.displayName ?? "未找到配置的模型"
+            return " · 自动请求固定：\(name)（满足条件时）"
+        }()
+        let summary = "全局策略：\(policy.activeStrategy.displayName)\(pinNote)"
+        return Text(summary)
+            .font(.callout.weight(.medium))
+            .lineLimit(2)
+            .help(policy.pinnedModelID == nil ? summary : "\(summary)。固定模型需满足请求的硬约束；显式模型或档位按请求处理，Agent 配置可能不同。")
+            .accessibilityLabel(summary)
+    }
+
+    private var strategyDetailsButton: some View {
+        Button {
+            narrowDetailBeforeStrategy = selectedRecord != nil && (!usesSinglePane || showNarrowDetail)
+            showStrategyDetails = true
+            showNarrowDetail = true
+        } label: {
+            Label("策略、档位与统计", systemImage: "slider.horizontal.3")
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .accessibilityLabel("打开策略与统计详情")
+        .disabled(showStrategyDetails)
+    }
+
+    private func historyToolbar(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    groupPicker.frame(width: 210)
+                    searchField.frame(minWidth: 150)
+                }
+                VStack(spacing: 8) {
+                    groupPicker
+                    searchField
                 }
             }
-            .pickerStyle(.segmented)
-            .frame(width: 210)
 
-            Picker("状态", selection: $filterMode) {
-                ForEach(FilterMode.allCases, id: \.self) { mode in
-                    Text(mode.rawValue).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 150)
-
-            TextField("搜索 Agent / 模型 / 提示词…", text: $searchText)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 240)
-
-            Spacer()
-
-            if !engine.callHistory.isEmpty {
-                Button("清空列表") {
-                    do {
-                        try engine.clearCallHistory()
-                        selectedRecordID = nil
-                    } catch {
-                        clearHistoryError = error.localizedDescription
-                        showClearHistoryError = true
+            HStack(spacing: 8) {
+                Picker("状态", selection: $filterMode) {
+                    ForEach(FilterMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
                     }
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .accessibilityLabel("筛选调用状态")
+                if compact, selectedRecord != nil {
+                    Button("查看选中记录") { showNarrowDetail = true }
+                        .controlSize(.small)
+                        .accessibilityLabel("查看选中的记录详情")
+                }
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
 
-    @ViewBuilder
+    private var groupPicker: some View {
+        Picker("视图模式", selection: $groupMode) {
+            ForEach(GroupMode.allCases, id: \.self) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .accessibilityLabel("记录分组方式")
+    }
+
+    private var searchField: some View {
+        TextField("搜索 Agent / 模型 / 提示词…", text: $searchText)
+            .textFieldStyle(.roundedBorder)
+            .accessibilityLabel("搜索路由记录")
+    }
+
     private var historySplitBody: some View {
-        if baseFilteredRecords.isEmpty {
-            VStack(spacing: 10) {
-                Image(systemName: "tray")
-                    .font(.system(size: 28))
-                    .foregroundStyle(.tertiary)
-                Text(engine.callHistory.isEmpty ? "暂无路由记录" : "当前筛选条件下无匹配记录")
-                    .font(.callout.weight(.medium))
-                    .foregroundStyle(.secondary)
-                if engine.config.providers.filter(\.isEnabled).isEmpty, let onNavigateToProviders {
-                    Button("前往「提供商」接入模型") {
-                        onNavigateToProviders()
+        GeometryReader { geometry in
+            Group {
+                if geometry.size.width >= 700 {
+                    HSplitView {
+                        historyList(compact: false)
+                            .frame(minWidth: 280, idealWidth: 320, maxWidth: 400)
+                        detailPane(compact: false)
+                            .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                } else if showNarrowDetail {
+                    detailPane(compact: true)
+                } else {
+                    historyList(compact: true)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(24)
-        } else {
-            HSplitView {
-                Group {
-                    if groupMode == .bySession {
-                        List(sessionItems, selection: Binding(
-                            get: { selectedSession?.id },
-                            set: { newKey in
-                                if let newKey, let matched = sessionItems.first(where: { $0.id == newKey }) {
-                                    selectedRecordID = matched.representativeRecord.id
-                                }
-                            }
-                        )) { session in
-                            sessionRow(session)
-                                .tag(session.id)
-                        }
-                        .listStyle(.inset)
-                    } else {
-                        List(baseFilteredRecords, selection: Binding(
-                            get: { selectedRecord?.id },
-                            set: { selectedRecordID = $0 }
-                        )) { record in
-                            singleCallRow(record)
-                                .tag(record.id)
-                        }
-                        .listStyle(.inset)
-                    }
-                }
-                .frame(minWidth: 290, idealWidth: 330, maxWidth: 400)
+            .onAppear { usesSinglePane = geometry.size.width < 700 }
+            .onChange(of: geometry.size.width) { _, width in usesSinglePane = width < 700 }
+        }
+    }
 
+    private func historyList(compact: Bool) -> some View {
+        VStack(spacing: 0) {
+            historyToolbar(compact: compact)
+            Divider()
+            if baseFilteredRecords.isEmpty {
+                emptyHistory
+            } else if groupMode == .bySession {
+                List(sessionItems, selection: Binding(
+                    get: { selectedSession?.id },
+                    set: { newKey in
+                        if let newKey, let matched = sessionItems.first(where: { $0.id == newKey }) {
+                            selectedRecordID = matched.representativeRecord.id
+                            if compact { showNarrowDetail = true }
+                        }
+                    }
+                )) { session in
+                    sessionRow(session)
+                        .tag(session.id)
+                }
+                .listStyle(.inset)
+            } else {
+                List(baseFilteredRecords, selection: Binding(
+                    get: { selectedRecord?.id },
+                    set: {
+                        selectedRecordID = $0
+                        if compact && $0 != nil { showNarrowDetail = true }
+                    }
+                )) { record in
+                    singleCallRow(record)
+                        .tag(record.id)
+                }
+                .listStyle(.inset)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyHistory: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "tray")
+                .font(.system(size: 28))
+                .foregroundStyle(.tertiary)
+            Text(engine.callHistory.isEmpty ? "暂无路由记录" : "当前筛选条件下无匹配记录")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.secondary)
+            if engine.config.providers.filter(\.isEnabled).isEmpty, let onNavigateToProviders {
+                Button("前往「提供商」接入模型") {
+                    onNavigateToProviders()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+    }
+
+    private func detailPane(compact: Bool) -> some View {
+        VStack(spacing: 0) {
+            if showStrategyDetails {
+                HStack {
+                    Text("策略与统计").font(.headline)
+                    Spacer()
+                    Button {
+                        showStrategyDetails = false
+                        showNarrowDetail = narrowDetailBeforeStrategy
+                    } label: {
+                        Label("关闭", systemImage: "xmark")
+                    }
+                    .buttonStyle(.borderless)
+                    .keyboardShortcut(.escape, modifiers: [])
+                    .accessibilityLabel("关闭策略与统计")
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        LiveRoutingBannerView(engine: engine)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("当前策略").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            Picker("当前策略", selection: Binding(
+                                get: { engine.config.policy.activeStrategy },
+                                set: { engine.setStrategy($0) }
+                            )) {
+                                Text("省钱").tag(RoutingStrategyPreset.costFirst)
+                                Text("均衡").tag(RoutingStrategyPreset.balanced)
+                                Text("质量").tag(RoutingStrategyPreset.qualityFirst)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .accessibilityLabel("当前路由策略")
+                        }
+                        StrategyTierStripView(engine: engine, compact: true)
+                        SavingsDetailsView(engine: engine)
+                        TodayOverviewChartsView(engine: engine, compact: true)
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                if compact {
+                    HStack {
+                        Text("记录详情").font(.headline)
+                        Spacer()
+                        Button("返回记录") { showNarrowDetail = false }
+                            .keyboardShortcut(.escape, modifiers: [])
+                            .accessibilityLabel("返回路由记录列表")
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    Divider()
+                }
                 Group {
                     if groupMode == .bySession, let session = selectedSession {
                         SessionTaskDetailView(
@@ -305,9 +434,10 @@ struct CallHistoryView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
-                .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func sessionRow(_ session: SessionSummaryItem) -> some View {
