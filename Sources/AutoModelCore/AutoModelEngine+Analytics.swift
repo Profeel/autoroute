@@ -447,15 +447,7 @@ extension AutoModelEngine {
     }
 
     func flagshipBaselineModel() -> ModelConfig? {
-        if let high = model(for: .high), high.blendedPricePerMillion != nil {
-            return high
-        }
-        if let pricedFlagship = config.models
-            .filter({ $0.isEnabled && $0.blendedPricePerMillion != nil })
-            .max(by: { $0.qualityScore < $1.qualityScore }) {
-            return pricedFlagship
-        }
-        return model(for: .high) ?? config.models.max(by: { $0.qualityScore < $1.qualityScore })
+        model(for: .high) ?? config.models.filter(\.isEnabled).max(by: { $0.qualityScore < $1.qualityScore })
     }
 
     func baselineEstimatesForLedger(record: CallRecord) -> (costUSD: Double?, latencyMs: Double?) {
@@ -491,19 +483,7 @@ extension AutoModelEngine {
     private func computeImpactSummary(scopedRecords: [CallRecord]) -> RoutingImpactSummary? {
         guard !scopedRecords.isEmpty else { return nil }
 
-        let baselineModel: ModelConfig? = {
-            if let high = model(for: .high), high.blendedPricePerMillion != nil {
-                return high
-            }
-            if let pricedFlagship = config.models
-                .filter({ $0.isEnabled && $0.blendedPricePerMillion != nil })
-                .max(by: { $0.qualityScore < $1.qualityScore }) {
-                return pricedFlagship
-            }
-            return model(for: .high) ?? config.models.max(by: { $0.qualityScore < $1.qualityScore })
-        }()
-
-        guard let baseline = baselineModel else { return nil }
+        guard let baseline = flagshipBaselineModel() else { return nil }
 
         let successRecords = scopedRecords.filter { $0.status == .success }
         let successRatePct = Int((Double(successRecords.count) / Double(scopedRecords.count) * 100.0).rounded())

@@ -391,7 +391,6 @@ struct MainContentView: View {
                         onOpenReceipt: openSidebarReceipt,
                         compact: true
                     )
-                    ActivitySummaryView(engine: engine, onOpenReceipt: openSidebarReceipt, compact: true)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)

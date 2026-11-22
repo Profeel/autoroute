@@ -3,34 +3,44 @@ import Charts
 import SwiftUI
 
 enum ModelChartPalette {
+    private static let hues: [CGFloat] = [0.59, 0.08, 0.34, 0.76, 0.48, 0.94, 0.15, 0.66, 0.01, 0.26]
+    private static let preferredSlots = [
+        "gpt-6.2-sol": 0,
+        "gpt-6-luna": 1,
+        "gpt-6.2-astra": 2,
+        "gpt-5.6-luna": 3,
+    ]
+
+    static func sessionColors(for modelIDs: [String]) -> [String: Color] {
+        let reservedSlots = Set(modelIDs.compactMap { preferredSlots[$0] })
+        var availableSlots = hues.indices.filter { !reservedSlots.contains($0) }.makeIterator()
+        var colors: [String: Color] = [:]
+        for modelID in modelIDs where colors[modelID] == nil {
+            if let slot = preferredSlots[modelID] ?? availableSlots.next() {
+                colors[modelID] = color(hue: hues[slot])
+            } else {
+                colors[modelID] = color(for: modelID)
+            }
+        }
+        return colors
+    }
+
     static func color(for modelID: String) -> Color {
         let id = ModelPresentationIdentity.id(for: modelID)
-        let hue: CGFloat
-        if id.hasPrefix("gpt-") || id.hasPrefix("o3") || id.hasPrefix("o4") { hue = 0.60 }
-        else if id.hasPrefix("claude-") { hue = 0.07 }
-        else if id.hasPrefix("deepseek-") { hue = 0.50 }
-        else if id.hasPrefix("glm-") { hue = 0.76 }
-        else if id.hasPrefix("gemini-") { hue = 0.35 }
-        else if id.hasPrefix("qwen") { hue = 0.91 }
-        else if id.hasPrefix("kimi-") { hue = 0.14 }
-        else {
-            let hash = id.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0x7fffffff }
-            hue = [0.15, 0.29, 0.45, 0.67, 0.84][hash % 5]
+        if let slot = preferredSlots[id] {
+            return color(hue: hues[slot])
         }
-        let shade: CGFloat
-        if id.contains("astra") || id.contains("opus") { shade = -0.10 }
-        else if id.contains("terra") || id.contains("sonnet") { shade = 0.05 }
-        else if id.contains("luna") || id.contains("haiku") { shade = 0.14 }
-        else { shade = 0 }
-        let revision: CGFloat
-        if id.contains("-6.2-") || id.contains("-5.2") { revision = -0.04 }
-        else if id.contains("-6.1-") || id.contains("-5.1") { revision = 0.03 }
-        else if id.contains("-6-") { revision = 0.07 }
-        else { revision = 0 }
-        return Color(NSColor(name: nil) { appearance in
+        let hash = id.utf8.reduce(UInt64(14_695_981_039_346_656_037)) { partial, byte in
+            (partial ^ UInt64(byte)) &* 1_099_511_628_211
+        }
+        return color(hue: CGFloat(Double(hash & 0xFFFF) / 65_536))
+    }
+
+    private static func color(hue: CGFloat) -> Color {
+        Color(NSColor(name: nil) { appearance in
             let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            return NSColor(calibratedHue: hue, saturation: dark ? 0.67 : 0.78,
-                           brightness: min(0.98, (dark ? 0.83 : 0.63) + shade + revision), alpha: 1)
+            return NSColor(calibratedHue: hue, saturation: dark ? 0.76 : 0.84,
+                           brightness: dark ? 0.90 : 0.68, alpha: 1)
         })
     }
 
@@ -409,6 +419,7 @@ struct TodayOverviewChartsView: View {
 struct SessionTaskDetailView: View {
     @ObservedObject var engine: AutoModelEngine
     let agentName: String
+    let agentKind: AgentKind?
     let title: String
     let recordsChronological: [CallRecord]
     let switchCount: Int
@@ -435,19 +446,31 @@ struct SessionTaskDetailView: View {
             )
         }
         let modelBreakdown = ModelTokenBreakdownItem.summarize(recordsChronological, models: engine.config.models)
-        let costSaved = sessionImpact.flatMap { $0.evaluatedTurnCount > 0 ? max(0, $0.costSavedUSD) : nil }
-        let timeSaved: Double? = sessionImpact.flatMap { impact in
-            guard impact.speedSampleCount > 0, impact.speedComparedTurnCount > 0 else { return nil }
-            return impact.totalTimeSavedSeconds.map { max(0, $0) }
-        }
+        let turnModelIDs = turnPoints.filter { $0.tokens > 0 }.map(\.modelID)
+        let chartModelIDs = Set(turnModelIDs).sorted()
+        let chartColors = ModelChartPalette.sessionColors(for: turnModelIDs + modelBreakdown.map(\.modelID))
+        let costSaved = sessionImpact.flatMap { $0.evaluatedTurnCount > 0 ? $0.costSavedUSD : nil }
+        let timeSaved = sessionImpact.flatMap(\.timeDifferenceSeconds)
+        let visibleTurns = min(10, turnPoints.count)
 
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                // Title & baseline savings summary
+                HStack(spacing: 7) {
+                    Image(systemName: AgentPresentation.symbol(for: agentKind))
+                        .foregroundStyle(AgentPresentation.color(for: agentKind))
+                    Text(agentName)
+                        .font(.caption.weight(.semibold))
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("调用 Agent：\(agentName)")
+
+                // Session title and model path
                 VStack(alignment: .leading, spacing: 6) {
                     Text(title)
                         .font(.title3.weight(.semibold))
                         .lineLimit(2)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityIdentifier("session-task-title")
 
                     HStack(spacing: 8) {
                         Image(systemName: switchCount > 0 ? "arrow.triangle.swap" : "checkmark.circle")
@@ -461,52 +484,37 @@ struct SessionTaskDetailView: View {
                     }
                     .foregroundStyle(switchCount > 0 ? Color.blue : Color.secondary)
 
-                    if let impact = sessionImpact {
-                        VStack(alignment: .leading, spacing: 4) {
-                            if impact.evaluatedTurnCount > 0 {
-                                let costDescription = impact.costSavedUSD == 0
-                                    ? "费用相同"
-                                    : "\(impact.costSavedUSD > 0 ? "节省" : "多支出") \(AutoModelFormatter.formatUSD(abs(impact.costSavedUSD)))"
-                                Label("对比 \(impact.baselineModelDisplayName) \(costDescription)", systemImage: "dollarsign.circle.fill")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(impact.costSavedUSD > 0 ? Color.green : (impact.costSavedUSD < 0 ? Color.orange : Color.secondary))
-                            } else {
-                                Text("暂无可比费用")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            if let baselineTotal = impact.baselineTotalLatencyMs,
-                               impact.speedSampleCount > 0, impact.speedComparedTurnCount > 0 {
-                                let sec = (baselineTotal - impact.actualTotalLatencyMs) / 1000
-                                Label(
-                                    sec == 0 ? "耗时相同" : String(format: "%@ %.1f 秒", sec > 0 ? "节省" : "增加", abs(sec)),
-                                    systemImage: "bolt.circle.fill"
-                                )
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(sec < 0 ? Color.orange : Color.blue)
-                            }
-                        }
-                    } else {
-                        Text("暂无可比费用")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
                 }
 
-                // Session KPI dashboard: the four numbers users should not have to infer.
+                if let impact = sessionImpact {
+                    Text("对比旗舰模型 · \(impact.baselineModelDisplayName)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .help("费用按本轮实际 Token 用量估算。耗时依据可比样本。\(impact.speedBasisLabel)")
+                }
+
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
                     sessionMetricTile(icon: "number", label: "总 Token", value: formatTokens(totalTokens), tint: .primary)
                     sessionMetricTile(icon: "dollarsign.circle.fill", label: "实际费用", value: totalCostUSD.map(AutoModelFormatter.formatUSD) ?? "未定价", tint: .secondary)
-                    sessionMetricTile(icon: "arrow.down.circle.fill", label: "节省费用", value: costSaved.map(AutoModelFormatter.formatUSD) ?? "—", tint: .green)
-                    sessionMetricTile(icon: "clock.badge.checkmark.fill", label: "节省时间", value: timeSaved.map(formatSavedTime) ?? "—", tint: .blue)
+                    sessionMetricTile(
+                        icon: "dollarsign.circle",
+                        label: costSaved.map { $0 < 0 ? "估算多支出" : "估算省钱" } ?? "估算省钱",
+                        value: costSaved.map { AutoModelFormatter.formatUSD(abs($0)) } ?? "—",
+                        tint: costSaved.map { $0 < 0 ? Color.orange : Color.green } ?? .secondary
+                    )
+                    sessionMetricTile(
+                        icon: "clock",
+                        label: timeSaved.map { $0 < 0 ? "估算多耗时" : "估算省时" } ?? "估算省时",
+                        value: timeSaved.map { formatSavedTime(abs($0)) } ?? "—",
+                        tint: timeSaved.map { $0 < 0 ? Color.orange : Color.blue } ?? .secondary
+                    )
                 }
 
-                if let latestRecord = recordsChronological.last {
+                if let latestRecord = recordsChronological.last, let latestModelID = turnPoints.last?.modelID {
                     VStack(alignment: .leading, spacing: 7) {
                         HStack(spacing: 7) {
-                            Image(systemName: ModelChartPalette.symbol(for: latestRecord.executedModelID ?? latestRecord.requestedModel))
-                                .foregroundStyle(ModelChartPalette.color(for: latestRecord.executedModelID ?? latestRecord.requestedModel))
+                            Image(systemName: ModelChartPalette.symbol(for: latestModelID))
+                                .foregroundStyle(chartColors[latestModelID] ?? ModelChartPalette.color(for: latestModelID))
                             Text("当前实际模型")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -533,9 +541,15 @@ struct SessionTaskDetailView: View {
                 // The KPI grid above is the primary session summary; detailed timing and switches remain in the turn list.
                 // Per-turn Token Bar Chart
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("逐轮 Token 消耗")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("逐轮 Token 消耗")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(turnPoints.count > 10 ? "最近 10 轮 · 左右滑动看更早" : "共 \(turnPoints.count) 轮")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
 
                     if turnPoints.allSatisfy({ $0.tokens == 0 }) {
                         Text("本会话暂无 Token 统计")
@@ -546,61 +560,95 @@ struct SessionTaskDetailView: View {
                     } else {
                         Chart(turnPoints) { point in
                             BarMark(
-                                x: .value("轮次", point.turnNumber),
+                                x: .value("轮次", Double(point.turnNumber)),
                                 y: .value("Tokens", point.tokens)
                             )
-                            .foregroundStyle(ModelChartPalette.color(for: point.modelID))
+                            .foregroundStyle(chartColors[point.modelID] ?? .secondary)
                             .cornerRadius(3)
+                            .accessibilityLabel("T\(point.turnNumber) · \(point.modelID)")
+                            .accessibilityValue("\(point.tokens.formatted()) Token")
                         }
                         .chartXScale(domain: 0.5...(Double(turnPoints.count) + 0.5))
+                        .chartScrollableAxes(.horizontal)
+                        .chartXVisibleDomain(length: Double(visibleTurns))
+                        .chartScrollPosition(initialX: Double(turnPoints.count - visibleTurns) + 0.5)
                         .chartXAxis {
-                            AxisMarks(values: routingTurnAxisValues(turnPoints.count)) { value in
+                            AxisMarks(values: turnPoints.map { Double($0.turnNumber) }) { value in
                                 AxisGridLine()
-                                AxisValueLabel(anchor: turnPoints.count == 1 ? .top : (value.as(Int.self) == 1 ? .topLeading : (value.as(Int.self) == turnPoints.count ? .topTrailing : .top))) {
-                                    if let turn = value.as(Int.self) {
-                                        Text("T\(turn)")
+                                AxisValueLabel {
+                                    if let turn = value.as(Double.self) {
+                                        Text("T\(Int(turn))")
                                             .font(.caption2.monospacedDigit())
-                                            .fixedSize(horizontal: true, vertical: false)
                                     }
                                 }
                             }
                         }
-                        .frame(height: 130)
+                        .frame(height: 142)
+                    }
+
+                    if chartModelIDs.count > 1 {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                ForEach(chartModelIDs, id: \.self) { modelID in
+                                    HStack(spacing: 4) {
+                                        Circle()
+                                            .fill(chartColors[modelID] ?? .secondary)
+                                            .frame(width: 7, height: 7)
+                                        Text(modelID)
+                                            .font(.caption2)
+                                            .fixedSize()
+                                    }
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
                     }
                 }
                 .padding(12)
                 .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
 
-                // Per-model breakdown bar
                 if !modelBreakdown.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("本会话各模型 Token 占比")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
 
-                        GeometryReader { geo in
-                            HStack(spacing: 2) {
+                        HStack(alignment: .center, spacing: 12) {
+                            Chart(modelBreakdown) { item in
+                                SectorMark(angle: .value("Token", item.totalTokens))
+                                    .foregroundStyle(chartColors[item.modelID] ?? .secondary)
+                            }
+                            .chartLegend(.hidden)
+                            .frame(width: 142, height: 142)
+                            .accessibilityLabel("本会话各模型 Token 占比饼图")
+                            .accessibilityValue(modelBreakdown.map { "\($0.modelLabel) \(Int($0.sharePercent.rounded()))%" }.joined(separator: "、"))
+
+                            VStack(alignment: .leading, spacing: 5) {
                                 ForEach(modelBreakdown) { item in
-                                    RoundedRectangle(cornerRadius: 3)
-                                        .fill(ModelChartPalette.color(for: item.modelID))
-                                        .frame(width: max(4, (geo.size.width - CGFloat(max(0, modelBreakdown.count - 1) * 2)) * CGFloat(item.sharePercent / 100.0)))
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        HStack(spacing: 5) {
+                                            Circle()
+                                                .fill(chartColors[item.modelID] ?? .secondary)
+                                                .frame(width: 8, height: 8)
+                                            Text(item.modelLabel)
+                                                .font(.caption2.weight(.medium))
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                            Spacer(minLength: 2)
+                                            Text("\(Int(item.sharePercent.rounded()))%")
+                                                .font(.caption2.monospacedDigit().weight(.semibold))
+                                        }
+                                        Text(formatTokens(item.totalTokens) + " tokens")
+                                            .font(.caption2.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                            .padding(.leading, 13)
+                                    }
+                                    .help("\(item.modelLabel)：\(formatTokens(item.totalTokens)) Token（\(Int(item.sharePercent.rounded()))%）")
                                 }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .frame(height: 10)
-
-                        ForEach(modelBreakdown) { item in
-                            HStack {
-                                ModelFamilyIcon(modelID: item.modelID)
-                                    .font(.caption2)
-                                Text(item.modelLabel)
-                                    .font(.caption)
-                                Spacer()
-                                Text("\(formatTokens(item.totalTokens)) (\(Int(item.sharePercent.rounded()))%)")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
+                        .accessibilityElement(children: .contain)
                     }
                     .padding(12)
                     .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 10))

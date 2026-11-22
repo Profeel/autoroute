@@ -304,7 +304,7 @@ struct SavingsDetailsView: View {
                 Text("暂无可对比的真实记录").foregroundStyle(.secondary)
             }
             if let impact {
-                Text("当前基准：\(impact.baselineModelDisplayName)；按当前单价估算，并非供应商账单。")
+                Text("相较旗舰「\(impact.baselineModelDisplayName)」；按当前单价估算，并非供应商账单。")
                     .foregroundStyle(.secondary)
                 if impact.evaluatedTurnCount > 0 {
                     let comparison = impact.costSavedUSD == 0
