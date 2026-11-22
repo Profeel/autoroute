@@ -3,6 +3,65 @@ import XCTest
 @testable import AutoModelCore
 
 final class ConnectionReadinessTests: XCTestCase {
+    func testOnboardingAgentPrefersConnectedThenInstalledThenCodex() {
+        let uninstalledCodex = status(.codex, installed: false)
+        let installedOpenCode = status(.opencode, installed: true)
+        let connectedHermes = status(.hermes, installed: true, connected: true)
+
+        XCTAssertEqual(AgentReadiness.preferredOnboardingAgent(from: [uninstalledCodex]), .codex)
+        XCTAssertEqual(AgentReadiness.preferredOnboardingAgent(from: [installedOpenCode, uninstalledCodex]), .opencode)
+        XCTAssertEqual(AgentReadiness.preferredOnboardingAgent(from: [installedOpenCode, connectedHermes, uninstalledCodex]), .hermes)
+        XCTAssertNil(AgentReadiness.preferredOnboardingAgent(from: []))
+    }
+
+    func testFailedFirstRequestReceiptMustBeCurrentRealRequestForSelectedAgent() throws {
+        let configuredAt = Date(timeIntervalSince1970: 10_000)
+        var failure = makeRecord(at: configuredAt.addingTimeInterval(5))
+        failure.status = .failed
+        let unrelatedAgent = modifying(failure) { $0.decision.agentID = AgentKind.opencode.rawValue }
+        let demo = modifying(failure) { $0.executionOrigin = .demo }
+        let local = modifying(failure) { $0.source = .testBench }
+        let rejected = modifying(failure) { $0.status = .rejected }
+        let otherIdentity = modifying(failure) { $0.decision.agentIdentitySource = .explicitHeader }
+        let priorConfiguration = modifying(failure) { $0.timestamp = configuredAt }
+        let success = modifying(failure) { $0.status = .success }
+
+        let configured = status(.codex, installed: true, connected: true)
+        func progress(_ records: [CallRecord]) -> (readiness: AgentReadiness, latestFailureID: UUID?) {
+            AgentReadiness.requestProgress(status: configured, updatedAt: configuredAt, records: records)
+        }
+        let ineligible = [unrelatedAgent, demo, local, rejected, otherIdentity, priorConfiguration]
+        XCTAssertNil(progress(ineligible).latestFailureID)
+        XCTAssertEqual(progress(ineligible + [failure]).latestFailureID, failure.id)
+        let laterSuccess = modifying(success) { $0.timestamp = failure.timestamp.addingTimeInterval(2) }
+        let laterFailure = modifying(failure) { $0.timestamp = laterSuccess.timestamp.addingTimeInterval(2) }
+        XCTAssertNil(progress([failure, laterSuccess]).latestFailureID)
+        let retried = progress([laterFailure, failure, laterSuccess])
+        XCTAssertEqual(retried.readiness, .verified(laterSuccess.id))
+        XCTAssertEqual(retried.latestFailureID, laterFailure.id)
+        XCTAssertNil(AgentReadiness.requestProgress(status: configured, updatedAt: nil, records: [failure]).latestFailureID)
+    }
+
+    func testFreshHomeSelectsCodexDespiteGenericShellOption() {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = AgentConfigService(homeDirectory: home, backupDirectory: home.appendingPathComponent("backups"))
+        let statuses = service.inspectAllAgents(proxyPort: 8765)
+        XCTAssertTrue(statuses.contains { $0.kind == .shellAndContinue && $0.isInstalled })
+        XCTAssertEqual(AgentReadiness.preferredOnboardingAgent(from: statuses), .codex)
+    }
+
+    private func status(_ kind: AgentKind, installed: Bool, connected: Bool = false) -> AgentIntegrationStatus {
+        AgentIntegrationStatus(kind: kind, configFilePath: "test", isInstalled: installed, isConnectedToAutoModel: connected, hasBackup: false)
+    }
+
+    private func modifying(_ record: CallRecord, _ update: (inout CallRecord) -> Void) -> CallRecord {
+        var copy = record
+        copy.id = UUID()
+        update(&copy)
+        return copy
+    }
+
     func testAgentProofRequiresCurrentConfigurationAndRealAliasedSuccess() {
         let now = Date()
         let configuredAt = now.addingTimeInterval(-1)

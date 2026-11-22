@@ -22,6 +22,10 @@ struct OnboardingView: View {
         engine.agentStatuses.first { $0.kind == selectedAgent }
     }
 
+    private var agentPickerStatuses: [AgentIntegrationStatus] {
+        engine.agentStatuses.filter { $0.isInstalled || $0.isConnectedToAutoModel || $0.kind == .codex }
+    }
+
     private var hasUsableModel: Bool { !engine.healthyAvailableModels().isEmpty }
 
     var body: some View {
@@ -74,7 +78,9 @@ struct OnboardingView: View {
         .onAppear {
             engine.recordOnboardingStarted()
             engine.refreshAgentStatuses()
-            selectedAgent = selectedAgent ?? engine.agentStatuses.first(where: \.isInstalled)?.kind
+            if selectedAgent == nil {
+                selectedAgent = AgentReadiness.preferredOnboardingAgent(from: engine.agentStatuses)
+            }
             selectedProviderID = selectedProviderID ?? engine.config.providers.first(where: \.isEnabled)?.id
         }
         .sheet(isPresented: $showProviderEditor) {
@@ -135,21 +141,29 @@ struct OnboardingView: View {
     private var agentStep: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                Label("2. 预览并接入一个 Agent", systemImage: "2.circle").font(.headline)
+                Label(selectedAgent == .codex ? "2. 接入 Codex" : "2. 预览并接入一个 Agent", systemImage: "2.circle")
+                    .font(.headline)
                 if !hasUsableModel {
                     Text("连接提供商后可预览 Agent 配置。")
                         .foregroundStyle(.secondary)
-                } else if engine.agentStatuses.contains(where: \.isInstalled) {
+                } else if !agentPickerStatuses.isEmpty {
                     Picker("Agent", selection: $selectedAgent) {
-                        ForEach(engine.agentStatuses.filter(\.isInstalled)) { status in
-                            Text(status.kind.displayName).tag(AgentKind?.some(status.kind))
+                        ForEach(agentPickerStatuses) { status in
+                            Text(status.kind == .codex && !status.isInstalled ? "Codex（尚未检测到）" : status.kind.displayName)
+                                .tag(AgentKind?.some(status.kind))
                         }
-                    }.frame(maxWidth: 300)
+                    }
+                    .frame(maxWidth: 300)
                     if let status = agentStatus {
+                        if status.kind == .codex && !status.isInstalled && !status.isConnectedToAutoModel {
+                            Text("尚未找到 Codex 配置。你可以先预览，确认后会创建 ~/.codex/config.toml。打开 Codex 并发送一条请求，即可验证接入。")
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         AgentConnectionCard(engine: engine, status: status, onOpenReceipt: onOpenReceipt)
                     }
                 } else {
-                    Text("未检测到 Agent；可在高级选项中手动接入或跳过。")
+                    Text("未检测到受支持的 Agent；可继续完成提供商设置，之后再接入 Codex。")
                         .foregroundStyle(.secondary)
                 }
             }.padding(6)
@@ -160,18 +174,29 @@ struct OnboardingView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 Label("3. 从 Agent 发出第一条请求", systemImage: "3.circle").font(.headline)
-                if let selectedAgent {
-                    switch engine.agentReadiness(for: selectedAgent) {
+                if let status = agentStatus {
+                    let progress = AgentReadiness.requestProgress(
+                        status: status,
+                        updatedAt: engine.agentConfigService.configurationUpdatedAt(for: status.kind),
+                        records: engine.callHistory
+                    )
+                    switch progress.readiness {
                     case .notConfigured:
-                        Text("先预览并写入 \(selectedAgent.displayName) 的配置。")
+                        Text("先预览并写入 \(status.kind.displayName) 的配置。")
                     case .waiting:
-                        Text("重启 \(selectedAgent.displayName)，发送一条普通请求。成功后此处会显示验证结果；上游可能收费。")
+                        Text("配置已写入。重启 \(status.kind.displayName) 并发送一条请求。供应商可能收取费用。")
                     case .verified:
                         Text("已收到该 Agent 的真实成功请求。")
                         Button("完成引导") {
                             engine.setOnboardingCompleted(true)
                             onNavigate(.history)
                         }.buttonStyle(.borderedProminent)
+                    }
+                    if let id = progress.latestFailureID {
+                        Label("最近一次请求失败", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Button("查看失败收据") { onOpenReceipt(id) }
+                            .buttonStyle(.bordered)
                     }
                 }
             }.padding(6)

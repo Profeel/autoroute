@@ -19,17 +19,39 @@ public enum AgentReadiness: Equatable {
     case waiting
     case verified(UUID)
 
+    public static func preferredOnboardingAgent(from statuses: [AgentIntegrationStatus]) -> AgentKind? {
+        statuses.first(where: \.isConnectedToAutoModel)?.kind
+            ?? statuses.first(where: { $0.isInstalled && $0.kind != .shellAndContinue })?.kind
+            ?? statuses.first(where: { $0.kind == .codex })?.kind
+            ?? statuses.first(where: \.isInstalled)?.kind
+    }
+
     public static func evaluate(status: AgentIntegrationStatus, updatedAt: Date?, records: [CallRecord]) -> AgentReadiness {
-        guard status.isConnectedToAutoModel else { return .notConfigured }
-        guard let updatedAt else { return .waiting }
-        guard let record = records.first(where: {
-            $0.totalCompletionMs.isFinite && $0.totalCompletionMs >= 0
-                && $0.timestamp.addingTimeInterval(-$0.totalCompletionMs / 1000) >= updatedAt
-                && $0.source == .externalProxy && $0.status == .success
-                && $0.executionOrigin == .real && $0.decision.agentID == status.kind.rawValue
-                && $0.decision.agentIdentitySource == .modelAlias
-        }) else { return .waiting }
-        return .verified(record.id)
+        requestProgress(status: status, updatedAt: updatedAt, records: records).readiness
+    }
+
+    public static func requestProgress(status: AgentIntegrationStatus, updatedAt: Date?, records: [CallRecord])
+        -> (readiness: AgentReadiness, latestFailureID: UUID?) {
+        guard status.isConnectedToAutoModel else { return (.notConfigured, nil) }
+        guard let updatedAt else { return (.waiting, nil) }
+        var success: CallRecord?
+        var failure: CallRecord?
+        for record in records {
+            guard record.source == .externalProxy, record.executionOrigin == .real,
+                  record.decision.agentID == status.kind.rawValue, record.decision.agentIdentitySource == .modelAlias,
+                  record.totalCompletionMs.isFinite, record.totalCompletionMs >= 0,
+                  record.timestamp.addingTimeInterval(-record.totalCompletionMs / 1000) >= updatedAt else { continue }
+            switch record.status {
+            case .success where record.timestamp >= (success?.timestamp ?? .distantPast):
+                success = record
+            case .failed where record.timestamp >= (failure?.timestamp ?? .distantPast):
+                failure = record
+            default: break
+            }
+        }
+        guard let success else { return (.waiting, failure?.id) }
+        let latestFailureID = failure.flatMap { $0.timestamp > success.timestamp ? $0.id : nil }
+        return (.verified(success.id), latestFailureID)
     }
 }
 
