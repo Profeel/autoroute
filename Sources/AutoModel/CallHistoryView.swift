@@ -43,6 +43,11 @@ struct CallHistoryView: View {
         let totalDurationMs: Double
         let totalTokens: Int
         let totalCostUSD: Double?
+        let costSavedUSD: Double?
+        let timeSavedSeconds: Double?
+        let actualModelLabel: String
+        let routingReason: String
+        let taskType: String
         let hasFailure: Bool
         let latestTimestamp: Date
     }
@@ -460,6 +465,44 @@ struct CallHistoryView: View {
                 .lineLimit(1)
 
             HStack(spacing: 8) {
+                Text(session.mergedPathText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(session.switchCount > 0 ? .blue : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(session.hasFailure ? "失败" : "已结束")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(session.hasFailure ? .orange : .secondary)
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                sessionMetric(icon: "number", value: compactTokenLabel(session.totalTokens), tint: .primary)
+                sessionMetric(icon: "dollarsign.circle", value: session.totalCostUSD.map(AutoModelFormatter.formatUSD) ?? "—", tint: .secondary)
+                sessionMetric(icon: "arrow.down.circle", value: session.costSavedUSD.map(AutoModelFormatter.formatUSD) ?? "—", tint: .green)
+                sessionMetric(icon: "clock.arrow.circlepath", value: compactSavedTime(session.timeSavedSeconds), tint: .blue)
+                Spacer(minLength: 0)
+            }
+            .help("Token · 实际费用 · 节省费用 · 节省时间")
+
+            HStack(spacing: 5) {
+                Image(systemName: ModelChartPalette.symbol(for: session.actualModelLabel))
+                    .font(.caption2)
+                    .foregroundStyle(ModelChartPalette.color(for: session.actualModelLabel))
+                Text("实际 \(session.actualModelLabel)")
+                    .font(.caption2.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("· \(session.taskType)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            .help("任务类型：\(session.taskType)；路由原因：\(session.routingReason)")
+
+            HStack(spacing: 8) {
                 Text(AutoModelFormatter.formatMs(session.totalDurationMs))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -467,12 +510,33 @@ struct CallHistoryView: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(session.switchCount > 0 ? .blue : .secondary)
                 Spacer()
-                Text(session.totalCostUSD.map { AutoModelFormatter.formatUSD($0) } ?? "未定价")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 4)
+    }
+
+    private func sessionMetric(icon: String, value: String, tint: Color) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.caption2)
+            Text(value)
+                .font(.caption2.monospacedDigit())
+                .lineLimit(1)
+        }
+        .foregroundStyle(tint)
+    }
+
+    private func compactTokenLabel(_ count: Int) -> String {
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1_000) }
+        return "\(count)"
+    }
+
+    private func compactSavedTime(_ seconds: Double?) -> String {
+        guard let seconds else { return "—" }
+        if seconds < 1 { return "0s" }
+        if seconds < 60 { return String(format: "%.1fs", seconds) }
+        return String(format: "%.1fm", seconds / 60)
     }
 
     private func singleCallRow(_ record: CallRecord) -> some View {
@@ -588,7 +652,16 @@ struct CallHistoryView: View {
             let totalDur = chronological.map(\.totalCompletionMs).reduce(0, +)
             let totalTok = chronological.compactMap { $0.finalUsage?.totalTokens }.reduce(0, +)
             let costValues = chronological.compactMap(\.totalCostUSD)
-            let totalCost: Double? = costValues.isEmpty ? nil : costValues.reduce(0, +)
+            let totalCost: Double? = costValues.count == chronological.count && !costValues.isEmpty ? costValues.reduce(0, +) : nil
+            let impact = engine.sessionImpactSummary(for: chronological)
+            let actualModelLabel = latest.executedModelDisplayName
+                ?? latest.executedModelID
+                ?? latest.decision.selectedDisplayName
+                ?? latest.requestedModel
+            let routingReason = latest.decision.routingReasonNote
+                ?? latest.decision.matchedRules.first
+                ?? "\(latest.decision.strategyName) 策略"
+            let taskType = latest.decision.subtaskCategory?.displayName ?? "通用任务"
             let hasFailure = chronological.contains { $0.status != .success }
 
             return SessionSummaryItem(
@@ -602,6 +675,14 @@ struct CallHistoryView: View {
                 totalDurationMs: totalDur,
                 totalTokens: totalTok,
                 totalCostUSD: totalCost,
+                costSavedUSD: impact.flatMap { $0.evaluatedTurnCount > 0 ? max(0, $0.costSavedUSD) : nil },
+                timeSavedSeconds: impact.flatMap { impact in
+                    guard impact.speedSampleCount > 0, impact.speedComparedTurnCount > 0 else { return nil }
+                    return impact.totalTimeSavedSeconds.map { max(0, $0) }
+                },
+                actualModelLabel: actualModelLabel,
+                routingReason: routingReason,
+                taskType: taskType,
                 hasFailure: hasFailure,
                 latestTimestamp: latest.timestamp
             )

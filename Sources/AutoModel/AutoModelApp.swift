@@ -384,6 +384,7 @@ struct MainContentView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
+                    SidebarUsageMetricsView(engine: engine)
                     ConnectionStatusView(
                         engine: engine,
                         onNavigate: { selectedTab = $0 },
@@ -434,5 +435,54 @@ struct MainContentView: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.14))
+    }
+}
+
+private struct SidebarUsageMetricsView: View {
+    @ObservedObject var engine: AutoModelEngine
+
+    var body: some View {
+        let usage = engine.cumulativeUsageSummary()
+        let savings = engine.cumulativeSavingsSummary()
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
+            metric(icon: "number", value: compactTokens(usage.totalTokens), label: "Token", tint: .primary)
+            metric(icon: "dollarsign.circle.fill", value: usage.totalCostUSD > 0 ? AutoModelFormatter.formatUSD(usage.totalCostUSD) : "—", label: "费用", tint: .secondary)
+            metric(icon: "arrow.down.circle.fill", value: savings.totalCostSavedUSD > 0 ? AutoModelFormatter.formatUSD(savings.totalCostSavedUSD) : "—", label: "省钱", tint: .green)
+            metric(icon: "clock.badge.checkmark.fill", value: compactTime(savings.totalTimeSavedSeconds), label: "省时", tint: .blue)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity)
+        .background(Color(.controlBackgroundColor).opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("累计用量与节省：Token \(compactTokens(usage.totalTokens))，费用 \(usage.totalCostUSD > 0 ? AutoModelFormatter.formatUSD(usage.totalCostUSD) : "暂无定价")，节省费用 \(savings.totalCostSavedUSD > 0 ? AutoModelFormatter.formatUSD(savings.totalCostSavedUSD) : "暂无")，节省时间 \(compactTime(savings.totalTimeSavedSeconds))")
+    }
+
+    private func metric(icon: String, value: String, label: String, tint: Color) -> some View {
+        VStack(spacing: 2) {
+            Image(systemName: icon)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(tint)
+            Text(value)
+                .font(.callout.weight(.bold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(label)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 43)
+    }
+
+    private func compactTokens(_ count: Int) -> String {
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1_000) }
+        return "\(count)"
+    }
+
+    private func compactTime(_ seconds: Double) -> String {
+        if seconds < 1 { return "—" }
+        if seconds < 60 { return String(format: "%.1fs", seconds) }
+        if seconds < 3600 { return String(format: "%.1fm", seconds / 60) }
+        return String(format: "%.1fh", seconds / 3600)
     }
 }

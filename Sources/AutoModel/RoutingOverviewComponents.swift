@@ -67,7 +67,7 @@ struct LiveRoutingBannerView: View {
                 Circle()
                     .fill(Color.green)
                     .frame(width: 8, height: 8)
-                Text("路由目标")
+                Text("正在使用")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                     .fixedSize()
@@ -76,7 +76,7 @@ struct LiveRoutingBannerView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(state.targetModelDisplayName ?? "路由中…")
-                    .accessibilityLabel("最近开始请求的初始路由目标：\(state.targetModelDisplayName ?? "路由中")；并发请求或重试可能使用其他模型")
+                    .accessibilityLabel("当前实际尝试的模型：\(state.targetModelDisplayName ?? "路由中")；并发请求或重试可能使用其他模型")
 
                 Spacer(minLength: 0)
 
@@ -435,6 +435,11 @@ struct SessionTaskDetailView: View {
             )
         }
         let modelBreakdown = ModelTokenBreakdownItem.summarize(recordsChronological, models: engine.config.models)
+        let costSaved = sessionImpact.flatMap { $0.evaluatedTurnCount > 0 ? max(0, $0.costSavedUSD) : nil }
+        let timeSaved: Double? = sessionImpact.flatMap { impact in
+            guard impact.speedSampleCount > 0, impact.speedComparedTurnCount > 0 else { return nil }
+            return impact.totalTimeSavedSeconds.map { max(0, $0) }
+        }
 
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -443,6 +448,18 @@ struct SessionTaskDetailView: View {
                     Text(title)
                         .font(.title3.weight(.semibold))
                         .lineLimit(2)
+
+                    HStack(spacing: 8) {
+                        Image(systemName: switchCount > 0 ? "arrow.triangle.swap" : "checkmark.circle")
+                        Text(recordsChronological.map { $0.executedModelDisplayName ?? $0.executedModelID ?? $0.requestedModel }.joined(separator: " → "))
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(recordsChronological.contains { $0.status != .success } ? "失败" : "已结束")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(recordsChronological.contains { $0.status != .success } ? .orange : .secondary)
+                    }
+                    .foregroundStyle(switchCount > 0 ? Color.blue : Color.secondary)
 
                     if let impact = sessionImpact {
                         VStack(alignment: .leading, spacing: 4) {
@@ -477,17 +494,43 @@ struct SessionTaskDetailView: View {
                     }
                 }
 
-                // 4 Core Stat Cards
-                HStack(spacing: 8) {
-                    statCard(title: "识别 Agent", value: agentName)
-                    statCard(title: "总共耗时", value: AutoModelFormatter.formatMs(totalDurationMs))
-                    statCard(title: "模型切换", value: "\(switchCount) 次")
-                    statCard(
-                        title: "费用 / Token",
-                        value: "\(totalCostUSD.map { AutoModelFormatter.formatUSD($0) } ?? "未定价") · \(formatTokens(totalTokens))"
-                    )
+                // Session KPI dashboard: the four numbers users should not have to infer.
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                    sessionMetricTile(icon: "number", label: "总 Token", value: formatTokens(totalTokens), tint: .primary)
+                    sessionMetricTile(icon: "dollarsign.circle.fill", label: "实际费用", value: totalCostUSD.map(AutoModelFormatter.formatUSD) ?? "未定价", tint: .secondary)
+                    sessionMetricTile(icon: "arrow.down.circle.fill", label: "节省费用", value: costSaved.map(AutoModelFormatter.formatUSD) ?? "—", tint: .green)
+                    sessionMetricTile(icon: "clock.badge.checkmark.fill", label: "节省时间", value: timeSaved.map(formatSavedTime) ?? "—", tint: .blue)
                 }
 
+                if let latestRecord = recordsChronological.last {
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(spacing: 7) {
+                            Image(systemName: ModelChartPalette.symbol(for: latestRecord.executedModelID ?? latestRecord.requestedModel))
+                                .foregroundStyle(ModelChartPalette.color(for: latestRecord.executedModelID ?? latestRecord.requestedModel))
+                            Text("当前实际模型")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(latestRecord.executedModelDisplayName ?? latestRecord.executedModelID ?? latestRecord.requestedModel)
+                                .font(.callout.weight(.semibold))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        HStack(alignment: .top, spacing: 8) {
+                            Label(latestRecord.decision.subtaskCategory?.displayName ?? "通用任务", systemImage: "square.stack.3d.up.fill")
+                                .font(.caption)
+                            Text(latestRecord.decision.routingReasonNote ?? latestRecord.decision.matchedRules.first ?? "\(latestRecord.decision.strategyName) 策略")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        .help("路由原因")
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.controlBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 9))
+                }
+
+                // The KPI grid above is the primary session summary; detailed timing and switches remain in the turn list.
                 // Per-turn Token Bar Chart
                 VStack(alignment: .leading, spacing: 8) {
                     Text("逐轮 Token 消耗")
@@ -606,6 +649,30 @@ struct SessionTaskDetailView: View {
             }
             .padding(16)
         }
+    }
+
+    private func sessionMetricTile(icon: String, label: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Image(systemName: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(tint)
+            Text(value)
+                .font(.title3.weight(.bold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 66, alignment: .leading)
+        .padding(10)
+        .background(Color(.controlBackgroundColor).opacity(0.75), in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private func formatSavedTime(_ seconds: Double) -> String {
+        if seconds < 60 { return String(format: "%.1f 秒", seconds) }
+        if seconds < 3600 { return String(format: "%.1f 分", seconds / 60) }
+        return String(format: "%.1f 小时", seconds / 3600)
     }
 
     private func statCard(title: String, value: String) -> some View {
