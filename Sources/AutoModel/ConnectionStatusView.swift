@@ -1,3 +1,4 @@
+import AppKit
 import AutoModelCore
 import SwiftUI
 
@@ -5,11 +6,103 @@ struct ConnectionStatusView: View {
     @ObservedObject var engine: AutoModelEngine
     let onNavigate: (SidebarTab) -> Void
     let onOpenReceipt: (UUID) -> Void
+    var compact = false
 
     @State private var message: String?
+    @State private var showConnectionDetails = false
+    @State private var copiedAddress = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if compact {
+                proxyStatus
+                proxyAddress
+                if allConnectionsReady {
+                    DisclosureGroup("连接详情", isExpanded: $showConnectionDetails) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            providerStatus
+                            agentStatus
+                        }
+                        .padding(.top, 6)
+                    }
+                } else {
+                    providerStatus
+                    if let (_, readiness) = configuredAgent, case .verified = readiness {
+                        DisclosureGroup("连接详情", isExpanded: $showConnectionDetails) {
+                            agentStatus.padding(.top, 6)
+                        }
+                    } else {
+                        agentStatus
+                    }
+                }
+            } else if allConnectionsReady {
+                DisclosureGroup(isExpanded: $showConnectionDetails) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        proxyStatus
+                        providerStatus
+                        agentStatus
+                    }
+                    .padding(.top, 6)
+                } label: {
+                    HStack(spacing: 8) {
+                        Label("连接正常", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("连接详情").foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("连接正常，连接详情")
+                }
+            } else {
+                proxyStatus
+                providerStatus
+                if let (_, readiness) = configuredAgent, case .verified = readiness {
+                    DisclosureGroup("连接详情", isExpanded: $showConnectionDetails) {
+                        agentStatus.padding(.top, 6)
+                    }
+                } else {
+                    agentStatus
+                }
+            }
+        }
+        .font(.caption)
+        .controlSize(compact ? .mini : .small)
+        .padding(compact ? 8 : 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.controlBackgroundColor).opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
+        .onAppear { engine.refreshAgentStatuses() }
+    }
+
+    private var allConnectionsReady: Bool {
+        guard case .running = engine.proxyReadiness,
+              engine.providerReadiness == .ready,
+              let (_, readiness) = configuredAgent,
+              case .verified = readiness else { return false }
+        return true
+    }
+
+    private var proxyAddress: some View {
+        HStack(spacing: 4) {
+            Text(engine.config.proxySettings.baseURLString)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .help(engine.config.proxySettings.baseURLString)
+            Spacer(minLength: 0)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(engine.config.proxySettings.baseURLString, forType: .string)
+                copiedAddress = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedAddress = false }
+            } label: {
+                Image(systemName: copiedAddress ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .help("复制本地代理地址")
+            .accessibilityLabel("复制本地代理地址")
+        }
+    }
+
+    private var proxyStatus: some View {
+        VStack(alignment: .leading, spacing: 4) {
             HStack {
                 switch engine.proxyReadiness {
                 case .running:
@@ -45,46 +138,48 @@ struct ConnectionStatusView: View {
                 }
             }
             if case .error(let detail) = engine.proxyReadiness {
-                Text(detail).foregroundStyle(.secondary)
+                Text(detail).foregroundStyle(.secondary).lineLimit(2).help(detail)
             } else if case .keychainError(let detail) = engine.proxyReadiness {
-                Text(message ?? detail).foregroundStyle(.secondary)
-            }
-            HStack {
-                switch engine.providerReadiness {
-                case .ready: Label("提供商模型已测活", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                case .needsTesting: Label("提供商模型待测活", systemImage: "clock").foregroundStyle(.orange)
-                case .missing: Label("尚无可用提供商模型", systemImage: "circle").foregroundStyle(.orange)
-                }
-                Spacer()
-                if engine.providerReadiness != .ready {
-                    Button("管理提供商") { onNavigate(.modelsAndPolicy) }
-                }
-            }
-            HStack {
-                if let (status, readiness) = configuredAgent {
-                    switch readiness {
-                    case .verified(let id):
-                        Label("\(status.kind.displayName) 最近成功 \(receiptTime(id))", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                        Spacer()
-                        Button("收据") { onOpenReceipt(id) }
-                    case .waiting:
-                        Label("\(status.kind.displayName) 已写入，等待真实请求", systemImage: "clock").foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Agent") { onNavigate(.agents) }
-                    case .notConfigured:
-                        agentMissing
-                    }
-                } else {
-                    agentMissing
-                }
+                Text(message ?? detail).foregroundStyle(.secondary).lineLimit(2).help(message ?? detail)
             }
         }
-        .font(.caption)
-        .controlSize(.small)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.controlBackgroundColor).opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
-        .onAppear { engine.refreshAgentStatuses() }
+    }
+
+    private var providerStatus: some View {
+        HStack(alignment: .top, spacing: 4) {
+            switch engine.providerReadiness {
+            case .ready: Label("提供商模型已测活", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            case .needsTesting: Label("提供商模型待测活", systemImage: "clock").foregroundStyle(.orange)
+            case .missing: Label("尚无可用提供商模型", systemImage: "circle").foregroundStyle(.orange)
+            }
+            Spacer()
+            if engine.providerReadiness != .ready {
+                Button(compact ? "管理" : "管理提供商") { onNavigate(.modelsAndPolicy) }
+            }
+        }
+    }
+
+    private var agentStatus: some View {
+        HStack(alignment: .top, spacing: 4) {
+            if let (status, readiness) = configuredAgent {
+                switch readiness {
+                case .verified(let id):
+                    Label("\(status.kind.displayName) 最近成功 \(receiptTime(id))", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("收据") { onOpenReceipt(id) }
+                        .accessibilityLabel("查看 Agent 最近成功收据")
+                case .waiting:
+                    Label("\(status.kind.displayName) 已写入，等待真实请求", systemImage: "clock").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Agent") { onNavigate(.agents) }
+                case .notConfigured:
+                    agentMissing
+                }
+            } else {
+                agentMissing
+            }
+        }
     }
 
     private var configuredAgent: (AgentIntegrationStatus, AgentReadiness)? {
@@ -102,7 +197,7 @@ struct ConnectionStatusView: View {
         Group {
             Label("尚未接入 Agent", systemImage: "circle").foregroundStyle(.secondary)
             Spacer()
-            Button("接入 Agent") { onNavigate(.agents) }
+            Button(compact ? "接入" : "接入 Agent") { onNavigate(.agents) }
         }
     }
 }
@@ -110,6 +205,7 @@ struct ConnectionStatusView: View {
 struct ActivitySummaryView: View {
     @ObservedObject var engine: AutoModelEngine
     let onOpenReceipt: (UUID) -> Void
+    var compact = false
 
     var body: some View {
         let today = engine.callHistory.filter { $0.executionOrigin == .real && Calendar.current.isDateInToday($0.timestamp) }
@@ -118,15 +214,64 @@ struct ActivitySummaryView: View {
             ($0.executionOrigin == .real && ($0.status != .success || $0.attempts.count > 1))
                 || ($0.source == .externalProxy && $0.executionOrigin == nil && $0.status != .success)
         }.max { $0.timestamp < $1.timestamp }
+        let latestProxyRequest = engine.callHistory.filter {
+            $0.source == .externalProxy && $0.executionOrigin == .real
+        }.max { $0.timestamp < $1.timestamp }
         return VStack(alignment: .leading, spacing: 6) {
-            HStack {
+            if compact {
                 Text("今日真实调用 \(today.count) 次")
-                Spacer()
                 Text(priced.isEmpty ? "费用未知" : "已记录费用 \(AutoModelFormatter.formatUSD(priced.reduce(0, +)))")
+            } else {
+                HStack {
+                    Text("今日真实调用 \(today.count) 次")
+                    Spacer()
+                    Text(priced.isEmpty ? "费用未知" : "已记录费用 \(AutoModelFormatter.formatUSD(priced.reduce(0, +)))")
+                }
             }
             Text("基于当前保留的记录\(today.count > priced.count ? "；\(today.count - priced.count) 次缺费用" : "")")
                 .foregroundStyle(.secondary)
-            if let issue {
+                .fixedSize(horizontal: false, vertical: true)
+            if compact {
+                Divider()
+                Text("最近代理请求").font(.caption.weight(.semibold))
+                if let latestProxyRequest {
+                    HStack(spacing: 4) {
+                        Text(latestProxyRequest.status == .success && latestProxyRequest.attempts.count > 1
+                             ? "回退后成功" : latestProxyRequest.status.displayName)
+                        Spacer(minLength: 0)
+                        Button("收据") { onOpenReceipt(latestProxyRequest.id) }
+                            .accessibilityLabel("查看最近代理请求收据")
+                    }
+                    Text(latestProxyRequest.timestamp.formatted(date: .abbreviated, time: .shortened))
+                        .foregroundStyle(.secondary)
+                    let modelName: String = {
+                        if latestProxyRequest.status != .success, let attempt = latestProxyRequest.attempts.last {
+                            return engine.config.models.first {
+                                $0.modelID == attempt.modelID && (attempt.providerID == nil || $0.providerID == attempt.providerID)
+                            }?.displayName ?? attempt.modelID
+                        }
+                        return latestProxyRequest.executedModelDisplayName ?? latestProxyRequest.executedModelID ?? "未记录"
+                    }()
+                    Text("模型：\(modelName)")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help("模型：\(modelName)")
+                        .accessibilityLabel("模型：\(modelName)")
+                } else {
+                    Text("暂无真实代理请求").foregroundStyle(.secondary)
+                }
+                if let issue, issue.id != latestProxyRequest?.id {
+                    Divider()
+                    Text(issue.status == .success ? "最近回退后成功" : "最近请求异常")
+                    HStack(spacing: 4) {
+                        Text(issue.timestamp.formatted(date: .abbreviated, time: .shortened))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        Button("收据") { onOpenReceipt(issue.id) }
+                            .accessibilityLabel("查看最近请求异常收据")
+                    }
+                }
+            } else if let issue {
                 HStack {
                     Text(issue.status == .success ? "最近回退后成功" : "最近代理请求失败")
                     Text(issue.timestamp.formatted(date: .abbreviated, time: .shortened)).foregroundStyle(.secondary)
@@ -136,8 +281,8 @@ struct ActivitySummaryView: View {
             }
         }
         .font(.caption)
-        .controlSize(.small)
-        .padding(10)
+        .controlSize(compact ? .mini : .small)
+        .padding(compact ? 8 : 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.controlBackgroundColor).opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
     }
@@ -162,7 +307,10 @@ struct SavingsDetailsView: View {
                 Text("当前基准：\(impact.baselineModelDisplayName)；按当前单价估算，并非供应商账单。")
                     .foregroundStyle(.secondary)
                 if impact.evaluatedTurnCount > 0 {
-                    Text("费用覆盖 \(impact.evaluatedTurnCount)/\(successful) 条成功请求；\(impact.costSavedUSD >= 0 ? "估算节省" : "估算多支出") \(AutoModelFormatter.formatUSD(abs(impact.costSavedUSD)))。")
+                    let comparison = impact.costSavedUSD == 0
+                        ? "估算费用相同"
+                        : "\(impact.costSavedUSD > 0 ? "估算节省" : "估算多支出") \(AutoModelFormatter.formatUSD(abs(impact.costSavedUSD)))"
+                    Text("费用覆盖 \(impact.evaluatedTurnCount)/\(successful) 条成功请求；\(comparison)。")
                 } else {
                     Text("缺少用量或单价，无法估算费用差额。")
                 }

@@ -301,10 +301,7 @@ struct RoutingReceiptView: View {
     }
 
     private func sessionBaselineComparisonStrip(_ impact: RoutingImpactSummary) -> some View {
-        let turnCount = max(1, effectiveTimeline.filter { $0.status == .success }.count)
-        let baselineTotalMs = impact.baselineAvgLatencyMs.map { $0 * Double(turnCount) }
-        let actualTotalMs = impact.actualAvgLatencyMs * Double(turnCount)
-        let savedTotalMs = baselineTotalMs.map { $0 - actualTotalMs }
+        let savedTotalMs = impact.baselineTotalLatencyMs.map { $0 - impact.actualTotalLatencyMs }
 
         let savedCost = impact.costSavedUSD
         let extraRatioPct = impact.actualCostUSD > 0
@@ -317,18 +314,18 @@ struct RoutingReceiptView: View {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.down.right.circle.fill")
                         .font(.caption2)
-                        .foregroundStyle(savedCost > 0.00001 ? Color.green : Color.secondary)
-                    if savedCost > 0.00001, let savePct = impact.costSavingsPercent {
+                        .foregroundStyle(savedCost > 0 ? Color.green : (savedCost < 0 ? Color.orange : Color.secondary))
+                    if savedCost > 0, let savePct = impact.costSavingsPercent {
                         let extraText = extraRatioPct.map { String(format: " · 全用最高级贵 +%.0f%%", $0) } ?? ""
                         Text("对比全用「\(shortModelName(impact.baselineModelDisplayName))」(\(AutoModelFormatter.formatUSD(impact.baselineCostUSD)))：AutoRoute 省 \(AutoModelFormatter.formatUSD(savedCost)) (-\(String(format: "%.1f", savePct))%)\(extraText)")
                             .font(.caption2.weight(.medium).monospacedDigit())
                             .foregroundStyle(Color.green)
-                    } else if savedCost < -0.00001 {
+                    } else if savedCost < 0 {
                         Text("对比「\(shortModelName(impact.baselineModelDisplayName))」(\(AutoModelFormatter.formatUSD(impact.baselineCostUSD)))：本次多花 \(AutoModelFormatter.formatUSD(-savedCost))")
                             .font(.caption2.weight(.medium).monospacedDigit())
                             .foregroundStyle(Color.orange)
                     } else {
-                        Text("本会话与最高级「\(shortModelName(impact.baselineModelDisplayName))」同档执行，费用一致")
+                        Text("本会话与基准「\(shortModelName(impact.baselineModelDisplayName))」费用一致")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -342,14 +339,18 @@ struct RoutingReceiptView: View {
                         .font(.caption2)
                         .foregroundStyle(Color.blue)
                     if let savedMs = savedTotalMs, let speedPct = impact.speedGainPercent {
-                        if savedMs >= 0 {
-                            Text(String(format: "快 %.1fs (+%.1f%%)", savedMs / 1000.0, speedPct))
+                        if savedMs > 0 {
+                            Text(String(format: "估算快 %.1fs (+%.1f%%)", savedMs / 1000.0, speedPct))
                                 .font(.caption2.weight(.semibold).monospacedDigit())
                                 .foregroundStyle(Color.blue)
-                        } else {
-                            Text(String(format: "慢 %.1fs (-%.1f%%)", (-savedMs) / 1000.0, abs(speedPct)))
+                        } else if savedMs < 0 {
+                            Text(String(format: "估算慢 %.1fs (-%.1f%%)", (-savedMs) / 1000.0, abs(speedPct)))
                                 .font(.caption2.weight(.semibold).monospacedDigit())
                                 .foregroundStyle(Color.orange)
+                        } else {
+                            Text("估算耗时相同")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                     } else {
                         Text(impact.speedBasisLabel)
@@ -716,12 +717,13 @@ struct RoutingReceiptView: View {
         .chartXScale(domain: 0.5...(Double(timeline.count) + 0.5))
         .chartYScale(domain: 0...(maxTokensK * 1.25))
         .chartXAxis {
-            AxisMarks(values: .automatic(desiredCount: min(8, timeline.count))) { val in
+            AxisMarks(values: routingTurnAxisValues(timeline.count)) { val in
                 AxisGridLine()
-                AxisValueLabel {
+                AxisValueLabel(anchor: timeline.count == 1 ? .top : (val.as(Int.self) == 1 ? .topLeading : (val.as(Int.self) == timeline.count ? .topTrailing : .top))) {
                     if let t = val.as(Int.self), t >= 1, t <= timeline.count {
                         Text("T\(t)")
                             .font(.caption2.monospacedDigit())
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                 }
             }
