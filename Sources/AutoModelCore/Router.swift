@@ -31,6 +31,8 @@ public struct RoutingContext: Sendable {
     public var stickyModelID: UUID?
     public var consecutiveRoutineTurns: Int
     public var escalateNextTurn: Bool
+    public var qualityFailureCount: Int
+    public var lastFailureEffort: ReasoningEffort?
     public var runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics]
 
     public init(
@@ -42,6 +44,8 @@ public struct RoutingContext: Sendable {
         stickyModelID: UUID? = nil,
         consecutiveRoutineTurns: Int = 0,
         escalateNextTurn: Bool = false,
+        qualityFailureCount: Int = 0,
+        lastFailureEffort: ReasoningEffort? = nil,
         runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics] = [:]
     ) {
         self.requestedModel = requestedModel
@@ -52,6 +56,8 @@ public struct RoutingContext: Sendable {
         self.stickyModelID = stickyModelID
         self.consecutiveRoutineTurns = consecutiveRoutineTurns
         self.escalateNextTurn = escalateNextTurn
+        self.qualityFailureCount = qualityFailureCount
+        self.lastFailureEffort = lastFailureEffort
         self.runtimeMetricsByModelID = runtimeMetricsByModelID
     }
 }
@@ -249,6 +255,7 @@ public enum RequestFeatureExtractor {
             recommendedEffort: recommendedEffort,
             subtaskSummary: subtaskSummary,
             clientProvidedEffort: clientProvidedEffort,
+            hasClientProvidedEffort: payload["reasoning_effort"] != nil || (payload["reasoning"] as? [String: Any])?["effort"] != nil || payload["thinking"] != nil,
             isUserTurnBoundary: isUserTurnBoundary
         )
     }
@@ -321,10 +328,6 @@ public enum RequestFeatureExtractor {
         if requiresTools {
             return .toolCalling
         }
-        if estimatedTokens >= 24_000 {
-            return .longContext
-        }
-
         let lower = text.lowercased()
         let codeSignals = [
             "```", "func ", "def ", "class ", "import ", "struct ", "select ", "swift", "python",
@@ -440,7 +443,7 @@ public enum RequestFeatureExtractor {
             "deep research", "quantitative analysis", "tradeoff", "架构", "系统设计", "迁移", "大规模重构",
             "跨模块", "性能优化", "深度分析", "深度研究", "定量分析", "方案对比", "重构方案"
         ]
-        if planningSignals.contains(where: { lower.contains($0) }) || estimatedTokens >= 120_000 {
+        if planningSignals.contains(where: { lower.contains($0) }) {
             return (.architecturePlanning, .high)
         }
         if requiresVision || intentTokens >= 1_500 {
@@ -664,7 +667,7 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                     policyVersion: context.policy.policyVersion,
                     deciderPluginID: pluginID,
                     decisionDurationMs: ms,
-                    selectedEffort: context.features.recommendedEffort,
+                    selectedEffort: context.features.clientProvidedEffort ?? context.features.recommendedEffort,
                     subtaskCategory: context.features.subtaskCategory,
                     routingReasonNote: "指定模型「\(primaryMatch.0.displayName)」· 通道 \(primaryMatch.1.name)",
                     canonicalGroupID: canonicalID
@@ -706,7 +709,7 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             policyVersion: context.policy.policyVersion,
             deciderPluginID: pluginID,
             decisionDurationMs: ms,
-            selectedEffort: context.features.recommendedEffort,
+            selectedEffort: context.features.clientProvidedEffort ?? context.features.recommendedEffort,
             subtaskCategory: context.features.subtaskCategory,
             routingReasonNote: "指定模型直连「\(model.displayName)」· 子任务「\(context.features.subtaskCategory.displayName)」"
         )
@@ -730,11 +733,29 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         }
 
         let subtask = context.features.subtaskCategory
-        let targetEffort = context.features.clientProvidedEffort ?? Self.resolvedEffort(
+        let initialEffort = context.features.clientProvidedEffort ?? Self.resolvedEffort(
             recommended: context.features.recommendedEffort,
             explicitTier: explicitTier,
             strategy: context.policy.activeStrategy
         )
+        let previousModel = context.stickyModelID.flatMap { id in context.models.first { $0.id == id } }
+        let previousProvider = previousModel.flatMap { providersByID[$0.providerID] }
+        // An effort increase is meaningful only on a wire path that can inject it.
+        let previousEligible = context.qualityFailureCount > 0 && (previousModel.map { model in
+            evaluateHardConstraints(model: model, provider: previousProvider, features: context.features,
+                policy: context.policy, ignorePriceCap: explicitTier != nil,
+                runtimeMetrics: context.runtimeMetricsByModelID[model.id]).passedHardConstraints
+        } ?? false)
+        let effortOrder: [ReasoningEffort] = [.low, .medium, .high, .max]
+        let raisedEffort: ReasoningEffort? = context.lastFailureEffort == .low ? .medium
+            : (context.lastFailureEffort == .medium ? .high : nil)
+        let canIncreaseEffort = context.policy.enablePhaseDowngradeHysteresis
+            && context.qualityFailureCount == 1 && previousEligible
+            && !context.features.hasClientProvidedEffort
+            && previousModel.map { $0.capabilities.contains(.reasoning) || $0.defaultRole == .complexReasoning } == true
+            && previousProvider.map { $0.apiProtocol != .anthropicMessages } == true
+            && raisedEffort.map { (effortOrder.firstIndex(of: $0) ?? 0) > (effortOrder.firstIndex(of: initialEffort) ?? 0) } == true
+        let targetEffort: ReasoningEffort = canIncreaseEffort ? (raisedEffort ?? initialEffort) : initialEffort
 
         var evaluations: [CandidateEvaluation] = []
         var passingModels: [(ModelConfig, ProviderConfig, Double, [String])] = []
@@ -829,22 +850,15 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             strategy: context.policy.activeStrategy
         )
         let canSwitchPhase = context.features.isUserTurnBoundary != false
-        let shouldRescue = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis && context.escalateNextTurn
-        let targetTier: ModelTier = {
-            guard shouldRescue else { return baseTier }
-            switch baseTier {
-            case .low: return .medium
-            case .medium, .high: return .high
-            }
-        }()
+        let wantsRescue = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
+            && context.qualityFailureCount > 0 && !canIncreaseEffort
+            && explicitTier == nil && context.policy.pinnedModelID == nil
 
         let configuredTierIDSet = Set([ModelTier.low, .medium, .high].flatMap { context.policy.modelIDs(for: $0) })
         let hasConfiguredPool = !configuredTierIDSet.isEmpty || context.policy.fallbackModelID != nil
         let enforceStrictTierPool = context.policy.strictThreeTierPoolOnly
             && (context.policy.preferTierMappingInAuto || explicitTier != nil)
             && hasConfiguredPool
-        var effectiveTier = explicitTier ?? targetTier
-
         let stickyTuple = context.stickyModelID.flatMap { sid in sorted.first(where: { $0.0.id == sid }) }
         let tierOrder = ModelTier.allCases
         let stickyTiers: [ModelTier] = stickyTuple.map { sticky in
@@ -858,9 +872,19 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                 }
             }
         } ?? []
-        let targetIndex = tierOrder.firstIndex(of: targetTier) ?? 0
-        let stickyTier = stickyTiers.contains(targetTier) ? targetTier : stickyTiers.last
+        let stickyTier = stickyTiers.contains(baseTier) ? baseTier : stickyTiers.last
         let stickyTierIndex = stickyTier.flatMap { tierOrder.firstIndex(of: $0) }
+        let rescueTier: ModelTier? = {
+            guard wantsRescue, let index = stickyTierIndex, index + 1 < tierOrder.count else { return nil }
+            let next = tierOrder[index + 1]
+            guard let candidate = Self.resolveTierCandidate(poolIDs: context.policy.modelIDs(for: next),
+                sorted: sorted, allModels: context.models, enableSameModelGrouping: context.policy.enableAutoSameModelGrouping),
+                  candidate.tuple.0.id != stickyTuple?.0.id else { return nil }
+            return next
+        }()
+        let targetTier = wantsRescue ? (rescueTier ?? stickyTier ?? baseTier) : baseTier
+        var effectiveTier = explicitTier ?? targetTier
+        let targetIndex = tierOrder.firstIndex(of: targetTier) ?? 0
         let tierPoolIDs = context.policy.modelIDs(for: targetTier)
         let resolvedTierCandidate = Self.resolveTierCandidate(
             poolIDs: tierPoolIDs,
@@ -871,17 +895,20 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         let canFollowTaskTier = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
             && context.policy.activeStrategy == .balanced && context.policy.preferTierMappingInAuto
             && resolvedTierCandidate != nil
-        let stickyNeedsTierUpgrade = canFollowTaskTier
+        let stickyNeedsTierUpgrade = !canIncreaseEffort && canFollowTaskTier
             && (stickyTierIndex ?? -1) < targetIndex
-        let stickyNeedsEscalateToReasoning = canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
+        let stickyNeedsEscalateToReasoning = !canIncreaseEffort && canSwitchPhase && context.policy.enablePhaseDowngradeHysteresis
             && (!context.policy.preferTierMappingInAuto || context.policy.modelIDs(for: targetTier).isEmpty)
             && context.policy.activeStrategy != .costFirst && targetEffort.requiresDeepReasoning
             && hasReasoningCandidate && (stickyTuple.map {
                 !$0.0.capabilities.contains(.reasoning) && $0.0.defaultRole != .complexReasoning
             } ?? false)
-        let stickyNeedsToolRescue = shouldRescue && !stickyTiers.contains(targetTier)
-        let stickyShouldDowngrade = canFollowTaskTier && !context.escalateNextTurn && !targetEffort.requiresDeepReasoning
-            && (stickyTierIndex ?? -1) > targetIndex && context.consecutiveRoutineTurns >= 2
+        let stickyNeedsToolRescue = rescueTier != nil && !stickyTiers.contains(targetTier)
+        let clearLightTask = context.features.subtaskCategory == .explorationSearch
+            || context.features.subtaskCategory == .summarizationCompaction
+        let stickyShouldDowngrade = canFollowTaskTier && context.qualityFailureCount == 0
+            && (stickyTierIndex ?? -1) > targetIndex
+            && (clearLightTask || context.consecutiveRoutineTurns >= 2)
 
         if let explicitTier {
             let tierPoolIDs = context.policy.modelIDs(for: explicitTier)
@@ -891,14 +918,16 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                 allModels: context.models,
                 enableSameModelGrouping: context.policy.enableAutoSameModelGrouping
             ) {
-                selectedTuple = tierTuple.tuple
-                let isPrimary = tierTuple.tuple.0.id == tierPoolIDs.first
-                if tierTuple.viaSameModelGroup {
-                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：主通道冷却中，同模型自动分组切换至「\(tierTuple.tuple.1.name) / \(tierTuple.tuple.0.displayName)」")
+                selectedTuple = (canIncreaseEffort && stickyTiers.contains(explicitTier) ? stickyTuple : nil) ?? tierTuple.tuple
+                let isPrimary = selectedTuple.0.id == tierPoolIDs.first
+                if canIncreaseEffort && selectedTuple.0.id == stickyTuple?.0.id {
+                    matchedRules.append("必需工具调用缺失：保留显式档位内的同一模型，思考强度提高至 \(targetEffort.rawValue)")
+                } else if tierTuple.viaSameModelGroup {
+                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：主通道冷却中，同模型自动分组切换至「\(selectedTuple.1.name) / \(selectedTuple.0.displayName)」")
                 } else {
-                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：请求「\(context.requestedModel)」-> 选用配置的\(explicitTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.tuple.0.displayName)」")
+                    matchedRules.append("显式档位路由 [\(explicitTier.displayName)]：请求「\(context.requestedModel)」-> 选用配置的\(explicitTier.shortName)\(isPrimary ? "" : "备选")模型「\(selectedTuple.0.displayName)」")
                 }
-                reasonNote = "显式指定 \(explicitTier.shortName) 档 · effort=\(targetEffort.rawValue)"
+                reasonNote = canIncreaseEffort ? "显式档位内保留原模型并提高思考强度至 \(targetEffort.rawValue)" : "显式指定 \(explicitTier.shortName) 档 · effort=\(targetEffort.rawValue)"
             } else if let controlledFallback = selectControlledFallback(
                 for: explicitTier,
                 policy: context.policy,
@@ -936,7 +965,7 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             matchedRules.append("命中固定模型规则: 用户已固定「\(pinnedTuple.0.displayName)」")
             reasonNote = "命中用户固定模型规则「\(pinnedTuple.0.displayName)」· effort=\(targetEffort.rawValue)"
         } else if context.policy.enableSessionStickiness,
-                  context.features.isMultiTurn,
+                  (context.features.isMultiTurn || context.qualityFailureCount > 0),
                   let stickyTuple,
                   !stickyNeedsTierUpgrade,
                   !stickyNeedsEscalateToReasoning,
@@ -945,7 +974,16 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             selectedTuple = stickyTuple
             effectiveTier = stickyTier ?? effectiveTier
             matchedRules.append("命中多轮会话粘性: 保持与同会话上一轮一致的「\(stickyTuple.0.displayName)」以保留缓存收益")
-            reasonNote = "保持会话缓存稳定 (粘性) · \(subtask.displayName) · effort=\(targetEffort.rawValue)"
+            if canIncreaseEffort {
+                matchedRules.append("必需工具调用缺失：保留同一模型，思考强度提高至 \(targetEffort.rawValue)")
+                reasonNote = "必需工具调用缺失，同模型提高思考强度至 \(targetEffort.rawValue)"
+            } else {
+                reasonNote = wantsRescue && rescueTier == nil
+                    ? "必需工具调用缺失，但相邻高档不可用或已到最高档，保留当前模型"
+                    : canSwitchPhase
+                    ? "保持会话缓存稳定 (粘性) · \(subtask.displayName) · effort=\(targetEffort.rawValue)"
+                    : "工具或上游状态续接，保留同一模型 · effort=\(targetEffort.rawValue)"
+            }
         } else {
             let stickyWasEscalated = context.policy.enableSessionStickiness
                 && context.features.isMultiTurn && stickyTuple != nil
@@ -961,8 +999,8 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                     matchedRules.append("三档路由命中 [\(targetTier.displayName)]：任务「\(subtask.displayName)」(effort=\(targetEffort.rawValue)) + 策略「\(context.policy.activeStrategy.displayName)」-> 选用\(targetTier.shortName)\(isPrimary ? "" : "备选")模型「\(tierTuple.0.displayName)」")
                 }
                 if stickyShouldDowngrade {
-                    reasonNote = "连续常规任务，降档至「\(tierTuple.0.displayName)」"
-                    matchedRules.append("防抖降档：连续 \(context.consecutiveRoutineTurns) 轮常规任务，切换至\(targetTier.shortName)")
+                    reasonNote = clearLightTask ? "新一轮轻量任务，降档至「\(tierTuple.0.displayName)」" : "连续常规任务，降档至「\(tierTuple.0.displayName)」"
+                    matchedRules.append(clearLightTask ? "用户新一轮轻量任务：切换至\(targetTier.shortName)" : "防抖降档：连续 \(context.consecutiveRoutineTurns) 轮常规任务，切换至\(targetTier.shortName)")
                 } else if stickyNeedsToolRescue {
                     reasonNote = "连续无有效工具调用/空转，自动升档破局至「\(tierTuple.0.displayName)」"
                     matchedRules.append("语义软升级：检测到前序轮次工具调用空转，自动升至「\(tierTuple.0.displayName)」")
@@ -1230,11 +1268,9 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
             return .low
         case .balanced:
             switch task {
-            case .simpleQA:
-                return .low
-            case .generalChat, .coding, .toolCalling, .visionMultimodal:
+            case .simpleQA, .generalChat, .coding, .toolCalling, .visionMultimodal, .longContext:
                 return .medium
-            case .complexReasoning, .longContext:
+            case .complexReasoning:
                 return .high
             }
         case .qualityFirst:
@@ -1475,7 +1511,9 @@ public final class ModelRouter: @unchecked Sendable {
         var modelUUID: UUID
         var policyVersion: Int
         var consecutiveRoutineTurns: Int
-        var escalateNextTurn: Bool
+        var qualityFailureCount: Int
+        var lastFailureEffort: ReasoningEffort?
+        var qualityRecoveryKey: String?
         var wasMultiTurn: Bool
         var lastAccessedAt: Date
     }
@@ -1535,30 +1573,38 @@ public final class ModelRouter: @unchecked Sendable {
         models: [ModelConfig],
         policy: RoutingPolicyConfig,
         runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics] = [:],
-        stickinessNamespace: String? = nil
+        stickinessNamespace: String? = nil,
+        qualityRecoveryKey: String? = nil
     ) -> RoutingDecision {
         let baseModeKey = Self.stickinessModeKey(requestedModel: requestedModel)
         let modeKey = stickinessNamespace.map { "agent:\($0)|\(baseModeKey)" } ?? baseModeKey
         let now = Date()
-        let sessionSnapshot: (stickyID: UUID?, routineCount: Int, escalate: Bool) = lock.withLock {
+        let sessionSnapshot: (stickyID: UUID?, routineCount: Int, failures: Int, failedEffort: ReasoningEffort?) = lock.withLock {
             pruneStickinessLocked(now: now)
             guard policy.enableSessionStickiness,
-                  features.isMultiTurn,
                   let fp = features.conversationFingerprint else {
-                return (nil, 0, false)
+                return (nil, 0, 0, nil)
             }
             let key = SessionStickinessKey(fingerprint: fp, modeKey: modeKey)
             guard var cached = sessionStickinessMap[key],
                   cached.policyVersion == policy.policyVersion else {
-                return (nil, 0, false)
+                return (nil, 0, 0, nil)
             }
+            let matchesFailure = qualityRecoveryKey != nil && qualityRecoveryKey == cached.qualityRecoveryKey
+            if !matchesFailure && features.isUserTurnBoundary != false {
+                cached.qualityFailureCount = 0
+                cached.lastFailureEffort = nil
+                cached.qualityRecoveryKey = nil
+                sessionStickinessMap[key] = cached
+            }
+            guard features.isMultiTurn || matchesFailure else { return (nil, 0, 0, nil) }
             let isRoutineBoundary = features.isUserTurnBoundary != false
                 && features.subtaskCategory.recommendedTier != .high
-                && !(features.clientProvidedEffort ?? features.recommendedEffort).requiresDeepReasoning
             let routineCount = isRoutineBoundary ? (cached.consecutiveRoutineTurns + 1) : 0
             cached.lastAccessedAt = now
             sessionStickinessMap[key] = cached
-            return (cached.modelUUID, routineCount, cached.escalateNextTurn)
+            return (cached.modelUUID, routineCount, matchesFailure ? cached.qualityFailureCount : 0,
+                    matchesFailure ? cached.lastFailureEffort : nil)
         }
 
         let decider: any RoutingDeciderPlugin = lock.withLock {
@@ -1573,7 +1619,9 @@ public final class ModelRouter: @unchecked Sendable {
             policy: policy,
             stickyModelID: sessionSnapshot.stickyID,
             consecutiveRoutineTurns: sessionSnapshot.routineCount,
-            escalateNextTurn: sessionSnapshot.escalate,
+            escalateNextTurn: sessionSnapshot.failures > 0,
+            qualityFailureCount: sessionSnapshot.failures,
+            lastFailureEffort: sessionSnapshot.failedEffort,
             runtimeMetricsByModelID: runtimeMetricsByModelID
         )
 
@@ -1586,6 +1634,8 @@ public final class ModelRouter: @unchecked Sendable {
         policyVersion: Int,
         isRoutineSubtask: Bool = false,
         wasToolStarved: Bool = false,
+        selectedEffort: ReasoningEffort = .medium,
+        qualityRecoveryKey: String? = nil,
         requestedModel: String = "auto",
         explicitTier: ModelTier? = nil,
         isMultiTurn: Bool = true,
@@ -1617,7 +1667,10 @@ public final class ModelRouter: @unchecked Sendable {
                 modelUUID: modelUUID,
                 policyVersion: policyVersion,
                 consecutiveRoutineTurns: routineCount,
-                escalateNextTurn: wasToolStarved,
+                qualityFailureCount: wasToolStarved && qualityRecoveryKey != nil
+                    ? min(2, (prev?.policyVersion == policyVersion && prev?.qualityRecoveryKey == qualityRecoveryKey ? (prev?.qualityFailureCount ?? 0) : 0) + 1) : 0,
+                lastFailureEffort: wasToolStarved && qualityRecoveryKey != nil ? selectedEffort : nil,
+                qualityRecoveryKey: wasToolStarved ? qualityRecoveryKey : nil,
                 wasMultiTurn: nextWasMultiTurn,
                 lastAccessedAt: now
             )

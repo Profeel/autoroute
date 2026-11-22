@@ -23,8 +23,8 @@ final class AdaptiveRoutingTests: XCTestCase {
             ("从以下记录提取订单号", low.id, .low),
             ("Fix the typo in README.md", medium.id, .medium),
             ("Write a product announcement email", medium.id, .medium),
-            ("Check this", high.id, .medium),
-            ("Debug why checkout sometimes hangs", high.id, .medium),
+            ("Check this", medium.id, .medium),
+            ("Debug why checkout sometimes hangs", medium.id, .medium),
             ("Plan a cross-service database migration", high.id, .high),
             ("Find the root cause of a deadlock", high.id, .high),
         ]
@@ -34,6 +34,111 @@ final class AdaptiveRoutingTests: XCTestCase {
             XCTAssertEqual(decision.selectedModelUUID, expectedModel, prompt)
             XCTAssertEqual(decision.selectedEffort, expectedEffort, prompt)
         }
+    }
+
+    func testHistoryLengthDoesNotImplyHighComplexityButStillLimitsCapacity() {
+        var medium = model("scoped")
+        medium.contextWindow = 32_000
+        var high = model("advanced")
+        high.contextWindow = 300_000
+        let policy = RoutingPolicyConfig(mediumTierModelID: medium.id, highTierModelID: high.id)
+        let messages = [["role": "user", "content": String(repeating: "x", count: 450_000)],
+                        ["role": "assistant", "content": "Done"], ["role": "user", "content": "Check this"]]
+        let features = RequestFeatureExtractor.extract(from: ["messages": messages])
+        XCTAssertEqual(features.subtaskCategory, .generalEngineering)
+        let result = ModelRouter().route(requestedModel: "auto", features: features, providers: [provider], models: [medium, high], policy: policy)
+        XCTAssertEqual(result.selectedModelUUID, high.id)
+        XCTAssertEqual(result.candidateEvaluations.first { $0.modelUUID == medium.id }?.passedHardConstraints, false)
+    }
+
+    func testExplicitHighEffortDoesNotPreventNewLightTaskDowngradeOrChangeToolContinuation() {
+        let low = model("light"), medium = model("scoped"), high = model("advanced")
+        let policy = RoutingPolicyConfig(lowTierModelID: low.id, mediumTierModelID: medium.id, highTierModelID: high.id)
+        let router = ModelRouter()
+        let session = "switch-session"
+        router.recordSuccessfulSessionModel(fingerprint: session, modelUUID: high.id, policyVersion: policy.policyVersion)
+        let history: [[String: Any]] = [["role": "user", "content": "Plan cross-service architecture"], ["role": "assistant", "content": "Done"]]
+        let continuation = history + [["role": "tool", "content": "Found source"]]
+        let toolFeatures = RequestFeatureExtractor.extract(from: ["messages": continuation, "reasoning_effort": "high"], sessionHeader: session)
+        let toolDecision = router.route(requestedModel: "auto", features: toolFeatures, providers: [provider], models: [low, medium, high], policy: policy)
+        XCTAssertEqual(toolDecision.selectedModelUUID, high.id)
+        XCTAssertEqual(toolDecision.selectedEffort, .high)
+        let next = history + [["role": "user", "content": "Search for the config file"]]
+        let features = RequestFeatureExtractor.extract(from: ["messages": next, "reasoning_effort": "high"], sessionHeader: session)
+        let decision = router.route(requestedModel: "auto", features: features, providers: [provider], models: [low, medium, high], policy: policy)
+        XCTAssertEqual(decision.selectedModelUUID, low.id)
+        XCTAssertEqual(decision.selectedEffort, .high)
+        XCTAssertTrue(decision.matchedRules.contains { $0.contains("轻量任务") })
+    }
+
+    func testVerifiedFailureRecoversSameModelThenAdjacentTierAndStopsAtTop() {
+        let low = model("light"), medium = model("scoped"), high = model("advanced")
+        let models = [low, medium, high]
+        let policy = RoutingPolicyConfig(lowTierModelID: low.id, mediumTierModelID: medium.id, highTierModelID: high.id)
+        let router = ModelRouter()
+        let session = "quality-session", key = "same-required-tool-context"
+        let features = RequestFeatureExtractor.extract(from: ["messages": [["role": "user", "content": "Implement the requested function"]]], sessionHeader: session)
+        func record(_ model: ModelConfig, effort: ReasoningEffort, failed: Bool = true) {
+            router.recordSuccessfulSessionModel(fingerprint: session, modelUUID: model.id, policyVersion: policy.policyVersion,
+                wasToolStarved: failed, selectedEffort: effort, qualityRecoveryKey: key, isMultiTurn: false)
+        }
+        func route(_ recoveryKey: String?) -> RoutingDecision {
+            router.route(requestedModel: "auto", features: features, providers: [provider], models: models, policy: policy, qualityRecoveryKey: recoveryKey)
+        }
+        record(medium, effort: .medium)
+        let first = route(key)
+        XCTAssertEqual(first.selectedModelUUID, medium.id)
+        XCTAssertEqual(first.selectedEffort, .high)
+        XCTAssertTrue(first.matchedRules.contains { $0.contains("必需工具调用缺失") })
+        XCTAssertEqual(route("unrelated-task").selectedEffort, .medium)
+        XCTAssertEqual(route(key).selectedEffort, .medium, "An unrelated user task must clear stale recovery state")
+        record(medium, effort: .high)
+        let second = route(key)
+        XCTAssertEqual(second.selectedModelUUID, high.id)
+        record(high, effort: .high)
+        let top = route(key)
+        XCTAssertEqual(top.selectedModelUUID, high.id)
+        XCTAssertTrue(top.routingReasonNote?.contains("最高档") == true)
+        record(high, effort: .high, failed: false)
+        XCTAssertEqual(route(key).selectedEffort, .medium)
+    }
+
+    func testRecoveryHonorsExplicitEffortAndUnavailableAdjacentTier() {
+        let medium = model("scoped"), high = model("advanced")
+        let policy = RoutingPolicyConfig(mediumTierModelID: medium.id, highTierModelID: high.id)
+        let router = ModelRouter(), session = "quality-explicit", key = "same"
+        let features = RequestFeatureExtractor.extract(from: ["reasoning_effort": "high", "messages": [["role": "user", "content": "Implement the requested function"]]], sessionHeader: session)
+        router.recordSuccessfulSessionModel(fingerprint: session, modelUUID: medium.id, policyVersion: policy.policyVersion,
+            wasToolStarved: true, selectedEffort: .high, qualityRecoveryKey: key, isMultiTurn: false)
+        let selected = router.route(requestedModel: "auto", features: features, providers: [provider], models: [medium, high], policy: policy, qualityRecoveryKey: key)
+        XCTAssertEqual(selected.selectedModelUUID, high.id)
+        XCTAssertEqual(selected.selectedEffort, .high)
+        var unavailable = high
+        unavailable.isEnabled = false
+        let held = router.route(requestedModel: "auto", features: features, providers: [provider], models: [medium, unavailable], policy: policy, qualityRecoveryKey: key)
+        XCTAssertEqual(held.selectedModelUUID, medium.id)
+        XCTAssertEqual(held.selectedEffort, .high)
+        XCTAssertTrue(held.routingReasonNote?.contains("不可用") == true)
+    }
+
+    func testExplicitModelAndTierPreserveEffortAndRecoveryIntent() {
+        let medium = model("scoped"), high = model("advanced")
+        let policy = RoutingPolicyConfig(mediumTierModelID: medium.id, highTierModelID: high.id)
+        let router = ModelRouter(), session = "explicit-session", key = "required"
+        let selectedHigh = RequestFeatureExtractor.extract(from: ["reasoning_effort": "high", "messages": [["role": "user", "content": "Implement the requested function"]]], sessionHeader: session)
+        let direct = router.route(requestedModel: "scoped", features: selectedHigh, providers: [provider], models: [medium, high], policy: policy)
+        XCTAssertEqual(direct.selectedEffort, .high)
+        let automatic = RequestFeatureExtractor.extract(from: ["messages": [["role": "user", "content": "Implement the requested function"]]], sessionHeader: session)
+        router.recordSuccessfulSessionModel(fingerprint: session, modelUUID: medium.id, policyVersion: policy.policyVersion,
+            wasToolStarved: true, selectedEffort: .medium, qualityRecoveryKey: key, requestedModel: "auto/medium", isMultiTurn: false)
+        let retry = router.route(requestedModel: "auto/medium", features: automatic, providers: [provider], models: [medium, high], policy: policy, qualityRecoveryKey: key)
+        XCTAssertEqual(retry.selectedModelUUID, medium.id)
+        XCTAssertEqual(retry.selectedEffort, .high)
+        XCTAssertTrue(retry.matchedRules.contains { $0.contains("思考强度提高") })
+        router.recordSuccessfulSessionModel(fingerprint: session, modelUUID: medium.id, policyVersion: policy.policyVersion,
+            wasToolStarved: true, selectedEffort: .high, qualityRecoveryKey: key, requestedModel: "auto/medium", isMultiTurn: false)
+        let exhausted = router.route(requestedModel: "auto/medium", features: automatic, providers: [provider], models: [medium, high], policy: policy, qualityRecoveryKey: key)
+        XCTAssertEqual(exhausted.selectedModelUUID, medium.id)
     }
 
     func testNativeAnthropicEffortRespectsClientSettingsAndCurrentModelSupport() {

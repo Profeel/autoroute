@@ -27,6 +27,7 @@ final class NativeResponsesTests: XCTestCase {
         let value = try result.get()
         XCTAssertEqual(value.assistantText, "你好")
         XCTAssertTrue(value.hasToolCalls)
+        XCTAssertEqual(value.nativeResponseID, "resp_1")
         XCTAssertEqual(value.usage?.promptTokens, 7)
         let forwarded = await capture.forwarded
         XCTAssertEqual(forwarded, wire)

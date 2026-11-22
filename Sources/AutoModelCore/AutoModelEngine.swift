@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 private final class LockedFlag: @unchecked Sendable {
@@ -11,6 +12,13 @@ private final class LockedFlag: @unchecked Sendable {
     var value: Bool {
         lock.withLock { flag }
     }
+}
+
+private final class LockedWireMetadata: @unchecked Sendable {
+    private let lock = NSLock()
+    private var metadata: WireRequestMetadata?
+    func set(_ value: WireRequestMetadata) { lock.withLock { metadata = value } }
+    var value: WireRequestMetadata? { lock.withLock { metadata } }
 }
 
 public enum LocalTokenPersistenceError: Error, LocalizedError, Sendable {
@@ -69,6 +77,80 @@ public final class AutoModelEngine: ObservableObject {
     @Published public private(set) var localModelAPIKeyError: String?
     private var transientFailureCountByModelID: [UUID: Int] = [:]
     private var retryNotBeforeByProviderID: [UUID: UInt64] = [:]
+    // Only opaque digests are kept in memory; state ownership is lost safely on restart.
+    private struct ResponseOrigin: Equatable {
+        var modelID: UUID
+        var providerID: UUID
+        var credentialDigest: String
+        var configurationDigest: String
+    }
+    private struct ResponseOriginEntry {
+        var origin: ResponseOrigin?
+        var recordedAt: Date
+    }
+    private let responseOriginSalt = UUID().uuidString
+    private var responseOrigins: [String: ResponseOriginEntry] = [:]
+
+    private func responseOriginDigest(_ value: String) -> String {
+        SHA256.hash(data: Data((responseOriginSalt + "|" + value).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func responseCredentialDigest(apiKey: String?, account: CodexSubscriptionAccount?, provider: ProviderConfig) -> String {
+        if let account {
+            return responseOriginDigest("account|\(account.id.uuidString)|\(account.accountID ?? provider.accountID ?? "")")
+        }
+        return responseOriginDigest("key|\(apiKey ?? "")|account|\(provider.accountID ?? "")")
+    }
+
+    private func responseConfigurationDigest(model: ModelConfig, provider: ProviderConfig, clientHeaders: [String: String]) -> String {
+        let lowered = Dictionary(clientHeaders.map { ($0.key.lowercased(), $0.value) }, uniquingKeysWith: { first, _ in first })
+        let forwarded = provider.passThroughHeaderNames.reduce(into: [String: String]()) { result, name in
+            let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let value = lowered[key] { result[key] = value }
+        }
+        let material: [String: Any] = ["model": model.modelID, "protocol": provider.apiProtocol.rawValue,
+            "endpoint": provider.baseURL, "account": provider.accountID ?? "", "proxy": provider.proxyURL ?? "",
+            "custom": provider.customHeaders, "forwarded": forwarded]
+        let data = (try? JSONSerialization.data(withJSONObject: material, options: [.sortedKeys])) ?? Data()
+        return responseOriginDigest("config|" + (String(data: data, encoding: .utf8) ?? ""))
+    }
+
+    // Match a required-tool failure only to a repeat of the same user request and tool schema.
+    private func qualityRecoveryKey(for payload: [String: Any]) -> String? {
+        let choice = payload["tool_choice"]
+        let required = (choice as? String) == "required" || (choice as? [String: Any])?["type"] as? String == "function"
+        guard required, let tools = payload["tools"] as? [Any], !tools.isEmpty,
+              let messages = payload["messages"] as? [[String: Any]],
+              let lastUser = messages.last(where: { ($0["role"] as? String) == "user" }),
+              let content = lastUser["content"] else { return nil }
+        guard let choice else { return nil }
+        let material: [String: Any] = ["choice": choice, "tools": tools, "user": content]
+        guard JSONSerialization.isValidJSONObject(material),
+              let data = try? JSONSerialization.data(withJSONObject: material, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        return responseOriginDigest("quality|" + text)
+    }
+
+    private func pruneResponseOrigins() {
+        let now = Date()
+        responseOrigins = responseOrigins.filter { now.timeIntervalSince($0.value.recordedAt) <= 7200 }
+        if responseOrigins.count > 2000 {
+            for key in responseOrigins.sorted(by: { $0.value.recordedAt < $1.value.recordedAt }).prefix(responseOrigins.count - 2000).map(\.key) {
+                responseOrigins.removeValue(forKey: key)
+            }
+        }
+    }
+
+    private func rememberResponseOrigin(id: String, origin: ResponseOrigin) {
+        guard !id.isEmpty else { return }
+        pruneResponseOrigins()
+        let key = responseOriginDigest(id)
+        if let existing = responseOrigins[key], existing.origin != origin {
+            responseOrigins[key] = ResponseOriginEntry(origin: nil, recordedAt: Date())
+        } else {
+            responseOrigins[key] = ResponseOriginEntry(origin: origin, recordedAt: Date())
+        }
+    }
 
     public var isLocalAPITokenPersistent: Bool { localAPITokenPersistenceError == nil }
     public var manualAgentAPIKey: String? {
@@ -936,7 +1018,7 @@ public final class AutoModelEngine: ObservableObject {
                 status = .healthy
             case .requestDeadlineExceeded:
                 status = .networkError
-            case .httpError, .modelUnavailable, .invalidResponse:
+            case .httpError, .modelUnavailable, .invalidResponse, .incompatibleRequest:
                 status = .serverError
             }
             let persistedError = persistedUpstreamErrorSummary(for: err, detailedMessage: err.localizedDescription)
@@ -2213,9 +2295,21 @@ public final class AutoModelEngine: ObservableObject {
            !previousResponseID.isEmpty {
             features.isUserTurnBoundary = false
         }
-        if let effort = (nativeAnthropicPayload?["output_config"] as? [String: Any])?["effort"] as? String {
-            features.clientProvidedEffort = ReasoningEffort(rawValue: effort)
+        if let rawEffort = nativeResponsesPayload?["reasoning_effort"]
+            ?? (nativeResponsesPayload?["reasoning"] as? [String: Any])?["effort"] {
+            features.clientProvidedEffort = (rawEffort as? String).flatMap { ReasoningEffort(rawValue: $0.lowercased()) }
+            features.hasClientProvidedEffort = true
         }
+        let anthropicState = nativeAnthropicPayload.map(NativeAnthropicRouting.opaqueContinuation) ?? (tokens: [], unresolved: false)
+        if !anthropicState.tokens.isEmpty || anthropicState.unresolved { features.isUserTurnBoundary = false }
+        if let effort = (nativeAnthropicPayload?["output_config"] as? [String: Any])?["effort"] {
+            features.clientProvidedEffort = (effort as? String).flatMap { ReasoningEffort(rawValue: $0.lowercased()) }
+            features.hasClientProvidedEffort = true
+        }
+        if nativeAnthropicPayload?["thinking"] != nil {
+            features.hasClientProvidedEffort = true
+        }
+        let qualityKey = qualityRecoveryKey(for: payload)
         let secrets = keychain.allKnownSecretValues()
         if !config.privacySettings.recordRequestBody {
             // Subtask summaries are derived from message text and are body data too.
@@ -2386,13 +2480,72 @@ public final class AutoModelEngine: ObservableObject {
             )
         }
 
+        let stateReferences = nativeResponsesPayload.map(NativeResponsesRouting.stateReferences) ?? (ids: [], encrypted: [], unresolved: false)
+        let hasExternalReferences = nativeResponsesPayload.map(NativeResponsesRouting.hasExternalReferences) ?? false
+        let hasStateReferences = !stateReferences.ids.isEmpty || !stateReferences.encrypted.isEmpty || stateReferences.unresolved
+            || !anthropicState.tokens.isEmpty || anthropicState.unresolved || hasExternalReferences
+        if hasStateReferences { pruneResponseOrigins() }
+        let stateKeys = stateReferences.ids.map { "responses|" + $0 }
+            + stateReferences.encrypted.map { "encrypted|" + $0 } + anthropicState.tokens.map { "anthropic|" + $0 }
+        let origins = stateKeys.compactMap { responseOrigins[responseOriginDigest($0)]?.origin }
+        let recordedOrigin = !stateReferences.unresolved && !anthropicState.unresolved && origins.count == stateKeys.count
+            && origins.dropFirst().allSatisfy { $0 == origins.first } ? origins.first : nil
+        // A caller may bring state created outside this process. A unique explicitly selected
+        // native model and single credential is the only safe source we can infer for it.
+        let explicitOrigin: ResponseOrigin? = {
+            guard hasStateReferences, recordedOrigin == nil, origins.isEmpty,
+                  !stateReferences.unresolved, !anthropicState.unresolved else { return nil }
+            let matching = config.models.compactMap { model -> (ModelConfig, ProviderConfig)? in
+                guard let provider = config.providers.first(where: { $0.id == model.providerID }) else { return nil }
+                let direct = routingRequestedModel == model.modelID || routingRequestedModel == "\(provider.name)/\(model.modelID)"
+                    || (routingRequestedModel == "codex/\(model.modelID)" && provider.apiProtocol == .codexChatGPT)
+                let compatible = nativeResponsesPayload != nil
+                    ? (provider.apiProtocol == .openAIResponses || provider.apiProtocol == .codexChatGPT)
+                    : provider.apiProtocol == .anthropicMessages
+                return direct && compatible ? (model, provider) : nil
+            }
+            guard matching.count == 1, let (model, provider) = matching.first else { return nil }
+            do {
+                let credential: String
+                if provider.apiProtocol == .codexChatGPT {
+                    let accounts = try keychain.getCodexAccounts(for: provider.id, fallbackAccountID: provider.accountID)
+                    guard accounts.count <= 1 else { return nil }
+                    credential = responseCredentialDigest(apiKey: nil, account: accounts.first, provider: provider)
+                } else {
+                    let keys = try keychain.getAPIKeys(for: provider.id)
+                    guard keys.count <= 1 else { return nil }
+                    credential = responseCredentialDigest(apiKey: keys.first, account: nil, provider: provider)
+                }
+                return ResponseOrigin(modelID: model.id, providerID: provider.id, credentialDigest: credential,
+                                      configurationDigest: responseConfigurationDigest(model: model, provider: provider, clientHeaders: clientHeaders))
+            } catch { return nil }
+        }()
+        let previousOrigin = recordedOrigin ?? explicitOrigin
         let runtimeMetrics = buildRuntimeMetricsMap()
+        let requiresStoredResponses = nativeResponsesPayload?["store"] as? Bool == true
         let eligibleProviders = config.providers.filter { provider in
-            nativeResponsesPayload == nil || provider.apiProtocol == .openAIResponses || provider.apiProtocol == .codexChatGPT
+            (nativeResponsesPayload == nil || provider.apiProtocol == .openAIResponses || provider.apiProtocol == .codexChatGPT)
+                && (!requiresStoredResponses || provider.apiProtocol == .openAIResponses)
+                && (previousOrigin == nil || provider.id == previousOrigin?.providerID)
         }
         let eligibleProviderIDs = Set(eligibleProviders.map(\.id))
+        let eligibleModels = config.models.filter { model in
+            guard eligibleProviderIDs.contains(model.providerID) else { return false }
+            guard let previousOrigin else { return true }
+            guard model.id == previousOrigin.modelID,
+                  let provider = eligibleProviders.first(where: { $0.id == model.providerID }) else { return false }
+            return responseConfigurationDigest(model: model, provider: provider, clientHeaders: clientHeaders) == previousOrigin.configurationDigest
+        }
         var decision: RoutingDecision
-        if let nativeAnthropicPayload,
+        if hasStateReferences && previousOrigin == nil {
+            let message = "无法确认上游状态的原始模型、供应商和账号（例如服务已重启、引用已过期或属于其他来源）。请提供完整上下文，去掉不可重放的状态引用后发起新请求。"
+            decision = RoutingDecision(requestedModel: routingRequestedModel, isAutoRouted: true,
+                matchedRules: ["上游状态归属未知，禁止跨来源续接"],
+                strategyName: agentResolution.policy.activeStrategy.displayName,
+                policyVersion: agentResolution.policy.policyVersion,
+                deciderPluginID: agentResolution.policy.activeDeciderPluginID,
+                decisionDurationMs: 0, errorSummary: message, routingReasonNote: message)
+        } else if let nativeAnthropicPayload,
            NativeAnthropicRouting.hasNativeFeatures(nativeAnthropicPayload) {
             let anthropicProviders = eligibleProviders.filter { $0.apiProtocol == .anthropicMessages }
             let anthropicProviderIDs = Set(anthropicProviders.map(\.id))
@@ -2401,12 +2554,13 @@ public final class AutoModelEngine: ObservableObject {
                     requestedModel: routingRequestedModel,
                     features: features,
                     providers: anthropicProviders,
-                    models: config.models.filter { anthropicProviderIDs.contains($0.providerID) },
+                    models: eligibleModels.filter { anthropicProviderIDs.contains($0.providerID) },
                     policy: agentResolution.policy,
                     runtimeMetricsByModelID: runtimeMetrics,
-                    stickinessNamespace: agentResolution.agentKind?.rawValue
+                    stickinessNamespace: agentResolution.agentKind?.rawValue,
+                    qualityRecoveryKey: qualityKey
                 )
-                if nativeDecision.selectedModelUUID != nil {
+                if nativeDecision.selectedModelUUID != nil || hasStateReferences {
                     decision = nativeDecision
                     decision.matchedRules.append("优先匹配 Anthropic 原生透传供应商")
                 } else {
@@ -2414,10 +2568,11 @@ public final class AutoModelEngine: ObservableObject {
                         requestedModel: routingRequestedModel,
                         features: features,
                         providers: eligibleProviders,
-                        models: config.models.filter { eligibleProviderIDs.contains($0.providerID) },
+                        models: eligibleModels,
                         policy: agentResolution.policy,
                         runtimeMetricsByModelID: runtimeMetrics,
-                        stickinessNamespace: agentResolution.agentKind?.rawValue
+                        stickinessNamespace: agentResolution.agentKind?.rawValue,
+                        qualityRecoveryKey: qualityKey
                     )
                 }
             } else {
@@ -2425,10 +2580,11 @@ public final class AutoModelEngine: ObservableObject {
                     requestedModel: routingRequestedModel,
                     features: features,
                     providers: eligibleProviders,
-                    models: config.models.filter { eligibleProviderIDs.contains($0.providerID) },
+                    models: eligibleModels,
                     policy: agentResolution.policy,
                     runtimeMetricsByModelID: runtimeMetrics,
-                    stickinessNamespace: agentResolution.agentKind?.rawValue
+                    stickinessNamespace: agentResolution.agentKind?.rawValue,
+                    qualityRecoveryKey: qualityKey
                 )
             }
         } else {
@@ -2436,22 +2592,29 @@ public final class AutoModelEngine: ObservableObject {
                 requestedModel: routingRequestedModel,
                 features: features,
                 providers: eligibleProviders,
-                models: config.models.filter { eligibleProviderIDs.contains($0.providerID) },
+                models: eligibleModels,
                 policy: agentResolution.policy,
                 runtimeMetricsByModelID: runtimeMetrics,
-                stickinessNamespace: agentResolution.agentKind?.rawValue
+                stickinessNamespace: agentResolution.agentKind?.rawValue,
+                qualityRecoveryKey: qualityKey
             )
         }
         decision.requestedModel = effectiveRequestedModel
         decision.agentID = agentResolution.agentKind?.rawValue
         decision.agentIdentitySource = agentResolution.identitySource
         decision.agentPolicyOverrideReason = agentResolution.overrideReason
+        if previousOrigin != nil {
+            decision.matchedRules.append("上游状态续接：仅允许原模型、供应商和凭据")
+            decision.routingReasonNote = "上游状态续接，保留原模型、供应商和凭据"
+        }
 
         guard let primaryID = decision.selectedModelUUID else {
             let status = (decision.isAutoRouted ? 503 : 404)
-            let errCode = nativeResponsesPayload != nil ? "native_responses_route_unavailable" : (decision.isAutoRouted ? "no_eligible_model" : "model_not_found")
-            let msg = nativeResponsesPayload != nil
-                ? "此请求包含必须保留的原生 Responses 工具或上下文，所选模型没有可用的 Responses 上游。请使用 Responses 供应商。"
+            let errCode = hasStateReferences ? "responses_continuation_unavailable" : (nativeResponsesPayload != nil ? "native_responses_route_unavailable" : (decision.isAutoRouted ? "no_eligible_model" : "model_not_found"))
+            let msg = hasStateReferences
+                ? ((decision.errorSummary ?? "原始模型或供应商当前不可用或配置已变更。") + " 请稍后重试，或提供完整上下文并去掉状态引用发起新请求。")
+                : nativeResponsesPayload != nil
+                ? (requiresStoredResponses ? "请求要求存储 Responses 状态，但没有可用的 OpenAI Responses 上游。" : "此请求包含必须保留的原生 Responses 工具或上下文，所选模型没有可用的 Responses 上游。请使用 Responses 供应商。")
                 : (decision.errorSummary ?? "没有满足条件的可用模型")
             let record = CallRecord(
                 source: source,
@@ -2602,7 +2765,7 @@ public final class AutoModelEngine: ObservableObject {
                 }
             }
 
-            let orderedCredentials: [AttemptCredential]
+            var orderedCredentials: [AttemptCredential]
             if provider.apiProtocol == .codexChatGPT {
                 let accounts = (try? keychain.getCodexAccounts(for: provider.id, fallbackAccountID: provider.accountID)) ?? []
                 if accounts.isEmpty {
@@ -2617,6 +2780,21 @@ public final class AutoModelEngine: ObservableObject {
                 orderedCredentials = rawKeys.isEmpty
                     ? [.apiKey(nil)]
                     : keyPoolRouter.orderedKeys(for: provider.id, keys: rawKeys, strategy: provider.keyRotationStrategy).map { .apiKey($0) }
+            }
+            if let previousOrigin {
+                orderedCredentials = orderedCredentials.filter { credential in
+                    switch credential {
+                    case .apiKey(let key):
+                        return responseCredentialDigest(apiKey: key, account: nil, provider: provider) == previousOrigin.credentialDigest
+                    case .codexAccount(let account):
+                        return responseCredentialDigest(apiKey: nil, account: account, provider: provider) == previousOrigin.credentialDigest
+                    }
+                }
+                if orderedCredentials.isEmpty {
+                    lastError = .invalidResponse(message: "原始账号或凭据不可用；请恢复原凭据重试，或提供完整上下文并去掉 previous_response_id 发起新请求。")
+                    decision.matchedRules.append("原始凭据不可用，禁止切换账号或 Key")
+                    break candidateAttempts
+                }
             }
 
             keyAttempts: for (keyIdx, credential) in orderedCredentials.enumerated() {
@@ -2638,6 +2816,12 @@ public final class AutoModelEngine: ObservableObject {
                     activeCodexAccount = acct
                     activeAPIKey = acct.accessToken
                     attemptProvider.accountID = acct.accountID ?? provider.accountID
+                }
+                if let previousOrigin,
+                   responseCredentialDigest(apiKey: activeAPIKey, account: activeCodexAccount, provider: attemptProvider) != previousOrigin.credentialDigest {
+                    lastError = .invalidResponse(message: "原始账号已变更；请恢复原账号重试，或提供完整上下文发起新请求。")
+                    decision.matchedRules.append("账号变更后禁止跨来源续接")
+                    break candidateAttempts
                 }
 
                 var didAttemptReactiveRefresh = false
@@ -2661,9 +2845,11 @@ public final class AutoModelEngine: ObservableObject {
                     let responseHeaders = mutableResponseHeaders
 
                     let headerFlag = LockedFlag()
+                    let wireMetadata = LockedWireMetadata()
                     let attemptEstimatedInputTokens = features.estimatedInputTokens
                     let attemptSelectedEffort = decision.selectedEffort
                     let attemptClientProvidedEffort = features.clientProvidedEffort
+                    let attemptHasClientProvidedEffort = features.hasClientProvidedEffort
                     let upstreamClient = self.upstreamClient
                     let remainingNanos = requestDeadlineNanos - keyCheckNow
                     let attemptSecrets = keychain.allKnownSecretValues()
@@ -2685,7 +2871,9 @@ public final class AutoModelEngine: ObservableObject {
                             clientHeaders: clientHeaders,
                             resolvedEffort: attemptSelectedEffort,
                             clientProvidedEffort: attemptClientProvidedEffort,
+                            hasClientProvidedEffort: attemptHasClientProvidedEffort,
                             secretsToRedact: attemptSecrets,
+                            onWireRequest: { wireMetadata.set($0) },
                             onStreamHeadersReady: {
                                 headerFlag.markTrue()
                                 if let onStreamHeadersReady {
@@ -2699,6 +2887,27 @@ public final class AutoModelEngine: ObservableObject {
 
                     switch result {
                     case .success(let completion):
+                        if nativeResponsesPayload != nil {
+                            let origin = ResponseOrigin(
+                                modelID: model.id, providerID: provider.id,
+                                credentialDigest: responseCredentialDigest(apiKey: activeAPIKey, account: activeCodexAccount, provider: attemptProvider),
+                                configurationDigest: responseConfigurationDigest(model: model, provider: provider, clientHeaders: clientHeaders)
+                            )
+                            for id in [completion.nativeResponseID].compactMap({ $0 }) + completion.nativeResponseItemIDs {
+                                rememberResponseOrigin(id: "responses|" + id, origin: origin)
+                            }
+                            for encrypted in completion.nativeResponseEncryptedContents {
+                                rememberResponseOrigin(id: "encrypted|" + encrypted, origin: origin)
+                            }
+                        }
+                        if provider.apiProtocol == .anthropicMessages && nativeAnthropicPayload != nil {
+                            let origin = ResponseOrigin(modelID: model.id, providerID: provider.id,
+                                credentialDigest: responseCredentialDigest(apiKey: activeAPIKey, account: activeCodexAccount, provider: attemptProvider),
+                                configurationDigest: responseConfigurationDigest(model: model, provider: provider, clientHeaders: clientHeaders))
+                            for token in completion.nativeAnthropicOpaqueTokens {
+                                rememberResponseOrigin(id: "anthropic|" + token, origin: origin)
+                            }
+                        }
                         if let acct = activeCodexAccount {
                             keyPoolRouter.clearAccountCooldown(providerID: provider.id, accountID: acct.id)
                         } else if let usedKey = activeAPIKey {
@@ -2733,7 +2942,8 @@ public final class AutoModelEngine: ObservableObject {
                             costUSD: costInfo.costUSD,
                             costStatus: costInfo.status,
                             errorMessage: nil,
-                            accountLabel: activeCodexAccount?.summary.displayTitle ?? credential.label
+                            accountLabel: activeCodexAccount?.summary.displayTitle ?? credential.label,
+                            wireMetadata: wireMetadata.value
                         )
                         attempts.append(attemptRecord)
 
@@ -2741,23 +2951,20 @@ public final class AutoModelEngine: ObservableObject {
                         cooldownUntilByModelID.removeValue(forKey: model.id)
 
                         if decision.isAutoRouted {
-                            let bodySnippet = String(data: completion.responseBody, encoding: .utf8) ?? ""
                             let hasToolCalls = completion.hasToolCalls
-                                || bodySnippet.contains("\"tool_calls\"")
-                                || bodySnippet.contains("\"function_call\"")
                             let toolChoice = payload["tool_choice"]
                             let requiresToolCall = (toolChoice as? String) == "required"
                                 || (toolChoice as? [String: Any])?["type"] as? String == "function"
                             let wasToolStarved = features.requiresTools && requiresToolCall && !hasToolCalls
-                                && completion.assistantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             let isRoutineSubtask = features.subtaskCategory.recommendedTier != .high
-                                && !decision.selectedEffort.requiresDeepReasoning
                             router.recordSuccessfulSessionModel(
                                 fingerprint: features.conversationFingerprint,
                                 modelUUID: model.id,
                                 policyVersion: decision.policyVersion,
                                 isRoutineSubtask: isRoutineSubtask,
                                 wasToolStarved: wasToolStarved,
+                                selectedEffort: decision.selectedEffort,
+                                qualityRecoveryKey: qualityKey,
                                 requestedModel: routingRequestedModel,
                                 explicitTier: explicitTier,
                                 isMultiTurn: features.isMultiTurn,
@@ -2864,6 +3071,12 @@ public final class AutoModelEngine: ObservableObject {
                             didAttemptReactiveRefresh = true
                             if let refreshed = await refreshOrSyncCodexAccount(acct, providerID: provider.id, forceRefresh: true),
                                refreshed.accessToken != activeAPIKey {
+                                if let previousOrigin,
+                                   responseCredentialDigest(apiKey: refreshed.accessToken, account: refreshed, provider: provider) != previousOrigin.credentialDigest {
+                                    lastError = .invalidResponse(message: "刷新后的账号与状态来源不一致，已停止续接。")
+                                    decision.matchedRules.append("账号刷新后禁止跨来源续接")
+                                    break candidateAttempts
+                                }
                                 activeCodexAccount = refreshed
                                 activeAPIKey = refreshed.accessToken
                                 attemptProvider.accountID = refreshed.accountID ?? provider.accountID
@@ -2886,7 +3099,8 @@ public final class AutoModelEngine: ObservableObject {
                                     costUSD: nil,
                                     costStatus: .noUsage,
                                     errorMessage: persistedErrMsg,
-                                    accountLabel: acct.summary.displayTitle
+                                    accountLabel: acct.summary.displayTitle,
+                                    wireMetadata: wireMetadata.value
                                 ))
                                 continue accountAttemptLoop
                             }
@@ -2933,7 +3147,8 @@ public final class AutoModelEngine: ObservableObject {
                                 costUSD: nil,
                                 costStatus: .noUsage,
                                 errorMessage: persistedErrMsg,
-                                accountLabel: activeCodexAccount?.summary.displayTitle ?? credential.label
+                                accountLabel: activeCodexAccount?.summary.displayTitle ?? credential.label,
+                                wireMetadata: wireMetadata.value
                             ))
                             continue keyAttempts
                         }
@@ -2981,6 +3196,9 @@ public final class AutoModelEngine: ObservableObject {
                         case .requestDeadlineExceeded:
                             // This is the request-level budget, not evidence that this provider is unhealthy.
                             break
+                        case .incompatibleRequest:
+                            // This candidate cannot carry the caller's explicit setting.
+                            break
                         case .invalidURL, .invalidResponse:
                             recordTransientCooldown(for: model.id, reason: persistedErrMsg)
                         }
@@ -3001,7 +3219,8 @@ public final class AutoModelEngine: ObservableObject {
                             costUSD: nil,
                             costStatus: .noUsage,
                             errorMessage: persistedErrMsg,
-                            accountLabel: activeCodexAccount?.summary.displayTitle ?? credential.label
+                            accountLabel: activeCodexAccount?.summary.displayTitle ?? credential.label,
+                            wireMetadata: wireMetadata.value
                         ))
 
                         if let seconds = upstreamErr.retryAfterSeconds {
@@ -3115,6 +3334,8 @@ public final class AutoModelEngine: ObservableObject {
             return "客户端已断开流式连接"
         case .requestDeadlineExceeded:
             return "请求达到累计 deadline"
+        case .incompatibleRequest(let message):
+            return message
         case .authError(let statusCode, _):
             return "上游鉴权失败 (HTTP \(statusCode))"
         case .modelUnavailable(let statusCode, _, _):

@@ -241,6 +241,11 @@ public final class ProxyServer: @unchecked Sendable {
             return
         }
 
+        guard jsonObj["_autoroute_responses_reasoning"] == nil else {
+            writer.sendJSON(statusCode: 400, body: errorJSON(message: "请求使用了 AutoRoute 保留字段。", type: "invalid_request_error", code: "reserved_parameter"))
+            return
+        }
+
         let isStream = (jsonObj["stream"] as? Bool) ?? false
         let sessionHeader = req.header("X-AutoModel-Session")
         let clientName = detectClientAgent(req: req, endpointPath: "/v1/chat/completions", payload: jsonObj)

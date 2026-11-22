@@ -1903,9 +1903,9 @@ final class AutoModelTests: XCTestCase {
         let dRoutine2 = router.route(requestedModel: "auto", features: fRoutine2, providers: [provider], models: allModels, policy: policy)
         XCTAssertEqual(dRoutine2.selectedModelUUID, medModel.id)
         // Simulate tool starvation on medModel -> next turn should soft-escalate back to High
-        router.recordSuccessfulSessionModel(fingerprint: fRoutine2.conversationFingerprint, modelUUID: medModel.id, policyVersion: 1, isRoutineSubtask: true, wasToolStarved: true)
+        router.recordSuccessfulSessionModel(fingerprint: fRoutine2.conversationFingerprint, modelUUID: medModel.id, policyVersion: 1, isRoutineSubtask: true, wasToolStarved: true, qualityRecoveryKey: "required-tool")
 
-        let dRescued = router.route(requestedModel: "auto", features: fRoutine2, providers: [provider], models: allModels, policy: policy)
+        let dRescued = router.route(requestedModel: "auto", features: fRoutine2, providers: [provider], models: allModels, policy: policy, qualityRecoveryKey: "required-tool")
         XCTAssertEqual(dRescued.selectedModelUUID, highModel.id)
 
         // 4. Cooldown excludes highModel without permanent eviction -> falls back to medModel cleanly

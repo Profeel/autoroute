@@ -34,5 +34,8 @@ final class NativeResponsesRoutingTests: XCTestCase {
         XCTAssertFalse(NativeResponsesRouting.isRequired(["tools": [["type": "function", "name": "lookup"]], "input": "Hi"]))
         XCTAssertTrue(NativeResponsesRouting.isRequired(["tools": [["type": "custom", "name": "exec"]], "input": "Hi"]))
         XCTAssertTrue(NativeResponsesRouting.isRequired(["input": [["type": "function_call", "namespace": "functions", "name": "exec"]]]))
+        XCTAssertTrue(NativeResponsesRouting.isRequired(["input": "continue", "previous_response_id": "resp_1"]))
+        XCTAssertTrue(NativeResponsesRouting.isRequired(["input": "start", "store": true]))
+        XCTAssertTrue(NativeResponsesRouting.isRequired(["input": [["type": "item_reference", "id": "item_1"]]]))
     }
 }

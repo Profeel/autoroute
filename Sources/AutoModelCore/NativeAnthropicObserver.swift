@@ -5,14 +5,10 @@ public enum NativeAnthropicRouting {
     /// Returns true if the request uses Anthropic-native features (`cache_control`, `thinking`,
     /// or Anthropic built-in tool types) that benefit from direct passthrough without OpenAI translation.
     public static func hasNativeFeatures(_ payload: [String: Any]) -> Bool {
-        if payload["thinking"] != nil { return true }
-        if let systemBlocks = payload["system"] as? [[String: Any]],
-           systemBlocks.contains(where: { $0["cache_control"] != nil }) {
-            return true
-        }
+        if payload["thinking"] != nil || hasCacheControl(payload)
+            || (payload["output_config"] as? [String: Any])?["effort"] != nil { return true }
         if let tools = payload["tools"] as? [[String: Any]] {
             for tool in tools {
-                if tool["cache_control"] != nil { return true }
                 if let type = tool["type"] as? String, !type.isEmpty, type != "custom" {
                     return true
                 }
@@ -21,7 +17,7 @@ public enum NativeAnthropicRouting {
         if let messages = payload["messages"] as? [[String: Any]] {
             for msg in messages {
                 if let blocks = msg["content"] as? [[String: Any]],
-                   blocks.contains(where: { $0["cache_control"] != nil || ($0["type"] as? String) == "thinking" }) {
+                   blocks.contains(where: { $0["cache_control"] != nil || ["thinking", "redacted_thinking"].contains($0["type"] as? String ?? "") }) {
                     return true
                 }
             }
@@ -29,13 +25,30 @@ public enum NativeAnthropicRouting {
         return false
     }
 
+    /// Signed thinking used in a tool continuation belongs to the upstream that produced it.
+    static func opaqueContinuation(_ payload: [String: Any]) -> (tokens: [String], unresolved: Bool) {
+        guard let messages = payload["messages"] as? [[String: Any]],
+              let lastBlocks = messages.last?["content"] as? [[String: Any]],
+              lastBlocks.contains(where: { $0["type"] as? String == "tool_result" }) else { return ([], false) }
+        var tokens: [String] = []
+        var unresolved = false
+        if let message = messages.last(where: { $0["role"] as? String == "assistant" }) {
+            for block in message["content"] as? [[String: Any]] ?? [] {
+                let type = block["type"] as? String ?? ""
+                guard type == "thinking" || type == "redacted_thinking" else { continue }
+                let value = block[type == "thinking" ? "signature" : "data"] as? String
+                if let value, !value.isEmpty { tokens.append(value) } else { unresolved = true }
+            }
+        }
+        return (tokens, unresolved)
+    }
+
     /// Apply automatic effort only to known model IDs at the start of a conversation.
     /// Leave continuation payloads and client-supplied thinking controls intact.
     static func applyingInitialEffort(
         to payload: [String: Any], modelID: String, effort: ReasoningEffort?
     ) -> [String: Any] {
-        let supportedIDs: Set<String> = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"]
-        guard let effort, supportedIDs.contains(modelID),
+        guard let effort, supportsEffort(modelID: modelID),
               let messages = payload["messages"] as? [[String: Any]], messages.count == 1,
               messages.first?["role"] as? String == "user",
               payload["thinking"] == nil else { return payload }
@@ -45,6 +58,25 @@ public enum NativeAnthropicRouting {
         var updated = payload
         updated["output_config"] = outputConfig
         return updated
+    }
+
+    static func supportsEffort(modelID: String) -> Bool {
+        ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"].contains(modelID)
+    }
+
+    /// Cache markers can occur at the request, system, tool or content-block level.
+    static func hasCacheControl(_ payload: [String: Any]) -> Bool {
+        if payload["cache_control"] != nil { return true }
+        if (payload["system"] as? [[String: Any]] ?? []).contains(where: { $0["cache_control"] != nil }) { return true }
+        if (payload["tools"] as? [[String: Any]] ?? []).contains(where: { $0["cache_control"] != nil }) { return true }
+        for message in payload["messages"] as? [[String: Any]] ?? [] {
+            for block in message["content"] as? [[String: Any]] ?? [] {
+                if block["cache_control"] != nil { return true }
+                if block["type"] as? String == "tool_result",
+                   (block["content"] as? [[String: Any]] ?? []).contains(where: { $0["cache_control"] != nil }) { return true }
+            }
+        }
+        return false
     }
 
     /// Extracts safe Anthropic protocol headers from an incoming proxy request for upstream passthrough.
@@ -67,6 +99,8 @@ struct NativeAnthropicObserver {
     private var outputTokens = 0
     private var cacheReadTokens = 0
     private var cacheCreationTokens = 0
+    private var sawCacheRead = false
+    private var sawCacheCreation = false
     private var sawAnyUsage = false
 
     private(set) var text = ""
@@ -74,6 +108,9 @@ struct NativeAnthropicObserver {
     private(set) var hasToolCalls = false
     private(set) var sawMessageStop = false
     private(set) var errorMessage: String?
+    private var signaturesByIndex: [Int: String] = [:]
+    private var redactedTokens: [String] = []
+    var opaqueTokens: [String] { Array(signaturesByIndex.values.filter { !$0.isEmpty }) + redactedTokens }
 
     var hasOutput: Bool { !text.isEmpty || !reasoning.isEmpty || hasToolCalls }
 
@@ -85,8 +122,8 @@ struct NativeAnthropicObserver {
             promptTokens: totalPrompt,
             completionTokens: out,
             totalTokens: totalPrompt + out,
-            cachedInputTokens: cacheReadTokens > 0 ? cacheReadTokens : nil,
-            cacheCreationTokens: cacheCreationTokens > 0 ? cacheCreationTokens : nil
+            cachedInputTokens: sawCacheRead ? cacheReadTokens : nil,
+            cacheCreationTokens: sawCacheCreation ? cacheCreationTokens : nil
         )
     }
 
@@ -116,6 +153,10 @@ struct NativeAnthropicObserver {
         case "content_block_start":
             if let block = event["content_block"] as? [String: Any] {
                 let btype = block["type"] as? String ?? ""
+                if btype == "redacted_thinking", let data = block["data"] as? String, !data.isEmpty { redactedTokens.append(data) }
+                if btype == "thinking", let signature = block["signature"] as? String, !signature.isEmpty {
+                    signaturesByIndex[event["index"] as? Int ?? 0] = signature
+                }
                 if btype == "tool_use" || btype == "server_tool_use" {
                     hasToolCalls = true
                 }
@@ -129,6 +170,8 @@ struct NativeAnthropicObserver {
                     reasoning += t
                 } else if dtype == "input_json_delta" {
                     hasToolCalls = true
+                } else if dtype == "signature_delta", let signature = delta["signature"] as? String {
+                    signaturesByIndex[event["index"] as? Int ?? 0, default: ""] += signature
                 }
             }
         case "message_delta":
@@ -156,6 +199,9 @@ struct NativeAnthropicObserver {
                     text += t
                 } else if btype == "thinking", let t = block["thinking"] as? String {
                     reasoning += t
+                    if let signature = block["signature"] as? String, !signature.isEmpty { signaturesByIndex[signaturesByIndex.count] = signature }
+                } else if btype == "redacted_thinking", let data = block["data"] as? String, !data.isEmpty {
+                    redactedTokens.append(data)
                 } else if btype == "tool_use" || btype == "server_tool_use" {
                     hasToolCalls = true
                 }
@@ -175,10 +221,12 @@ struct NativeAnthropicObserver {
         }
         if let read = raw["cache_read_input_tokens"] as? Int {
             cacheReadTokens = max(cacheReadTokens, read)
+            sawCacheRead = true
             sawAnyUsage = true
         }
         if let create = raw["cache_creation_input_tokens"] as? Int {
             cacheCreationTokens = max(cacheCreationTokens, create)
+            sawCacheCreation = true
             sawAnyUsage = true
         }
     }

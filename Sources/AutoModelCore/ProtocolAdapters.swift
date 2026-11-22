@@ -366,9 +366,14 @@ public enum ProtocolAdapters {
         if let topP = payload["top_p"] {
             chatPayload["top_p"] = topP
         }
-        if let reasoning = payload["reasoning"] as? [String: Any],
-           let effort = reasoning["effort"] as? String, !effort.isEmpty {
+        // Preserve presence and the original value, including newer model-specific values.
+        if let effort = payload["reasoning_effort"] ?? (payload["reasoning"] as? [String: Any])?["effort"] {
             chatPayload["reasoning_effort"] = effort
+        }
+        if let reasoning = payload["reasoning"] { chatPayload["_autoroute_responses_reasoning"] = reasoning }
+        if let thinking = payload["thinking"] { chatPayload["thinking"] = thinking }
+        for key in ["prompt_cache_key", "prompt_cache_retention", "prompt_cache_options"] {
+            if let value = payload[key] { chatPayload[key] = value }
         }
         if let toolChoice = payload["tool_choice"] {
             chatPayload["tool_choice"] = toolChoice
@@ -952,7 +957,9 @@ public extension ProtocolAdapters {
         modelID: String,
         forceStream: Bool,
         store: Bool? = nil,
-        defaultInstructions: String? = nil
+        defaultInstructions: String? = nil,
+        forwardCacheRetention: Bool = false,
+        forwardCacheOptions: Bool = false
     ) -> [String: Any] {
         let messages = payload["messages"] as? [[String: Any]] ?? []
         var systemParts: [String] = []
@@ -1054,12 +1061,18 @@ public extension ProtocolAdapters {
         if let maxTokens = (payload["max_completion_tokens"] as? Int) ?? (payload["max_tokens"] as? Int), store != false {
             out["max_output_tokens"] = maxTokens
         }
-        if let effort = (payload["reasoning_effort"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !effort.isEmpty {
-            out["reasoning"] = ["effort": effort]
-        } else if let reasoning = payload["reasoning"] as? [String: Any], !reasoning.isEmpty {
+        let originalReasoning = (payload["_autoroute_responses_reasoning"] as? [String: Any])
+            ?? (payload["reasoning"] as? [String: Any])
+        if let effort = payload["reasoning_effort"] {
+            var reasoning = originalReasoning ?? [:]
+            reasoning["effort"] = effort
+            out["reasoning"] = reasoning
+        } else if let reasoning = originalReasoning, !reasoning.isEmpty {
             out["reasoning"] = reasoning
         }
+        if let cacheKey = payload["prompt_cache_key"] { out["prompt_cache_key"] = cacheKey }
+        if forwardCacheRetention, let retention = payload["prompt_cache_retention"] { out["prompt_cache_retention"] = retention }
+        if forwardCacheOptions, let options = payload["prompt_cache_options"] { out["prompt_cache_options"] = options }
         if let tools = payload["tools"] as? [[String: Any]], !tools.isEmpty {
             out["tools"] = tools.compactMap { tool -> [String: Any]? in
                 guard (tool["type"] as? String) == "function" else { return nil }

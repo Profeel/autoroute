@@ -3,6 +3,11 @@ import Foundation
 /// Detect inputs that cannot survive a Responses -> Chat -> Responses conversion.
 public enum NativeResponsesRouting {
     public static func isRequired(_ payload: [String: Any]) -> Bool {
+        // State references and explicitly stored responses cannot survive Chat conversion.
+        let references = stateReferences(payload)
+        if !references.ids.isEmpty || !references.encrypted.isEmpty || references.unresolved || hasExternalReferences(payload) || payload["store"] as? Bool == true { return true }
+        // This newer option is only forwarded on the original Responses wire format.
+        if payload["prompt_cache_retention"] != nil || payload["prompt_cache_options"] != nil || hasCacheBreakpoint(payload) { return true }
         if let tools = payload["tools"] as? [[String: Any]], tools.contains(where: {
             ($0["type"] as? String) != "function"
         }) { return true }
@@ -10,6 +15,46 @@ public enum NativeResponsesRouting {
             let type = item["type"] as? String ?? "message"
             return type == "additional_tools" || type == "custom_tool_call"
                 || type == "custom_tool_call_output" || item["namespace"] != nil
+        }
+    }
+
+    static func hasCacheBreakpoint(_ payload: [String: Any]) -> Bool {
+        for key in ["input", "messages"] {
+            for item in payload[key] as? [[String: Any]] ?? [] {
+                for field in ["content", "output"] {
+                    if (item[field] as? [[String: Any]] ?? []).contains(where: { $0["prompt_cache_breakpoint"] != nil }) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    /// References are opaque upstream state. A missing/unknown reference is never silently dropped.
+    static func stateReferences(_ payload: [String: Any]) -> (ids: [String], encrypted: [String], unresolved: Bool) {
+        var ids: [String] = []
+        var encrypted: [String] = []
+        var unresolved = false
+        func add(_ value: Any?) {
+            if let id = value as? String, !id.isEmpty { ids.append(id) } else { unresolved = true }
+        }
+        if payload["previous_response_id"] != nil { add(payload["previous_response_id"]) }
+        for item in payload["input"] as? [[String: Any]] ?? [] {
+            let type = item["type"] as? String
+            if type == "item_reference" || (type == "reasoning" && item["encrypted_content"] != nil && item["id"] != nil) {
+                add(item["id"])
+            }
+            if type == "reasoning", let value = item["encrypted_content"] as? String, !value.isEmpty { encrypted.append(value) }
+        }
+        return (ids, encrypted, unresolved)
+    }
+
+    static func hasExternalReferences(_ payload: [String: Any]) -> Bool {
+        if payload["conversation"] != nil || (payload["prompt"] as? [String: Any])?["id"] != nil { return true }
+        return (payload["input"] as? [[String: Any]] ?? []).contains { item in
+            item["file_id"] != nil || (item["type"] as? String == "reasoning" && item["encrypted_content"] != nil)
+                || (item["content"] as? [[String: Any]] ?? []).contains { $0["file_id"] != nil }
         }
     }
 

@@ -10,6 +10,7 @@ struct RoutingReceiptView: View {
 
     @State private var showSubtaskTable = false
     @State private var showRawAudit = false
+    @State private var showAttempts = false
     @State private var showPayloads = false
     @State private var hoveredTurn: Int? = nil
 
@@ -201,16 +202,19 @@ struct RoutingReceiptView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                compactHeaderStrip
-                unifiedSessionChartCard
-                modelSharePieChartsCard
-                rawDetailsDisclosure
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    compactHeaderStrip
+                    unifiedSessionChartCard
+                    modelSharePieChartsCard
+                    rawDetailsDisclosure
+                }
+                .padding(14)
+                .frame(width: geometry.size.width, alignment: .leading)
             }
-            .padding(14)
+            .background(Color(.windowBackgroundColor))
         }
-        .background(Color(.windowBackgroundColor))
     }
 
     // MARK: - 1. Compact Header & 4 KPIs
@@ -268,10 +272,7 @@ struct RoutingReceiptView: View {
                         title: "本轮 Tokens",
                         value: record.finalUsage.map { formatTokens($0.totalTokens) } ?? "—",
                         sub: record.finalUsage.map { usage in
-                            if let rate = usage.cacheHitRate {
-                                return "\(usage.promptTokens)入 / \(usage.completionTokens)出 · 缓存 \(Int((rate * 100).rounded()))%"
-                            }
-                            return "\(usage.promptTokens)入 / \(usage.completionTokens)出"
+                            "\(usage.promptTokens)入 / \(usage.completionTokens)出"
                         } ?? "无用量"
                     )
                     Divider().frame(height: 26)
@@ -281,6 +282,14 @@ struct RoutingReceiptView: View {
                         sub: effectiveTimeline.count > 1 ? "\(formatTokens(totalSessionTokens)) · \(AutoModelFormatter.formatMs(totalSessionDurationMs))" : record.decision.strategyName
                     )
                 }
+
+                Text("路由选择 effort：\(record.decision.selectedEffort.rawValue) · 最近发送：\(wireEffortDescription(record.attempts.last(where: { $0.wireMetadata != nil })?.wireMetadata))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Text(attemptCacheDescription(record.finalUsage))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 if let impact = sessionImpact, impact.evaluatedTurnCount > 0 {
                     sessionBaselineComparisonStrip(impact)
@@ -968,8 +977,52 @@ struct RoutingReceiptView: View {
 
     // MARK: - 4. Collapsed Raw Details
 
+    private func wireEffortDescription(_ metadata: WireRequestMetadata?) -> String {
+        guard let metadata else { return "未知（未记录或未发送）" }
+        switch metadata.effortSource {
+        case .absent: return "交由上游决定"
+        case .client: return "\(metadata.effortValue ?? "未知")（客户端）"
+        case .automatic: return "\(metadata.effortValue ?? "未知")（自动）"
+        }
+    }
+
+    private func attemptCacheDescription(_ usage: TokenUsage?) -> String {
+        guard let cached = usage?.cachedInputTokens else { return "缓存命中未报告" }
+        let percent = usage?.cacheHitRate.map { "（\(Int(($0 * 100).rounded()))%）" } ?? ""
+        return "缓存命中 \(formatTokens(cached)) tokens\(percent)"
+    }
+
     private var rawDetailsDisclosure: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !record.attempts.isEmpty {
+                GroupBox {
+                    DisclosureGroup("上游尝试明细 (\(record.attempts.count) 次)", isExpanded: $showAttempts) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(record.attempts) { attempt in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("第 \(attempt.attemptIndex) 次 · \(attempt.providerName) / \(attempt.modelID) · \(attempt.succeeded ? "成功" : "失败")")
+                                        .font(.caption.weight(.medium))
+                                    Text("已发送 effort：\(wireEffortDescription(attempt.wireMetadata)) · \(attemptCacheDescription(attempt.usage))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    if let omitted = attempt.wireMetadata?.omittedCacheHints, !omitted.isEmpty {
+                                        Text("该协议未传递缓存提示：\(omitted.joined(separator: ", "))")
+                                            .font(.caption)
+                                            .foregroundStyle(.orange)
+                                    }
+                                    if let error = attempt.errorMessage, !error.isEmpty {
+                                        Text(error).font(.caption).foregroundStyle(.red)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(.top, 6)
+                    }
+                    .font(.caption.weight(.medium))
+                    .padding(4)
+                }
+            }
             GroupBox {
                 DisclosureGroup("子任务与 Effort 路由明细 (\(mergedPathSegments.count) 段)", isExpanded: $showSubtaskTable) {
                     subtaskEffortTableCard
