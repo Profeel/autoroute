@@ -2839,6 +2839,16 @@ public final class AutoModelEngine: ObservableObject {
                         executedProvider: attemptProvider,
                         attemptNumber: attempts.count + 1
                     )
+                    // The selected model can differ from the model that actually
+                    // answers after a fallback. Keep the live UI truthful per attempt.
+                    liveRoutingState = LiveRoutingState(
+                        inFlightCount: liveRoutingState.inFlightCount,
+                        activeAgentName: liveRoutingState.activeAgentName,
+                        targetModelDisplayName: model.displayName,
+                        targetTier: targetTierForLive,
+                        lastCompletedSummary: liveRoutingState.lastCompletedSummary,
+                        updatedAt: Date()
+                    )
                     if nativeAnthropicPayload != nil && attemptProvider.apiProtocol == .anthropicMessages {
                         mutableResponseHeaders["X-AutoModel-Wire-Format"] = "anthropic-native"
                     }
@@ -3530,15 +3540,19 @@ public final class AutoModelEngine: ObservableObject {
     }
 
     private func buildRuntimeMetricsMap() -> [UUID: ModelRuntimeMetrics] {
-        var stats: [UUID: (totalLatency: Double, successCount: Int, totalCount: Int)] = [:]
+        var stats: [UUID: (totalLatency: Double, successCount: Int, totalCount: Int, totalCostUSD: Double, pricedTokens: Int)] = [:]
         for record in callHistory.prefix(150) {
             for attempt in record.attempts {
                 guard let mid = attempt.modelUUID else { continue }
-                var cur = stats[mid] ?? (0, 0, 0)
+                var cur = stats[mid] ?? (0, 0, 0, 0, 0)
                 cur.totalCount += 1
                 if attempt.succeeded {
                     cur.successCount += 1
                     cur.totalLatency += attempt.firstTokenMs ?? attempt.totalLatencyMs
+                    if let cost = attempt.costUSD, let usage = attempt.usage, usage.totalTokens > 0 {
+                        cur.totalCostUSD += max(0, cost)
+                        cur.pricedTokens += usage.totalTokens
+                    }
                 }
                 stats[mid] = cur
             }
@@ -3548,10 +3562,14 @@ public final class AutoModelEngine: ObservableObject {
         for (mid, s) in stats where s.totalCount > 0 {
             let avg = s.successCount > 0 ? (s.totalLatency / Double(s.successCount)) : 10_000.0
             let rate = Double(s.successCount) / Double(s.totalCount)
+            let measuredCost: Double? = s.successCount >= 2 && s.pricedTokens > 0
+                ? s.totalCostUSD / Double(s.pricedTokens) * 1_000_000.0
+                : nil
             let cooldown = cooldownUntilByModelID[mid].flatMap { $0 > now ? $0 : nil }
             result[mid] = ModelRuntimeMetrics(
                 averageLatencyMs: avg,
                 successRate: rate,
+                averageCostPerMillionTokens: measuredCost,
                 sampleCount: s.totalCount,
                 cooldownUntil: cooldown
             )

@@ -518,6 +518,12 @@ public enum AgentKind: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    public static func isHermesSystemPrompt(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .hasPrefix("you are hermes agent, built by nous research.")
+    }
+
     public var subtitle: String {
         switch self {
         case .codex:
@@ -1670,6 +1676,12 @@ public struct RoutingImpactSummary: Equatable, Sendable {
     public var retryCount: Int
     public var top10PercentCostSharePercent: Double?
     public var speedBasisLabel: String
+
+    /// Positive when routing saved time, negative when it increased latency.
+    public var timeDifferenceSeconds: Double? {
+        guard speedSampleCount > 0, speedComparedTurnCount > 0, let baselineTotalLatencyMs else { return nil }
+        return (baselineTotalLatencyMs - actualTotalLatencyMs) / 1_000
+    }
 
     public init(
         baselineModelDisplayName: String,

@@ -11,6 +11,51 @@ final class AdaptiveRoutingTests: XCTestCase {
         )
     }
 
+    func testCostFirstLearnsMeasuredUnitCostAfterColdStart() {
+        let expensive = ModelConfig(
+            providerID: provider.id, modelID: "expensive", displayName: "Expensive",
+            inputPricePerMillion: 10, outputPricePerMillion: 10,
+            capabilities: [.chat], qualityScore: 75, speedScore: 75
+        )
+        let cheap = ModelConfig(
+            providerID: provider.id, modelID: "cheap", displayName: "Cheap",
+            inputPricePerMillion: 0.5, outputPricePerMillion: 0.5,
+            capabilities: [.chat], qualityScore: 75, speedScore: 75
+        )
+        let policy = RoutingPolicyConfig(
+            activeStrategy: .costFirst,
+            autoConfigureTiers: false,
+            preferTierMappingInAuto: false,
+            strictThreeTierPoolOnly: false
+        )
+        let features = RequestFeatureExtractor.extract(from: [
+            "messages": [["role": "user", "content": "Classify this"]]
+        ])
+        let router = ModelRouter()
+
+        let coldStart = router.route(
+            requestedModel: "auto", features: features,
+            providers: [provider], models: [expensive, cheap], policy: policy
+        )
+        XCTAssertEqual(coldStart.selectedModelUUID, cheap.id)
+
+        let measured = [
+            expensive.id: ModelRuntimeMetrics(
+                averageLatencyMs: 100, successRate: 1, averageCostPerMillionTokens: 0.10, sampleCount: 2
+            ),
+            cheap.id: ModelRuntimeMetrics(
+                averageLatencyMs: 100, successRate: 1, averageCostPerMillionTokens: 4.00, sampleCount: 2
+            )
+        ]
+        let learned = router.route(
+            requestedModel: "auto", features: features,
+            providers: [provider], models: [expensive, cheap], policy: policy,
+            runtimeMetricsByModelID: measured
+        )
+        XCTAssertEqual(learned.selectedModelUUID, expensive.id)
+        XCTAssertTrue(learned.candidateEvaluations.first(where: { $0.modelUUID == expensive.id })?.scoreBreakdown.contains { $0.contains("近况实测") } == true)
+    }
+
     func testBalancedRouteUsesTaskComplexityAndEffortIndependently() {
         let low = model("light")
         let medium = model("scoped")

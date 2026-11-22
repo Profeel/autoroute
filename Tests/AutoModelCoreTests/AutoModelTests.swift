@@ -2611,4 +2611,23 @@ final class AutoModelTests: XCTestCase {
         XCTAssertGreaterThan(sessionImpact.speedSavedMsPerTurn ?? -999, 6000.0)
         XCTAssertTrue(sessionImpact.speedBasisLabel.contains("按用量归一化"))
     }
+
+    func testExplicitSessionHeaderKeepsConversationGroupStableAcrossChangingMessages() {
+        let firstTurn = RequestFeatureExtractor.extract(
+            from: ["model": "auto", "messages": [["role": "user", "content": "先检查这个项目"]]],
+            sessionHeader: "hermes-session-42"
+        )
+        let laterTurn = RequestFeatureExtractor.extract(
+            from: ["model": "auto", "messages": [["role": "user", "content": "现在修复侧栏布局并运行测试"]]],
+            sessionHeader: "hermes-session-42"
+        )
+        let otherSession = RequestFeatureExtractor.extract(
+            from: ["model": "auto", "messages": [["role": "user", "content": "现在修复侧栏布局并运行测试"]]],
+            sessionHeader: "hermes-session-99"
+        )
+
+        XCTAssertEqual(firstTurn.conversationFingerprint, "hermes-session-42")
+        XCTAssertEqual(firstTurn.conversationFingerprint, laterTurn.conversationFingerprint)
+        XCTAssertNotEqual(laterTurn.conversationFingerprint, otherSession.conversationFingerprint)
+    }
 }

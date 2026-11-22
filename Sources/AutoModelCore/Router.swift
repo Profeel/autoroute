@@ -6,17 +6,22 @@ import Foundation
 public struct ModelRuntimeMetrics: Sendable {
     public var averageLatencyMs: Double
     public var successRate: Double
+    /// Measured spend per million reported tokens. Nil means there is not enough
+    /// trustworthy usage/cost data to override configured pricing.
+    public var averageCostPerMillionTokens: Double?
     public var sampleCount: Int
     public var cooldownUntil: Date?
 
     public init(
         averageLatencyMs: Double,
         successRate: Double,
+        averageCostPerMillionTokens: Double? = nil,
         sampleCount: Int,
         cooldownUntil: Date? = nil
     ) {
         self.averageLatencyMs = averageLatencyMs
         self.successRate = successRate
+        self.averageCostPerMillionTokens = averageCostPerMillionTokens
         self.sampleCount = sampleCount
         self.cooldownUntil = cooldownUntil
     }
@@ -1401,10 +1406,19 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         }
 
         let costScore: Double
-        if let blended = model.blendedPricePerMillion {
-            // Maps $0 -> 100, $0.5 -> ~80, $2 -> ~50, $10 -> ~16, $30 -> ~5
-            costScore = 100.0 / (1.0 + blended * 0.5)
-            breakdown.append(String(format: "成本分 %.1f (综合单价 $%.2f/M)", costScore, blended))
+        let configuredCost = model.blendedPricePerMillion
+        let observedCost = runtimeMetrics.flatMap { metrics in
+            metrics.sampleCount >= 2 ? metrics.averageCostPerMillionTokens : nil
+        }
+        if let blended = observedCost ?? configuredCost {
+            // Once two measured samples exist, the real unit cost wins over a
+            // stale catalog price. A missing price remains explicitly unknown.
+            costScore = 100.0 / (1.0 + max(0.0, blended) * 0.5)
+            if let observedCost {
+                breakdown.append(String(format: "成本分 %.1f (近况实测 $%.2f/M)", costScore, observedCost))
+            } else {
+                breakdown.append(String(format: "成本分 %.1f (配置单价 $%.2f/M)", costScore, blended))
+            }
         } else {
             // Unpriced models get a conservative cost score so known-priced models are preferred in costFirst
             switch model.defaultRole {
