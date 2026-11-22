@@ -36,6 +36,7 @@ struct CallHistoryView: View {
         let id: String
         let representativeRecord: CallRecord
         let recordsChronological: [CallRecord]
+        let agentKind: AgentKind?
         let agentName: String
         let title: String
         let mergedPathText: String
@@ -43,6 +44,11 @@ struct CallHistoryView: View {
         let totalDurationMs: Double
         let totalTokens: Int
         let totalCostUSD: Double?
+        let costSavedUSD: Double?
+        let timeSavedSeconds: Double?
+        let actualModelLabel: String
+        let routingReason: String
+        let taskType: String
         let hasFailure: Bool
         let latestTimestamp: Date
     }
@@ -50,8 +56,7 @@ struct CallHistoryView: View {
     private var listCacheSignature: String {
         let headID = engine.callHistory.first?.id.uuidString ?? "empty"
         let tailID = engine.callHistory.last?.id.uuidString ?? "empty"
-        let hasHermes = engine.agentStatuses.contains(where: { $0.kind == .hermes && $0.isConnectedToAutoModel })
-        return "\(engine.callHistory.count)|\(headID)|\(tailID)|\(filterMode.rawValue)|\(searchText)|\(hasHermes)"
+        return "\(engine.callHistory.count)|\(headID)|\(tailID)|\(filterMode.rawValue)|\(searchText)"
     }
 
     private var baseFilteredRecords: [CallRecord] {
@@ -410,6 +415,7 @@ struct CallHistoryView: View {
                         SessionTaskDetailView(
                             engine: engine,
                             agentName: session.agentName,
+                            agentKind: session.agentKind,
                             title: session.title,
                             recordsChronological: session.recordsChronological,
                             switchCount: session.switchCount,
@@ -420,6 +426,7 @@ struct CallHistoryView: View {
                                 inspectedTurnRecord = turn
                             }
                         )
+                        .id(session.id)
                     } else if let record = selectedRecord {
                         let peers = sessionPeers(for: record)
                         RoutingReceiptView(
@@ -443,6 +450,9 @@ struct CallHistoryView: View {
     private func sessionRow(_ session: SessionSummaryItem) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
+                Image(systemName: AgentPresentation.symbol(for: session.agentKind))
+                    .foregroundStyle(AgentPresentation.color(for: session.agentKind))
+                    .accessibilityHidden(true)
                 Circle()
                     .fill(session.hasFailure ? Color.orange : Color.green)
                     .frame(width: 6, height: 6)
@@ -460,6 +470,44 @@ struct CallHistoryView: View {
                 .lineLimit(1)
 
             HStack(spacing: 8) {
+                Text(session.mergedPathText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(session.switchCount > 0 ? .blue : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(session.hasFailure ? "失败" : "已结束")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(session.hasFailure ? .orange : .secondary)
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                sessionMetric(icon: "number", value: compactTokenLabel(session.totalTokens), tint: .primary)
+                sessionMetric(icon: "dollarsign.circle", value: session.totalCostUSD.map(AutoModelFormatter.formatUSD) ?? "—", tint: .secondary)
+                sessionMetric(icon: "arrow.down.circle", value: session.costSavedUSD.map(AutoModelFormatter.formatUSD) ?? "—", tint: session.costSavedUSD.map { $0 >= 0 ? Color.green : Color.orange } ?? .secondary)
+                sessionMetric(icon: "clock.arrow.circlepath", value: compactSavedTime(session.timeSavedSeconds), tint: session.timeSavedSeconds.map { $0 < 0 ? Color.orange : Color.blue } ?? .secondary)
+                Spacer(minLength: 0)
+            }
+            .help("Token · 实际费用 · 相较旗舰的费用差额和耗时差额")
+
+            HStack(spacing: 5) {
+                Image(systemName: ModelChartPalette.symbol(for: session.actualModelLabel))
+                    .font(.caption2)
+                    .foregroundStyle(ModelChartPalette.color(for: session.actualModelLabel))
+                Text("实际 \(session.actualModelLabel)")
+                    .font(.caption2.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("· \(session.taskType)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            .help("任务类型：\(session.taskType)；路由原因：\(session.routingReason)")
+
+            HStack(spacing: 8) {
                 Text(AutoModelFormatter.formatMs(session.totalDurationMs))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -467,12 +515,33 @@ struct CallHistoryView: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(session.switchCount > 0 ? .blue : .secondary)
                 Spacer()
-                Text(session.totalCostUSD.map { AutoModelFormatter.formatUSD($0) } ?? "未定价")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 4)
+    }
+
+    private func sessionMetric(icon: String, value: String, tint: Color) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.caption2)
+            Text(value)
+                .font(.caption2.monospacedDigit())
+                .lineLimit(1)
+        }
+        .foregroundStyle(tint)
+    }
+
+    private func compactTokenLabel(_ count: Int) -> String {
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1_000) }
+        return "\(count)"
+    }
+
+    private func compactSavedTime(_ seconds: Double?) -> String {
+        guard let seconds else { return "—" }
+        let magnitude = abs(seconds)
+        if magnitude < 60 { return String(format: "%.1fs", seconds) }
+        return String(format: "%.1fm", seconds / 60)
     }
 
     private func singleCallRow(_ record: CallRecord) -> some View {
@@ -523,49 +592,10 @@ struct CallHistoryView: View {
 
     // MARK: - Session Aggregation Helpers
 
-    private func mergedSessionBuckets(from records: [CallRecord]) -> [(key: String, records: [CallRecord])] {
-        let rawGrouped = Dictionary(grouping: records, by: \.sessionGroupKey)
-        struct Bucket {
-            var key: String
-            var titleKey: String
-            var records: [CallRecord]
-            var earliest: Date
-            var latest: Date
-        }
-
-        let initialBuckets: [Bucket] = rawGrouped.compactMap { key, items in
-            let sorted = items.sorted { $0.timestamp < $1.timestamp }
-            guard let first = sorted.first, let last = sorted.last else { return nil }
-            let title = cleanSessionTitle(for: first)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            return Bucket(key: key, titleKey: title, records: sorted, earliest: first.timestamp, latest: last.timestamp)
-        }
-        .sorted { $0.earliest < $1.earliest }
-
-        var merged: [Bucket] = []
-        for bucket in initialBuckets {
-            if bucket.titleKey.count >= 6,
-               let matchIdx = merged.lastIndex(where: { existing in
-                   guard existing.titleKey == bucket.titleKey else { return false }
-                   let gap = max(0, bucket.earliest.timeIntervalSince(existing.latest))
-                   return gap <= 1800
-               }) {
-                merged[matchIdx].records.append(contentsOf: bucket.records)
-                merged[matchIdx].records.sort { $0.timestamp < $1.timestamp }
-                merged[matchIdx].earliest = min(merged[matchIdx].earliest, bucket.earliest)
-                merged[matchIdx].latest = max(merged[matchIdx].latest, bucket.latest)
-            } else {
-                merged.append(bucket)
-            }
-        }
-        return merged.map { (key: $0.key, records: $0.records) }
-    }
-
     private func computeSessionItems(from records: [CallRecord]) -> [SessionSummaryItem] {
-        mergedSessionBuckets(from: records).compactMap { bucket in
-            let chronological = bucket.records
-            guard let latest = chronological.last, let oldest = chronological.first else { return nil }
+        SessionPresentation.sessions(from: records).compactMap { session in
+            let chronological = session.records
+            guard let latest = chronological.last else { return nil }
 
             var segments: [(model: String, count: Int)] = []
             for r in chronological {
@@ -588,56 +618,40 @@ struct CallHistoryView: View {
             let totalDur = chronological.map(\.totalCompletionMs).reduce(0, +)
             let totalTok = chronological.compactMap { $0.finalUsage?.totalTokens }.reduce(0, +)
             let costValues = chronological.compactMap(\.totalCostUSD)
-            let totalCost: Double? = costValues.isEmpty ? nil : costValues.reduce(0, +)
+            let totalCost: Double? = costValues.count == chronological.count && !costValues.isEmpty ? costValues.reduce(0, +) : nil
+            let impact = engine.sessionImpactSummary(for: chronological)
+            let actualModelLabel = latest.executedModelDisplayName
+                ?? latest.executedModelID
+                ?? latest.decision.selectedDisplayName
+                ?? latest.requestedModel
+            let routingReason = latest.decision.routingReasonNote
+                ?? latest.decision.matchedRules.first
+                ?? "\(latest.decision.strategyName) 策略"
+            let taskType = latest.decision.subtaskCategory?.displayName ?? "通用任务"
             let hasFailure = chronological.contains { $0.status != .success }
 
             return SessionSummaryItem(
-                id: bucket.key,
+                id: session.key,
                 representativeRecord: latest,
                 recordsChronological: chronological,
-                agentName: resolvedAgentLabel(for: chronological),
-                title: cleanSessionTitle(for: oldest),
+                agentKind: session.agent,
+                agentName: session.agent?.displayName ?? latest.displayClientAgent,
+                title: session.displayTitle,
                 mergedPathText: mergedPathText,
                 switchCount: max(0, segments.count - 1),
                 totalDurationMs: totalDur,
                 totalTokens: totalTok,
                 totalCostUSD: totalCost,
+                costSavedUSD: impact.flatMap { $0.evaluatedTurnCount > 0 ? $0.costSavedUSD : nil },
+                timeSavedSeconds: impact.flatMap(\.timeDifferenceSeconds),
+                actualModelLabel: actualModelLabel,
+                routingReason: routingReason,
+                taskType: taskType,
                 hasFailure: hasFailure,
                 latestTimestamp: latest.timestamp
             )
         }
         .sorted { $0.latestTimestamp > $1.latestTimestamp }
-    }
-
-    private func resolvedAgentLabel(for chronological: [CallRecord]) -> String {
-        if let explicitHermes = chronological.first(where: { $0.displayClientAgent.lowercased().contains("hermes") }) {
-            return explicitHermes.displayClientAgent
-        }
-        let raw = chronological.first?.displayClientAgent ?? "外部客户端"
-        let hasHermesConfigured = engine.agentStatuses.contains(where: { $0.kind == .hermes && $0.isConnectedToAutoModel })
-        if raw == "Python SDK", hasHermesConfigured, chronological.first?.source == .externalProxy {
-            return "Hermes Agent"
-        }
-        return raw
-    }
-
-    private func cleanSessionTitle(for record: CallRecord) -> String {
-        if let preview = record.requestPreview {
-            let lines = preview
-                .components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            if let userLine = lines.first(where: { $0.hasPrefix("[user]") }) {
-                let cleaned = userLine.replacingOccurrences(of: "[user]", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !cleaned.isEmpty {
-                    return String(cleaned.prefix(24)) + (cleaned.count > 24 ? "…" : "")
-                }
-            }
-            if let firstNonSystem = lines.first(where: { !$0.hasPrefix("[system]") }) {
-                return String(firstNonSystem.prefix(24)) + (firstNonSystem.count > 24 ? "…" : "")
-            }
-        }
-        return record.hasConversationFingerprint ? "会话 \(record.shortSessionLabel)" : "单次调用"
     }
 
     private func shortModelName(_ raw: String) -> String {
@@ -653,9 +667,9 @@ struct CallHistoryView: View {
     }
 
     private func sessionPeers(for record: CallRecord) -> [CallRecord] {
-        if let matchedBucket = mergedSessionBuckets(from: engine.callHistory)
-            .first(where: { bucket in bucket.records.contains(where: { $0.id == record.id }) }) {
-            return matchedBucket.records
+        if let session = SessionPresentation.sessions(from: engine.callHistory)
+            .first(where: { session in session.records.contains(where: { $0.id == record.id }) }) {
+            return session.records
         }
         return [record]
     }

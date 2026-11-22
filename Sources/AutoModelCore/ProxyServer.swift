@@ -247,8 +247,9 @@ public final class ProxyServer: @unchecked Sendable {
         }
 
         let isStream = (jsonObj["stream"] as? Bool) ?? false
-        let sessionHeader = req.header("X-AutoModel-Session")
+        let sessionHeader = sessionHeader(from: req)
         let clientName = detectClientAgent(req: req, endpointPath: "/v1/chat/completions", payload: jsonObj)
+        let agentHeader = req.header("X-AutoModel-Agent")
         let streamStarted = StreamFlagBox()
 
         let headersCallback: (@Sendable ([String: String]) async throws -> Void)? = isStream ? { @Sendable headers in
@@ -270,7 +271,7 @@ public final class ProxyServer: @unchecked Sendable {
             sessionHeader: sessionHeader,
             clientName: clientName,
             endpointPath: "/v1/chat/completions",
-            agentHeader: req.header("X-AutoModel-Agent"),
+            agentHeader: agentHeader,
             clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
             onStreamChunk: chunkCallback
@@ -314,7 +315,9 @@ public final class ProxyServer: @unchecked Sendable {
         }
 
         let isStream = (openAIPayload["stream"] as? Bool) ?? false
-        let sessionHeader = req.header("X-AutoModel-Session")
+        let sessionHeader = sessionHeader(from: req)
+        let clientName = detectClientAgent(req: req, endpointPath: "/v1/messages", payload: openAIPayload)
+        let agentHeader = req.header("X-AutoModel-Agent")
         let streamStarted = StreamFlagBox()
         let nativeAnthropicStream = StreamFlagBox()
         let translator = AnthropicStreamTranslator()
@@ -348,9 +351,9 @@ public final class ProxyServer: @unchecked Sendable {
             payload: openAIPayload,
             source: .externalProxy,
             sessionHeader: sessionHeader,
-            clientName: detectClientAgent(req: req, endpointPath: "/v1/messages", payload: openAIPayload),
+            clientName: clientName,
             endpointPath: "/v1/messages",
-            agentHeader: req.header("X-AutoModel-Agent"),
+            agentHeader: agentHeader,
             nativeAnthropicPayload: rawJSON,
             nativeAnthropicHeaders: passthroughHeaders,
             clientHeaders: req.headers,
@@ -413,7 +416,9 @@ public final class ProxyServer: @unchecked Sendable {
         }
 
         let isStream = (openAIPayload["stream"] as? Bool) ?? false
-        let sessionHeader = req.header("X-AutoModel-Session")
+        let sessionHeader = sessionHeader(from: req)
+        let clientName = detectClientAgent(req: req, endpointPath: "/v1/responses", payload: openAIPayload)
+        let agentHeader = req.header("X-AutoModel-Agent")
         let streamStarted = StreamFlagBox()
         let translator = ResponsesStreamTranslator()
 
@@ -442,9 +447,9 @@ public final class ProxyServer: @unchecked Sendable {
             payload: openAIPayload,
             source: .externalProxy,
             sessionHeader: sessionHeader,
-            clientName: detectClientAgent(req: req, endpointPath: "/v1/responses", payload: openAIPayload),
+            clientName: clientName,
             endpointPath: "/v1/responses",
-            agentHeader: req.header("X-AutoModel-Agent"),
+            agentHeader: agentHeader,
             nativeResponsesPayload: useNativeResponses ? NativeResponsesRouting.wirePayload(rawJSON) : nil,
             clientHeaders: req.headers,
             onStreamHeadersReady: headersCallback,
@@ -663,6 +668,10 @@ public final class ProxyServer: @unchecked Sendable {
                 return trimmed
             }
         }
+        if let sessionID = req.header("X-Hermes-Session-Id"),
+           !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return AgentKind.hermes.displayName
+        }
         let referer = (req.header("HTTP-Referer") ?? req.header("Referer") ?? "").lowercased()
         if referer.contains("hermes") { return "Hermes Agent" }
         if referer.contains("openclaw") { return "OpenClaw" }
@@ -681,25 +690,25 @@ public final class ProxyServer: @unchecked Sendable {
         if ua.contains("continue") { return "Continue" }
         if ua.contains("curl") { return "curl" }
 
-        // Inspect payload system prompt / user / metadata for Python-based agents (e.g. Hermes Agent)
+        // Identify Hermes by its built-in system prompt when the SDK supplies no client label.
         if let payload {
-            var hintChunks: [String] = []
-            if let sys = payload["system"] as? String { hintChunks.append(String(sys.prefix(1200))) }
-            if let userField = payload["user"] as? String { hintChunks.append(userField) }
-            if let meta = payload["metadata"] as? [String: Any] {
-                hintChunks.append(meta.values.map { "\($0)" }.joined(separator: " "))
-            }
-            if let msgs = payload["messages"] as? [[String: Any]] {
-                for msg in msgs.prefix(2) where (msg["role"] as? String) == "system" {
-                    if let s = msg["content"] as? String {
-                        hintChunks.append(String(s.prefix(1200)))
+            var instructions = [payload["system"] as? String].compactMap { $0 }
+            if let messages = payload["messages"] as? [[String: Any]] {
+                for message in messages.prefix(2) where (message["role"] as? String) == "system" {
+                    if let text = message["content"] as? String {
+                        instructions.append(text)
+                    } else if let parts = message["content"] as? [[String: Any]] {
+                        instructions.append(contentsOf: parts.compactMap { $0["text"] as? String })
                     }
                 }
             }
-            let joined = hintChunks.joined(separator: " ").lowercased()
-            if joined.contains("hermes") || joined.contains("nous research") || joined.contains(".hermes/") {
-                return "Hermes Agent"
+            if instructions.contains(where: AgentKind.isHermesSystemPrompt) {
+                return AgentKind.hermes.displayName
             }
+            let legacyHints = instructions.map { String($0.prefix(1200)) }
+                + [payload["user"] as? String ?? ""]
+                + ((payload["metadata"] as? [String: Any])?.values.map { "\($0)" } ?? [])
+            let joined = legacyHints.joined(separator: " ").lowercased()
             if joined.contains("openclaw") { return "OpenClaw" }
             if joined.contains("opencode") { return "OpenCode" }
         }
@@ -711,6 +720,12 @@ public final class ProxyServer: @unchecked Sendable {
         case "/v1/responses": return "Codex"
         default: return "外部客户端"
         }
+    }
+
+    private func sessionHeader(from req: HTTPRequestMessage) -> String? {
+        ["X-AutoModel-Session", "X-Hermes-Session-Id", "X-OpenAI-Conversation-Id"]
+            .lazy.compactMap { req.header($0)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
     }
 
     private func errorJSON(message: String, type: String, code: String) -> Data {
