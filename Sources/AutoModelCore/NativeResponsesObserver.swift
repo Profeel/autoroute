@@ -9,6 +9,9 @@ struct NativeResponsesObserver {
     private(set) var usage: TokenUsage?
     private(set) var hasToolCalls = false
     private(set) var completedResponse: [String: Any]?
+    private(set) var responseID: String?
+    private(set) var responseItemIDs: [String] = []
+    private(set) var encryptedContents: [String] = []
     private(set) var errorMessage: String?
     var hasOutput: Bool { !text.isEmpty || !reasoning.isEmpty || hasToolCalls }
 
@@ -59,6 +62,9 @@ struct NativeResponsesObserver {
     }
 
     mutating func observeResponse(_ response: [String: Any]) {
+        responseID = response["id"] as? String
+        responseItemIDs = (response["output"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
+        encryptedContents = (response["output"] as? [[String: Any]] ?? []).compactMap { $0["encrypted_content"] as? String }
         if let rawUsage = response["usage"] as? [String: Any],
            let parsed = TokenUsage.parse(from: rawUsage) {
             usage = parsed

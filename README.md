@@ -13,6 +13,8 @@ There is no hosted control plane, account requirement, or mandatory telemetry. Y
 - **Evidence instead of marketing:** receipts separate routing time, TTFT, total latency, upstream-reported usage, local estimates, retries, and missing prices.
 - **Agent-aware without losing compatibility:** stable identities such as `auto/agent/codex` support per-Agent policy and budgets while legacy `auto` configurations continue to work.
 
+Balanced `auto` starts with the low tier for retrieval, extraction, or summaries, the middle tier for everyday questions and scoped work, and the high tier for architecture and difficult debugging. With session phase switching enabled, a new user turn can change tiers while tool continuations keep their model when it remains eligible. Explicit reasoning effort stays in effect independently of the tier. When a required tool call is missing, retrying the same request can raise effort first, then move up a tier when the request can safely switch.
+
 ## 60-second demo
 
 The scripted walkthrough covers **discover → connect → request → receipt → fallback**, plus an optional repeatable A/B run. It uses the built-in loopback mock for an offline demonstration and labels it as such.
@@ -46,6 +48,8 @@ Local endpoints:
 | `GET /health`, `GET /v1/health` | Minimal anonymous health response |
 
 Text, tool calls, vision messages, reasoning content, and usage extraction are supported within the documented adapter limits. Embeddings, image generation, audio, and `n > 1` are not implemented; unsupported requests receive an explicit error rather than silent degradation.
+
+For stateful Responses requests, send `store: true` on the first call to select a native OpenAI Responses upstream that supports storage. AutoRoute keeps continuation ownership in memory and forwards known state references only to the original model, upstream, and credential. If automatic routing cannot verify the origin after a restart or expiration, resend the replayable conversation without the state reference.
 
 ## Install
 

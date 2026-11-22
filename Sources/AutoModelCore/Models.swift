@@ -1123,8 +1123,8 @@ public enum AgentSubtaskCategory: String, Codable, CaseIterable, Sendable {
     public var recommendedTier: ModelTier {
         switch self {
         case .explorationSearch, .summarizationCompaction: return .low
-        case .routineCoding, .toolOrchestration: return .medium
-        case .generalEngineering, .architecturePlanning, .deepDebugging: return .high
+        case .routineCoding, .generalEngineering, .toolOrchestration: return .medium
+        case .architecturePlanning, .deepDebugging: return .high
         }
     }
 
@@ -1145,7 +1145,7 @@ public enum AgentSubtaskCategory: String, Codable, CaseIterable, Sendable {
         case .routineCoding:
             return "范围明确的代码修改、单测和文档，优先使用中档与中等思考强度"
         case .generalEngineering:
-            return "开放式工程、分析或意图不明的请求，从高档与中等思考强度起步"
+            return "常规问答、开放式工程或意图不明的请求，从中档与中等思考强度起步"
         case .toolOrchestration:
             return "多步工具调用与终端指令编排，需稳定遵循工具 Schema 并保持会话状态一致"
         case .architecturePlanning:
@@ -1176,12 +1176,13 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
     public var recommendedEffort: ReasoningEffort
     public var subtaskSummary: String?
     public var clientProvidedEffort: ReasoningEffort?
+    public var hasClientProvidedEffort: Bool
     public var isUserTurnBoundary: Bool?
 
     enum CodingKeys: String, CodingKey {
         case messageCount, estimatedInputTokens, tokenEstimateConfidence, requiresTools, requiresVision, requiresJSONMode
         case isStreaming, detectedTaskType, conversationFingerprint, isMultiTurn
-        case subtaskCategory, recommendedEffort, subtaskSummary, clientProvidedEffort, isUserTurnBoundary
+        case subtaskCategory, recommendedEffort, subtaskSummary, clientProvidedEffort, hasClientProvidedEffort, isUserTurnBoundary
     }
 
     public init(
@@ -1199,6 +1200,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         recommendedEffort: ReasoningEffort? = nil,
         subtaskSummary: String? = nil,
         clientProvidedEffort: ReasoningEffort? = nil,
+        hasClientProvidedEffort: Bool? = nil,
         isUserTurnBoundary: Bool? = nil
     ) {
         let resolvedSubtask = subtaskCategory ?? detectedTaskType.defaultSubtaskCategory
@@ -1216,6 +1218,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         self.recommendedEffort = recommendedEffort ?? resolvedSubtask.recommendedEffort
         self.subtaskSummary = subtaskSummary
         self.clientProvidedEffort = clientProvidedEffort
+        self.hasClientProvidedEffort = hasClientProvidedEffort ?? (clientProvidedEffort != nil)
         self.isUserTurnBoundary = isUserTurnBoundary
     }
 
@@ -1237,6 +1240,7 @@ public struct RequestFeatures: Codable, Equatable, Sendable {
         recommendedEffort = try c.decodeIfPresent(ReasoningEffort.self, forKey: .recommendedEffort) ?? decodedSubtask.recommendedEffort
         subtaskSummary = try c.decodeIfPresent(String.self, forKey: .subtaskSummary)
         clientProvidedEffort = try c.decodeIfPresent(ReasoningEffort.self, forKey: .clientProvidedEffort)
+        hasClientProvidedEffort = try c.decodeIfPresent(Bool.self, forKey: .hasClientProvidedEffort) ?? (clientProvidedEffort != nil)
         isUserTurnBoundary = try c.decodeIfPresent(Bool.self, forKey: .isUserTurnBoundary)
     }
 }
@@ -1407,12 +1411,12 @@ public struct TokenUsage: Codable, Equatable, Sendable {
         self.promptTokens = max(0, promptTokens)
         self.completionTokens = max(0, completionTokens)
         self.totalTokens = totalTokens ?? (max(0, promptTokens) + max(0, completionTokens))
-        self.cachedInputTokens = cachedInputTokens.flatMap { $0 > 0 ? $0 : nil }
-        self.cacheCreationTokens = cacheCreationTokens.flatMap { $0 > 0 ? $0 : nil }
+        self.cachedInputTokens = cachedInputTokens.map { max(0, $0) }
+        self.cacheCreationTokens = cacheCreationTokens.map { max(0, $0) }
     }
 
     public var cacheHitRate: Double? {
-        guard let cached = cachedInputTokens, cached > 0, promptTokens > 0 else { return nil }
+        guard let cached = cachedInputTokens, promptTokens > 0 else { return nil }
         return min(1.0, Double(cached) / Double(promptTokens))
     }
 
@@ -1440,8 +1444,8 @@ public struct TokenUsage: Codable, Equatable, Sendable {
                 promptTokens: totalPrompt,
                 completionTokens: out,
                 totalTokens: totalPrompt + out,
-                cachedInputTokens: readIn > 0 ? readIn : nil,
-                cacheCreationTokens: createIn > 0 ? createIn : nil
+                cachedInputTokens: cacheReadAnthropic == nil ? nil : readIn,
+                cacheCreationTokens: cacheCreateAnthropic == nil ? nil : createIn
             )
         }
 
@@ -1492,6 +1496,23 @@ public enum CostCalculationStatus: String, Codable, Sendable {
     }
 }
 
+public enum WireEffortSource: String, Codable, Sendable {
+    case client, automatic, absent
+}
+
+/// Only protocol metadata is retained; request bodies and cache-key values are never recorded here.
+public struct WireRequestMetadata: Codable, Equatable, Sendable {
+    public var effortValue: String?
+    public var effortSource: WireEffortSource
+    public var omittedCacheHints: [String]
+
+    public init(effortValue: String?, effortSource: WireEffortSource, omittedCacheHints: [String] = []) {
+        self.effortValue = effortValue
+        self.effortSource = effortSource
+        self.omittedCacheHints = omittedCacheHints
+    }
+}
+
 public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var attemptIndex: Int
@@ -1511,6 +1532,7 @@ public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable 
     public var errorMessage: String?
     public var retryAfterSeconds: Double?
     public var accountLabel: String?
+    public var wireMetadata: WireRequestMetadata?
 
     public init(
         id: UUID = UUID(),
@@ -1529,7 +1551,8 @@ public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable 
         costUSD: Double?,
         costStatus: CostCalculationStatus,
         errorMessage: String?,
-        accountLabel: String? = nil
+        accountLabel: String? = nil,
+        wireMetadata: WireRequestMetadata? = nil
     ) {
         self.id = id
         self.attemptIndex = attemptIndex
@@ -1548,6 +1571,7 @@ public struct UpstreamAttemptRecord: Identifiable, Codable, Equatable, Sendable 
         self.costStatus = costStatus
         self.errorMessage = errorMessage
         self.accountLabel = accountLabel
+        self.wireMetadata = wireMetadata
     }
 }
 

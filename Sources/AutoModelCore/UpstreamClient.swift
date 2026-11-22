@@ -9,6 +9,7 @@ public enum UpstreamError: Error, LocalizedError, Sendable {
     case invalidURL(String)
     case clientDisconnected
     case requestDeadlineExceeded
+    case incompatibleRequest(message: String)
     case authError(statusCode: Int, message: String)
     case modelUnavailable(statusCode: Int, message: String, availability: ModelAvailabilityStatus)
     case networkError(message: String)
@@ -25,6 +26,7 @@ public enum UpstreamError: Error, LocalizedError, Sendable {
         case .invalidURL: return 400
         case .clientDisconnected: return 499
         case .requestDeadlineExceeded: return 504
+        case .incompatibleRequest: return 400
         case .authError(let code, _): return code
         case .modelUnavailable(let code, _, _): return code
         case .networkError: return 502
@@ -41,6 +43,8 @@ public enum UpstreamError: Error, LocalizedError, Sendable {
             return "客户端已断开流式连接"
         case .requestDeadlineExceeded:
             return "请求达到累计上游 deadline"
+        case .incompatibleRequest(let message):
+            return message
         case .authError(_, let msg):
             return "鉴权失败 (API Key 无效或无权限): \(msg)"
         case .modelUnavailable(_, let msg, _):
@@ -66,6 +70,10 @@ public struct UpstreamCompletionResult: Sendable {
     public var firstTokenMs: Double?
     public var totalLatencyMs: Double
     public var hasToolCalls: Bool
+    public var nativeResponseID: String?
+    public var nativeResponseItemIDs: [String]
+    public var nativeResponseEncryptedContents: [String]
+    public var nativeAnthropicOpaqueTokens: [String]
 
     public init(
         statusCode: Int,
@@ -77,7 +85,11 @@ public struct UpstreamCompletionResult: Sendable {
         usageEstimationMethod: String?,
         firstTokenMs: Double?,
         totalLatencyMs: Double,
-        hasToolCalls: Bool = false
+        hasToolCalls: Bool = false,
+        nativeResponseID: String? = nil,
+        nativeResponseItemIDs: [String] = [],
+        nativeResponseEncryptedContents: [String] = [],
+        nativeAnthropicOpaqueTokens: [String] = []
     ) {
         self.statusCode = statusCode
         self.responseBody = responseBody
@@ -89,6 +101,10 @@ public struct UpstreamCompletionResult: Sendable {
         self.firstTokenMs = firstTokenMs
         self.totalLatencyMs = totalLatencyMs
         self.hasToolCalls = hasToolCalls
+        self.nativeResponseID = nativeResponseID
+        self.nativeResponseItemIDs = nativeResponseItemIDs
+        self.nativeResponseEncryptedContents = nativeResponseEncryptedContents
+        self.nativeAnthropicOpaqueTokens = nativeAnthropicOpaqueTokens
     }
 }
 
@@ -118,6 +134,42 @@ public enum ProviderReachabilityOutcome: Sendable {
     case reachable(discoveredModelIDs: [String])
     case reachableNoModelList
     case unreachable(ProviderHealthStatus, String)
+}
+
+private struct WireObservation: Sendable {
+    let clientProvidedEffort: Bool
+    let cacheHintNames: [String]
+
+    func metadata(for body: [String: Any], protocol apiProtocol: ProviderProtocol) -> WireRequestMetadata {
+        let rawEffort = body["reasoning_effort"]
+            ?? (body["reasoning"] as? [String: Any])?["effort"]
+            ?? (body["output_config"] as? [String: Any])?["effort"]
+        let value: String?
+        if let rawEffort {
+            value = Self.safeLabel(rawEffort as? String) ?? "非标准值"
+        } else if let thinking = body["thinking"] {
+            let type = (thinking as? [String: Any])?["type"] as? String
+            value = Self.safeLabel(type).map { "thinking: \($0)" } ?? "thinking"
+        } else {
+            value = nil
+        }
+        let omitted = cacheHintNames.filter { name in
+            if name == "Anthropic cache_control" {
+                return apiProtocol != .anthropicMessages || !NativeAnthropicRouting.hasCacheControl(body)
+            }
+            if name == "prompt_cache_breakpoint" { return !NativeResponsesRouting.hasCacheBreakpoint(body) }
+            return body[name] == nil
+        }
+        return WireRequestMetadata(effortValue: value,
+            effortSource: value == nil ? .absent : (clientProvidedEffort ? .client : .automatic),
+            omittedCacheHints: omitted)
+    }
+
+    private static func safeLabel(_ value: String?) -> String? {
+        let allowed: Set<String> = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto", "enabled", "disabled", "adaptive"]
+        guard let value = value?.lowercased(), allowed.contains(value) else { return nil }
+        return value
+    }
 }
 
 public final class UpstreamClient: @unchecked Sendable {
@@ -318,10 +370,59 @@ public final class UpstreamClient: @unchecked Sendable {
         clientHeaders: [String: String] = [:],
         resolvedEffort: ReasoningEffort? = nil,
         clientProvidedEffort: ReasoningEffort? = nil,
+        hasClientProvidedEffort: Bool = false,
         secretsToRedact: [String] = [],
+        onWireRequest: (@Sendable (WireRequestMetadata) -> Void)? = nil,
         onStreamHeadersReady: (@Sendable () async throws -> Void)? = nil,
         onStreamChunk: (@Sendable (Data) async throws -> Void)? = nil
     ) async -> Result<UpstreamCompletionResult, UpstreamError> {
+        let clientEffortPresent = hasClientProvidedEffort || clientProvidedEffort != nil
+            || originalPayload["reasoning_effort"] != nil
+            || (originalPayload["reasoning"] as? [String: Any])?["effort"] != nil
+            || originalPayload["thinking"] != nil
+            || nativeResponsesPayload?["reasoning_effort"] != nil
+            || (nativeResponsesPayload?["reasoning"] as? [String: Any])?["effort"] != nil
+            || nativeResponsesPayload?["thinking"] != nil
+            || nativeAnthropicPayload?["thinking"] != nil
+            || (nativeAnthropicPayload?["output_config"] as? [String: Any])?["effort"] != nil
+        var hintNames = ["prompt_cache_key", "prompt_cache_retention", "prompt_cache_options"].filter {
+            originalPayload[$0] != nil || nativeResponsesPayload?[$0] != nil
+        }
+        if let nativeAnthropicPayload, NativeAnthropicRouting.hasCacheControl(nativeAnthropicPayload) {
+            hintNames.append("Anthropic cache_control")
+        }
+        if NativeResponsesRouting.hasCacheBreakpoint(nativeResponsesPayload ?? originalPayload) {
+            hintNames.append("prompt_cache_breakpoint")
+        }
+        let observation = WireObservation(clientProvidedEffort: clientEffortPresent, cacheHintNames: hintNames)
+        if nativeResponsesPayload == nil, nativeAnthropicPayload == nil, originalPayload["thinking"] != nil,
+           provider.apiProtocol != .openAIChatCompletions && provider.apiProtocol != .workBuddy {
+            return .failure(.incompatibleRequest(message: "客户端指定的 thinking 无法转换到该上游协议，请选择兼容的供应商。"))
+        }
+        if nativeResponsesPayload == nil,
+           let prewarm = (originalPayload["prompt_cache_options"] as? [String: Any])?["prewarm"],
+           (prewarm as? Bool) != false {
+            return .failure(.incompatibleRequest(message: "缓存预热不会生成对话回复，请通过 /v1/responses 发起原生预热请求。"))
+        }
+        if nativeResponsesPayload == nil, provider.apiProtocol != .openAIChatCompletions {
+            let canForwardRetention = provider.apiProtocol == .openAIResponses
+                && Self.supportsLegacyCacheRetention(modelID: model.modelID, value: originalPayload["prompt_cache_retention"])
+            if originalPayload["prompt_cache_retention"] != nil && !canForwardRetention {
+                return .failure(.incompatibleRequest(message: "所选上游无法保留客户端指定的缓存保留期限，请选择支持该期限的模型。"))
+            }
+            let canForwardOptions = provider.apiProtocol == .openAIResponses && Self.supportsModernCacheOptions(modelID: model.modelID)
+            if (originalPayload["prompt_cache_options"] as? [String: Any])?["ttl"] != nil && !canForwardOptions {
+                return .failure(.incompatibleRequest(message: "所选上游无法保留客户端指定的缓存 TTL，请选择支持该选项的模型。"))
+            }
+        }
+        if nativeResponsesPayload == nil, (provider.apiProtocol == .openAIResponses || provider.apiProtocol == .codexChatGPT),
+           NativeResponsesRouting.hasCacheBreakpoint(originalPayload) {
+            return .failure(.incompatibleRequest(message: "转换对话请求无法保留缓存断点，请通过 /v1/responses 发送原生请求。"))
+        }
+        if let nativeAnthropicPayload, provider.apiProtocol != .anthropicMessages,
+           nativeAnthropicPayload["thinking"] != nil || (nativeAnthropicPayload["output_config"] as? [String: Any])?["effort"] != nil {
+            return .failure(.incompatibleRequest(message: "客户端指定的 Anthropic thinking/effort 无法转换到该上游协议，请选择 Anthropic 供应商。"))
+        }
         if let nativeResponsesPayload {
             guard provider.apiProtocol == .codexChatGPT || provider.apiProtocol == .openAIResponses else {
                 let message = "Native Responses requests require a Responses-compatible provider"
@@ -331,7 +432,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 provider: provider, model: model, apiKey: apiKey,
                 payload: nativeResponsesPayload, estimatedInputTokens: estimatedInputTokens,
                 stream: stream, clientHeaders: clientHeaders,
-                resolvedEffort: resolvedEffort, clientProvidedEffort: clientProvidedEffort,
+                resolvedEffort: resolvedEffort, observation: observation, onWireRequest: onWireRequest,
                 secretsToRedact: secretsToRedact, onStreamHeadersReady: onStreamHeadersReady, onStreamChunk: onStreamChunk
             )
         }
@@ -347,16 +448,18 @@ public final class UpstreamClient: @unchecked Sendable {
                 clientHeaders: clientHeaders,
                 estimatedInputTokens: estimatedInputTokens,
                 stream: stream,
+                observation: observation,
+                onWireRequest: onWireRequest,
                 secretsToRedact: secretsToRedact,
                 onStreamHeadersReady: onStreamHeadersReady,
                 onStreamChunk: onStreamChunk
             )
         }
-        let preparedPayload = Self.injectReasoningEffortIfEligible(
+        let preparedPayload = provider.apiProtocol == .workBuddy ? originalPayload : Self.injectReasoningEffortIfEligible(
             payload: originalPayload,
             model: model,
             resolvedEffort: resolvedEffort,
-            clientProvidedEffort: clientProvidedEffort
+            hasClientProvidedEffort: clientEffortPresent
         )
 
         switch provider.apiProtocol {
@@ -369,6 +472,8 @@ public final class UpstreamClient: @unchecked Sendable {
                 estimatedInputTokens: estimatedInputTokens,
                 callerRequestedStream: stream,
                 clientHeaders: clientHeaders,
+                observation: observation,
+                onWireRequest: onWireRequest,
                 secretsToRedact: secretsToRedact,
                 onStreamHeadersReady: onStreamHeadersReady,
                 onStreamChunk: onStreamChunk
@@ -382,6 +487,9 @@ public final class UpstreamClient: @unchecked Sendable {
                 estimatedInputTokens: estimatedInputTokens,
                 stream: stream,
                 clientHeaders: clientHeaders,
+                resolvedEffort: resolvedEffort,
+                observation: observation,
+                onWireRequest: onWireRequest,
                 secretsToRedact: secretsToRedact,
                 onStreamHeadersReady: onStreamHeadersReady,
                 onStreamChunk: onStreamChunk
@@ -398,8 +506,14 @@ public final class UpstreamClient: @unchecked Sendable {
 
         let upstreamStreams = stream || workBuddy
         var upstreamPayload = workBuddy ? WorkBuddyProtocol.chatPayload(from: preparedPayload) : preparedPayload
+        upstreamPayload.removeValue(forKey: "_autoroute_responses_reasoning")
         upstreamPayload["model"] = model.modelID
         upstreamPayload["stream"] = upstreamStreams
+        if workBuddy {
+            upstreamPayload.removeValue(forKey: "prompt_cache_key")
+            upstreamPayload.removeValue(forKey: "prompt_cache_retention")
+            upstreamPayload.removeValue(forKey: "prompt_cache_options")
+        }
 
         guard let bodyData = try? JSONSerialization.data(withJSONObject: upstreamPayload, options: []) else {
             return .failure(.invalidResponse(message: "无法序列化上游请求 JSON"))
@@ -427,6 +541,7 @@ public final class UpstreamClient: @unchecked Sendable {
         let activeSession = resolvedSession(for: provider)
 
         do {
+            onWireRequest?(observation.metadata(for: upstreamPayload, protocol: provider.apiProtocol))
             if !upstreamStreams {
                 let (data, response) = try await activeSession.data(for: request)
                 let totalMs = elapsedMs(since: startTime)
@@ -753,6 +868,8 @@ public final class UpstreamClient: @unchecked Sendable {
                 note: "测活达到累计 deadline",
                 isTransientFailure: true
             )
+        case .incompatibleRequest(let message):
+            return ModelProbeResult(isAvailable: false, availability: .unavailable, latencyMs: latencyMs, note: message)
         case .invalidURL(let url):
             return ModelProbeResult(
                 isAvailable: false,
@@ -1049,18 +1166,38 @@ public final class UpstreamClient: @unchecked Sendable {
         payload: [String: Any],
         model: ModelConfig,
         resolvedEffort: ReasoningEffort?,
-        clientProvidedEffort: ReasoningEffort?
+        hasClientProvidedEffort: Bool
     ) -> [String: Any] {
-        guard clientProvidedEffort == nil,
+        guard !hasClientProvidedEffort,
               let resolvedEffort,
               payload["reasoning_effort"] == nil,
-              payload["reasoning"] == nil,
-              model.capabilities.contains(.reasoning) || model.defaultRole == .complexReasoning else {
+              (payload["reasoning"] as? [String: Any])?["effort"] == nil,
+              (payload["reasoning"] == nil || payload["reasoning"] is [String: Any]),
+              model.capabilities.contains(.reasoning) else {
             return payload
         }
         var updated = payload
         updated["reasoning_effort"] = resolvedEffort.upstreamEffortValue
         return updated
+    }
+
+    /// Converted requests only forward newer cache controls where the documented model family is known.
+    /// Native requests retain the caller's original settings for the provider to validate.
+    private static func supportsModernCacheOptions(modelID: String) -> Bool {
+        let components = modelID.lowercased().split(separator: "-")
+        guard components.count >= 2, components[0] == "gpt" else { return false }
+        let version = components[1].split(separator: ".")
+        guard version.count == 2, let major = Int(version[0]), let minor = Int(version[1]) else { return false }
+        return (major == 5 && minor >= 6 && minor <= 9) || (major == 6 && minor <= 2)
+    }
+
+    private static func supportsLegacyCacheRetention(modelID: String, value: Any?) -> Bool {
+        let supported: Set<String> = ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.2", "gpt-5.1-codex-max",
+            "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-chat-latest", "gpt-5", "gpt-5-codex", "gpt-4.1"]
+        let id = modelID.lowercased()
+        guard supported.contains(id), let retention = value as? String else { return false }
+        if retention == "24h" { return true }
+        return retention == "in_memory" && id != "gpt-5.5" && id != "gpt-5.5-pro"
     }
 
     private func extractUsage(from json: [String: Any]) -> TokenUsage? {
@@ -1108,7 +1245,7 @@ public final class UpstreamClient: @unchecked Sendable {
     private func executeNativeResponsesCompletion(
         provider: ProviderConfig, model: ModelConfig, apiKey: String?, payload: [String: Any],
         estimatedInputTokens: Int, stream: Bool, clientHeaders: [String: String] = [:], resolvedEffort: ReasoningEffort?,
-        clientProvidedEffort: ReasoningEffort?, secretsToRedact: [String],
+        observation: WireObservation, onWireRequest: (@Sendable (WireRequestMetadata) -> Void)?, secretsToRedact: [String],
         onStreamHeadersReady: (@Sendable () async throws -> Void)?,
         onStreamChunk: (@Sendable (Data) async throws -> Void)?
     ) async -> Result<UpstreamCompletionResult, UpstreamError> {
@@ -1119,6 +1256,14 @@ public final class UpstreamClient: @unchecked Sendable {
         var body = payload
         body["model"] = model.modelID
         body["stream"] = isCodex || stream
+        if let effort = body.removeValue(forKey: "reasoning_effort") {
+            guard body["reasoning"] == nil || body["reasoning"] is [String: Any] else {
+                return .failure(.incompatibleRequest(message: "无法将 reasoning_effort 与非对象的 reasoning 合并到 Responses 请求。"))
+            }
+            var reasoning = body["reasoning"] as? [String: Any] ?? [:]
+            reasoning["effort"] = effort
+            body["reasoning"] = reasoning
+        }
         if isCodex {
             body["store"] = false
             if body["instructions"] == nil { body["instructions"] = "You are a helpful assistant." }
@@ -1126,8 +1271,8 @@ public final class UpstreamClient: @unchecked Sendable {
                 body.removeValue(forKey: unsupportedKey)
             }
         }
-        if clientProvidedEffort == nil, let resolvedEffort,
-           model.capabilities.contains(.reasoning) || model.defaultRole == .complexReasoning {
+        if !observation.clientProvidedEffort, let resolvedEffort,
+           model.capabilities.contains(.reasoning) {
             if body["reasoning_effort"] == nil {
                 if var reasoning = body["reasoning"] as? [String: Any] {
                     if reasoning["effort"] == nil { reasoning["effort"] = resolvedEffort.upstreamEffortValue }
@@ -1143,6 +1288,7 @@ public final class UpstreamClient: @unchecked Sendable {
         let request = buildResponsesRequest(provider: provider, url: url, bodyData: data, apiKey: apiKey, timeout: provider.timeoutSeconds, clientHeaders: clientHeaders)
         let start = DispatchTime.now()
         do {
+            onWireRequest?(observation.metadata(for: body, protocol: provider.apiProtocol))
             let (bytes, response) = try await resolvedSession(for: provider).bytes(for: request)
             guard let http = response as? HTTPURLResponse else {
                 return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
@@ -1197,7 +1343,9 @@ public final class UpstreamClient: @unchecked Sendable {
                 assistantText: observer.text, reasoningText: observer.reasoning.isEmpty ? nil : observer.reasoning,
                 usage: usage, usageSource: reported == nil ? .estimatedWhenMissing : .upstreamReported,
                 usageEstimationMethod: reported == nil ? "上游未返回 usage，按本地字符数估算" : nil,
-                firstTokenMs: firstToken ?? total, totalLatencyMs: total, hasToolCalls: observer.hasToolCalls))
+                firstTokenMs: firstToken ?? total, totalLatencyMs: total, hasToolCalls: observer.hasToolCalls,
+                nativeResponseID: observer.responseID, nativeResponseItemIDs: observer.responseItemIDs,
+                nativeResponseEncryptedContents: observer.encryptedContents))
         } catch {
             return .failure(.networkError(message: SecretRedactor.redact(mapNetworkError(error), secrets: secretsToRedact)))
         }
@@ -1211,6 +1359,8 @@ public final class UpstreamClient: @unchecked Sendable {
         estimatedInputTokens: Int,
         callerRequestedStream: Bool,
         clientHeaders: [String: String] = [:],
+        observation: WireObservation,
+        onWireRequest: (@Sendable (WireRequestMetadata) -> Void)?,
         secretsToRedact: [String],
         onStreamHeadersReady: (@Sendable () async throws -> Void)?,
         onStreamChunk: (@Sendable (Data) async throws -> Void)?
@@ -1226,7 +1376,9 @@ public final class UpstreamClient: @unchecked Sendable {
             modelID: model.modelID,
             forceStream: isCodex || callerRequestedStream,
             store: isCodex ? false : nil,
-            defaultInstructions: isCodex ? "You are a helpful assistant." : nil
+            defaultInstructions: isCodex ? "You are a helpful assistant." : nil,
+            forwardCacheRetention: provider.apiProtocol == .openAIResponses && Self.supportsLegacyCacheRetention(modelID: model.modelID, value: originalPayload["prompt_cache_retention"]),
+            forwardCacheOptions: provider.apiProtocol == .openAIResponses && Self.supportsModernCacheOptions(modelID: model.modelID)
         )
         guard let bodyData = try? JSONSerialization.data(withJSONObject: upstreamPayload, options: []) else {
             return .failure(.invalidResponse(message: "无法序列化 Responses 上游请求 JSON"))
@@ -1243,6 +1395,7 @@ public final class UpstreamClient: @unchecked Sendable {
         let startTime = DispatchTime.now()
 
         do {
+            onWireRequest?(observation.metadata(for: upstreamPayload, protocol: provider.apiProtocol))
             let (asyncBytes, response) = try await resolvedSession(for: provider).bytes(for: request)
             guard let http = response as? HTTPURLResponse else {
                 return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
@@ -1265,7 +1418,7 @@ public final class UpstreamClient: @unchecked Sendable {
                 let respObj = (try? JSONSerialization.jsonObject(with: fullData) as? [String: Any]) ?? [:]
                 let chatObj = ProtocolAdapters.responsesJSONToChatCompletion(respObj, fallbackModel: model.modelID)
                 let (assistantText, reasoningText) = Self.extractAssistantAndReasoning(from: chatObj)
-                let reportedUsage = extractUsage(from: chatObj)
+                let reportedUsage = extractUsage(from: respObj)
                 let finalUsage = reportedUsage ?? TokenUsage(
                     promptTokens: estimatedInputTokens,
                     completionTokens: RequestFeatureExtractor.estimateTokens(text: assistantText, messageCount: 0)
@@ -1472,6 +1625,8 @@ public final class UpstreamClient: @unchecked Sendable {
         clientHeaders: [String: String] = [:],
         estimatedInputTokens: Int,
         stream: Bool,
+        observation: WireObservation,
+        onWireRequest: (@Sendable (WireRequestMetadata) -> Void)?,
         secretsToRedact: [String],
         onStreamHeadersReady: (@Sendable () async throws -> Void)?,
         onStreamChunk: (@Sendable (Data) async throws -> Void)?
@@ -1502,6 +1657,7 @@ public final class UpstreamClient: @unchecked Sendable {
 
         let startTime = DispatchTime.now()
         do {
+            onWireRequest?(observation.metadata(for: body, protocol: provider.apiProtocol))
             let (bytes, response) = try await resolvedSession(for: provider).bytes(for: request)
             guard let http = response as? HTTPURLResponse else {
                 return .failure(.invalidResponse(message: "上游未返回 HTTP 响应"))
@@ -1576,7 +1732,8 @@ public final class UpstreamClient: @unchecked Sendable {
                 usageEstimationMethod: reported == nil ? "上游未返回 usage，按本地字符数估算" : nil,
                 firstTokenMs: firstTokenMs ?? totalMs,
                 totalLatencyMs: totalMs,
-                hasToolCalls: observer.hasToolCalls
+                hasToolCalls: observer.hasToolCalls,
+                nativeAnthropicOpaqueTokens: observer.opaqueTokens
             ))
         } catch is ClientStreamDisconnectedError {
             return .failure(.clientDisconnected)
@@ -1598,6 +1755,9 @@ public final class UpstreamClient: @unchecked Sendable {
         estimatedInputTokens: Int,
         stream: Bool,
         clientHeaders: [String: String] = [:],
+        resolvedEffort: ReasoningEffort?,
+        observation: WireObservation,
+        onWireRequest: (@Sendable (WireRequestMetadata) -> Void)?,
         secretsToRedact: [String],
         onStreamHeadersReady: (@Sendable () async throws -> Void)?,
         onStreamChunk: (@Sendable (Data) async throws -> Void)?
@@ -1605,12 +1765,16 @@ public final class UpstreamClient: @unchecked Sendable {
         guard let url = provider.endpointURL(path: "/v1/messages") else {
             return .failure(.invalidURL(provider.baseURL))
         }
-        let chatEffort = (originalPayload["reasoning_effort"] as? String).flatMap(ReasoningEffort.init(rawValue:))
-        let upstreamPayload = NativeAnthropicRouting.applyingInitialEffort(
-            to: ProtocolAdapters.chatToAnthropicRequest(originalPayload, modelID: model.modelID, stream: false),
-            modelID: model.modelID,
-            effort: chatEffort
-        )
+        var upstreamPayload = ProtocolAdapters.chatToAnthropicRequest(originalPayload, modelID: model.modelID, stream: false)
+        if observation.clientProvidedEffort {
+            guard NativeAnthropicRouting.supportsEffort(modelID: model.modelID),
+                  let effort = originalPayload["reasoning_effort"] ?? (originalPayload["reasoning"] as? [String: Any])?["effort"] else {
+                return .failure(.incompatibleRequest(message: "客户端指定的 effort 无法应用到该 Anthropic 模型，请选择支持 effort 的模型。"))
+            }
+            upstreamPayload["output_config"] = ["effort": effort]
+        } else {
+            upstreamPayload = NativeAnthropicRouting.applyingInitialEffort(to: upstreamPayload, modelID: model.modelID, effort: resolvedEffort)
+        }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: upstreamPayload, options: []) else {
             return .failure(.invalidResponse(message: "无法序列化 Anthropic 上游请求"))
         }
@@ -1627,6 +1791,7 @@ public final class UpstreamClient: @unchecked Sendable {
 
         let startTime = DispatchTime.now()
         do {
+            onWireRequest?(observation.metadata(for: upstreamPayload, protocol: provider.apiProtocol))
             let (data, response) = try await resolvedSession(for: provider).data(for: request)
             let totalMs = elapsedMs(since: startTime)
             guard let http = response as? HTTPURLResponse else {
