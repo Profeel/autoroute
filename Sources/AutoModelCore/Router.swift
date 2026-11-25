@@ -34,6 +34,9 @@ public struct RoutingContext: Sendable {
     public var models: [ModelConfig]
     public var policy: RoutingPolicyConfig
     public var stickyModelID: UUID?
+    public var stickyCacheAgeSeconds: TimeInterval?
+    public var stickyLastPromptTokens: Int?
+    public var stickyLastCachedInputTokens: Int?
     public var consecutiveRoutineTurns: Int
     public var escalateNextTurn: Bool
     public var qualityFailureCount: Int
@@ -47,6 +50,9 @@ public struct RoutingContext: Sendable {
         models: [ModelConfig],
         policy: RoutingPolicyConfig,
         stickyModelID: UUID? = nil,
+        stickyCacheAgeSeconds: TimeInterval? = nil,
+        stickyLastPromptTokens: Int? = nil,
+        stickyLastCachedInputTokens: Int? = nil,
         consecutiveRoutineTurns: Int = 0,
         escalateNextTurn: Bool = false,
         qualityFailureCount: Int = 0,
@@ -59,6 +65,9 @@ public struct RoutingContext: Sendable {
         self.models = models
         self.policy = policy
         self.stickyModelID = stickyModelID
+        self.stickyCacheAgeSeconds = stickyCacheAgeSeconds
+        self.stickyLastPromptTokens = stickyLastPromptTokens
+        self.stickyLastCachedInputTokens = stickyLastCachedInputTokens
         self.consecutiveRoutineTurns = consecutiveRoutineTurns
         self.escalateNextTurn = escalateNextTurn
         self.qualityFailureCount = qualityFailureCount
@@ -911,9 +920,26 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         let stickyNeedsToolRescue = rescueTier != nil && !stickyTiers.contains(targetTier)
         let clearLightTask = context.features.subtaskCategory == .explorationSearch
             || context.features.subtaskCategory == .summarizationCompaction
-        let stickyShouldDowngrade = canFollowTaskTier && context.qualityFailureCount == 0
+        let rawStickyShouldDowngrade = canFollowTaskTier && context.qualityFailureCount == 0
             && (stickyTierIndex ?? -1) > targetIndex
             && (clearLightTask || context.consecutiveRoutineTurns >= 2)
+        let cacheGuardHoldReason: String? = {
+            guard rawStickyShouldDowngrade,
+                  let stickyModel = stickyTuple?.0,
+                  let targetModel = resolvedTierCandidate?.tuple.0,
+                  stickyModel.id != targetModel.id else {
+                return nil
+            }
+            return Self.evaluateCacheAwareDowngradeGuard(
+                stickyModel: stickyModel,
+                targetModel: targetModel,
+                estimatedInputTokens: context.features.estimatedInputTokens,
+                stickyCacheAgeSeconds: context.stickyCacheAgeSeconds,
+                stickyLastPromptTokens: context.stickyLastPromptTokens,
+                stickyLastCachedInputTokens: context.stickyLastCachedInputTokens
+            )
+        }()
+        let stickyShouldDowngrade = rawStickyShouldDowngrade && cacheGuardHoldReason == nil
 
         if let explicitTier {
             let tierPoolIDs = context.policy.modelIDs(for: explicitTier)
@@ -978,16 +1004,21 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
                   !stickyShouldDowngrade {
             selectedTuple = stickyTuple
             effectiveTier = stickyTier ?? effectiveTier
-            matchedRules.append("命中多轮会话粘性: 保持与同会话上一轮一致的「\(stickyTuple.0.displayName)」以保留缓存收益")
-            if canIncreaseEffort {
-                matchedRules.append("必需工具调用缺失：保留同一模型，思考强度提高至 \(targetEffort.rawValue)")
-                reasonNote = "必需工具调用缺失，同模型提高思考强度至 \(targetEffort.rawValue)"
+            if let cacheGuardHoldReason {
+                matchedRules.append("KV 缓存成本保护: \(cacheGuardHoldReason)")
+                reasonNote = "KV 缓存保护，保留「\(stickyTuple.0.displayName)」避免冷启动增费 · \(subtask.displayName) · effort=\(targetEffort.rawValue)"
             } else {
-                reasonNote = wantsRescue && rescueTier == nil
-                    ? "必需工具调用缺失，但相邻高档不可用或已到最高档，保留当前模型"
-                    : canSwitchPhase
-                    ? "保持会话缓存稳定 (粘性) · \(subtask.displayName) · effort=\(targetEffort.rawValue)"
-                    : "工具或上游状态续接，保留同一模型 · effort=\(targetEffort.rawValue)"
+                matchedRules.append("命中多轮会话粘性: 保持与同会话上一轮一致的「\(stickyTuple.0.displayName)」以保留缓存收益")
+                if canIncreaseEffort {
+                    matchedRules.append("必需工具调用缺失：保留同一模型，思考强度提高至 \(targetEffort.rawValue)")
+                    reasonNote = "必需工具调用缺失，同模型提高思考强度至 \(targetEffort.rawValue)"
+                } else {
+                    reasonNote = wantsRescue && rescueTier == nil
+                        ? "必需工具调用缺失，但相邻高档不可用或已到最高档，保留当前模型"
+                        : canSwitchPhase
+                        ? "保持会话缓存稳定 (粘性) · \(subtask.displayName) · effort=\(targetEffort.rawValue)"
+                        : "工具或上游状态续接，保留同一模型 · effort=\(targetEffort.rawValue)"
+                }
             }
         } else {
             let stickyWasEscalated = context.policy.enableSessionStickiness
@@ -1507,6 +1538,95 @@ public struct DeterministicLocalDeciderPlugin: RoutingDeciderPlugin, Sendable {
         return min(100.0, score)
     }
 
+    private static let warmCacheTTLSeconds: TimeInterval = 300
+    private static let minimumWarmCacheTokens = 4_000
+    private static let unpricedMinimumCacheTokens = 16_000
+    private static let assumedRoutineOutputTokens = 800.0
+
+    /// Automatically prevents mid-session downgrades when discarding a warm upstream
+    /// prompt/KV cache on the sticky model would cost at least as much as staying.
+    static func evaluateCacheAwareDowngradeGuard(
+        stickyModel: ModelConfig,
+        targetModel: ModelConfig,
+        estimatedInputTokens: Int,
+        stickyCacheAgeSeconds: TimeInterval?,
+        stickyLastPromptTokens: Int?,
+        stickyLastCachedInputTokens: Int?
+    ) -> String? {
+        if let age = stickyCacheAgeSeconds, age > warmCacheTTLSeconds {
+            return nil
+        }
+
+        let observedPrompt = max(stickyLastPromptTokens ?? 0, stickyLastCachedInputTokens ?? 0)
+        let effectivePromptTokens = max(estimatedInputTokens, observedPrompt)
+        guard effectivePromptTokens >= minimumWarmCacheTokens else {
+            return nil
+        }
+
+        let estimatedPrefix: Int
+        if let lastPrompt = stickyLastPromptTokens, lastPrompt > 0 {
+            estimatedPrefix = min(Int(Double(effectivePromptTokens) * 0.95), max(lastPrompt, stickyLastCachedInputTokens ?? 0))
+        } else if let lastCached = stickyLastCachedInputTokens, lastCached > 0 {
+            estimatedPrefix = min(Int(Double(effectivePromptTokens) * 0.95), lastCached)
+        } else {
+            estimatedPrefix = Int(Double(effectivePromptTokens) * 0.85)
+        }
+        let deltaTokens = max(0, effectivePromptTokens - estimatedPrefix)
+
+        if let stickyInput = stickyModel.inputPricePerMillion,
+           let targetInput = targetModel.inputPricePerMillion {
+            let stickyCacheRead = stickyModel.effectiveCachedInputPricePerMillion ?? stickyInput
+            // If the sticky model has no meaningful cache-read discount, switching does not lose cache value.
+            guard stickyCacheRead < stickyInput * 0.95 else {
+                return nil
+            }
+            let targetColdInput = targetModel.effectiveCacheCreationPricePerMillion ?? targetInput
+            let stayInputCost = (Double(estimatedPrefix) * stickyCacheRead + Double(deltaTokens) * stickyInput) / 1_000_000.0
+            let switchInputCost = (Double(effectivePromptTokens) * targetColdInput) / 1_000_000.0
+
+            let stayOutputCost: Double
+            let switchOutputCost: Double
+            if let stickyOut = stickyModel.outputPricePerMillion,
+               let targetOut = targetModel.outputPricePerMillion {
+                stayOutputCost = (assumedRoutineOutputTokens * stickyOut) / 1_000_000.0
+                switchOutputCost = (assumedRoutineOutputTokens * targetOut) / 1_000_000.0
+            } else {
+                stayOutputCost = 0
+                switchOutputCost = 0
+            }
+
+            let stayTotal = stayInputCost + stayOutputCost
+            let switchTotal = switchInputCost + switchOutputCost
+            if switchTotal >= stayTotal {
+                return "保持「\(stickyModel.displayName)」(热前缀 ~\(estimatedPrefix) tokens，留存估算 $\(String(format: "%.4f", stayTotal)) <= 切至「\(targetModel.displayName)」冷启动估算 $\(String(format: "%.4f", switchTotal)))"
+            }
+            return nil
+        }
+
+        // Unpriced fallback: protect observed warm caches or large contexts on known prompt-caching families.
+        if let lastCached = stickyLastCachedInputTokens, lastCached >= minimumWarmCacheTokens {
+            return "保持「\(stickyModel.displayName)」(上一轮实测命中缓存 \(lastCached) tokens，避免切换至「\(targetModel.displayName)」丢失 KV Cache)"
+        }
+        if effectivePromptTokens >= unpricedMinimumCacheTokens,
+           Self.supportsPromptCachingByFamily(modelID: stickyModel.modelID) {
+            return "保持「\(stickyModel.displayName)」(长上下文 ~\(effectivePromptTokens) tokens 且处于热缓存窗口，避免切换至「\(targetModel.displayName)」触发全量冷启动)"
+        }
+        return nil
+    }
+
+    private static func supportsPromptCachingByFamily(modelID: String) -> Bool {
+        let lower = modelID.lowercased()
+        return lower.contains("claude")
+            || lower.contains("deepseek")
+            || lower.contains("gemini")
+            || lower.contains("gpt-5")
+            || lower.contains("gpt-4.1")
+            || lower.contains("gpt-4o")
+            || lower.contains("o1")
+            || lower.contains("o3")
+            || lower.contains("o4")
+    }
+
     private func elapsedMs(since start: DispatchTime) -> Double {
         let nanos = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
         return Double(nanos) / 1_000_000.0
@@ -1530,6 +1650,8 @@ public final class ModelRouter: @unchecked Sendable {
         var qualityRecoveryKey: String?
         var wasMultiTurn: Bool
         var lastAccessedAt: Date
+        var lastPromptTokens: Int?
+        var lastCachedInputTokens: Int?
     }
 
     private static let stickinessTTLSeconds: TimeInterval = 7200
@@ -1588,21 +1710,29 @@ public final class ModelRouter: @unchecked Sendable {
         policy: RoutingPolicyConfig,
         runtimeMetricsByModelID: [UUID: ModelRuntimeMetrics] = [:],
         stickinessNamespace: String? = nil,
-        qualityRecoveryKey: String? = nil
+        qualityRecoveryKey: String? = nil,
+        now: Date = Date()
     ) -> RoutingDecision {
         let baseModeKey = Self.stickinessModeKey(requestedModel: requestedModel)
         let modeKey = stickinessNamespace.map { "agent:\($0)|\(baseModeKey)" } ?? baseModeKey
-        let now = Date()
-        let sessionSnapshot: (stickyID: UUID?, routineCount: Int, failures: Int, failedEffort: ReasoningEffort?) = lock.withLock {
+        let sessionSnapshot: (
+            stickyID: UUID?,
+            cacheAgeSeconds: TimeInterval?,
+            lastPromptTokens: Int?,
+            lastCachedInputTokens: Int?,
+            routineCount: Int,
+            failures: Int,
+            failedEffort: ReasoningEffort?
+        ) = lock.withLock {
             pruneStickinessLocked(now: now)
             guard policy.enableSessionStickiness,
                   let fp = features.conversationFingerprint else {
-                return (nil, 0, 0, nil)
+                return (nil, nil, nil, nil, 0, 0, nil)
             }
             let key = SessionStickinessKey(fingerprint: fp, modeKey: modeKey)
             guard var cached = sessionStickinessMap[key],
                   cached.policyVersion == policy.policyVersion else {
-                return (nil, 0, 0, nil)
+                return (nil, nil, nil, nil, 0, 0, nil)
             }
             let matchesFailure = qualityRecoveryKey != nil && qualityRecoveryKey == cached.qualityRecoveryKey
             if !matchesFailure && features.isUserTurnBoundary != false {
@@ -1611,14 +1741,22 @@ public final class ModelRouter: @unchecked Sendable {
                 cached.qualityRecoveryKey = nil
                 sessionStickinessMap[key] = cached
             }
-            guard features.isMultiTurn || matchesFailure else { return (nil, 0, 0, nil) }
+            guard features.isMultiTurn || matchesFailure else { return (nil, nil, nil, nil, 0, 0, nil) }
+            let cacheAge = max(0, now.timeIntervalSince(cached.lastAccessedAt))
             let isRoutineBoundary = features.isUserTurnBoundary != false
                 && features.subtaskCategory.recommendedTier != .high
             let routineCount = isRoutineBoundary ? (cached.consecutiveRoutineTurns + 1) : 0
             cached.lastAccessedAt = now
             sessionStickinessMap[key] = cached
-            return (cached.modelUUID, routineCount, matchesFailure ? cached.qualityFailureCount : 0,
-                    matchesFailure ? cached.lastFailureEffort : nil)
+            return (
+                cached.modelUUID,
+                cacheAge,
+                cached.lastPromptTokens,
+                cached.lastCachedInputTokens,
+                routineCount,
+                matchesFailure ? cached.qualityFailureCount : 0,
+                matchesFailure ? cached.lastFailureEffort : nil
+            )
         }
 
         let decider: any RoutingDeciderPlugin = lock.withLock {
@@ -1632,6 +1770,9 @@ public final class ModelRouter: @unchecked Sendable {
             models: models,
             policy: policy,
             stickyModelID: sessionSnapshot.stickyID,
+            stickyCacheAgeSeconds: sessionSnapshot.cacheAgeSeconds,
+            stickyLastPromptTokens: sessionSnapshot.lastPromptTokens,
+            stickyLastCachedInputTokens: sessionSnapshot.lastCachedInputTokens,
             consecutiveRoutineTurns: sessionSnapshot.routineCount,
             escalateNextTurn: sessionSnapshot.failures > 0,
             qualityFailureCount: sessionSnapshot.failures,
@@ -1654,13 +1795,15 @@ public final class ModelRouter: @unchecked Sendable {
         explicitTier: ModelTier? = nil,
         isMultiTurn: Bool = true,
         stickinessNamespace: String? = nil,
-        isUserTurnBoundary: Bool = true
+        isUserTurnBoundary: Bool = true,
+        promptTokens: Int? = nil,
+        cachedInputTokens: Int? = nil,
+        now: Date = Date()
     ) {
         guard let fingerprint, !fingerprint.isEmpty else { return }
         let baseModeKey = Self.stickinessModeKey(requestedModel: requestedModel, explicitTier: explicitTier)
         let modeKey = stickinessNamespace.map { "agent:\($0)|\(baseModeKey)" } ?? baseModeKey
         let key = SessionStickinessKey(fingerprint: fingerprint, modeKey: modeKey)
-        let now = Date()
         lock.withLock {
             let prev = sessionStickinessMap[key]
             // Never let a stray single-turn sidecar/background call hijack an active multi-turn sticky session
@@ -1677,6 +1820,8 @@ public final class ModelRouter: @unchecked Sendable {
                 routineCount = isRoutineSubtask && sameModel ? min(2, routineCount + 1) : 0
             }
             let nextWasMultiTurn = isMultiTurn || (sameModel && (prev?.wasMultiTurn ?? false))
+            let nextPromptTokens = promptTokens.map { max(0, $0) } ?? (sameModel ? prev?.lastPromptTokens : nil)
+            let nextCachedInputTokens = cachedInputTokens.map { max(0, $0) } ?? (sameModel ? prev?.lastCachedInputTokens : nil)
             sessionStickinessMap[key] = SessionStickinessState(
                 modelUUID: modelUUID,
                 policyVersion: policyVersion,
@@ -1686,7 +1831,9 @@ public final class ModelRouter: @unchecked Sendable {
                 lastFailureEffort: wasToolStarved && qualityRecoveryKey != nil ? selectedEffort : nil,
                 qualityRecoveryKey: wasToolStarved ? qualityRecoveryKey : nil,
                 wasMultiTurn: nextWasMultiTurn,
-                lastAccessedAt: now
+                lastAccessedAt: now,
+                lastPromptTokens: nextPromptTokens,
+                lastCachedInputTokens: nextCachedInputTokens
             )
             pruneStickinessLocked(now: now)
         }

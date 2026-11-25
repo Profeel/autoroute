@@ -2979,7 +2979,9 @@ public final class AutoModelEngine: ObservableObject {
                                 explicitTier: explicitTier,
                                 isMultiTurn: features.isMultiTurn,
                                 stickinessNamespace: agentResolution.agentKind?.rawValue,
-                                isUserTurnBoundary: features.isUserTurnBoundary != false
+                                isUserTurnBoundary: features.isUserTurnBoundary != false,
+                                promptTokens: completion.usage?.promptTokens,
+                                cachedInputTokens: completion.usage?.cachedInputTokens
                             )
                         }
 
