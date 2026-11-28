@@ -440,6 +440,7 @@ struct ModelEditorSheet: View {
     @State private var cacheCreationPriceText: String = ""
     @State private var maxRPMText: String = ""
     @State private var contextWindow: Int = 128_000
+    @State private var verifiedContextWindowText = ""
     @State private var capabilities: Set<ModelCapability> = [.chat]
     @State private var defaultRole: ModelDefaultUsage = .general
     @State private var qualityScore: Double = 75
@@ -482,6 +483,7 @@ struct ModelEditorSheet: View {
 
                 Section("约束与能力标签") {
                     Stepper("上下文上限: \(contextWindow) tokens", value: $contextWindow, in: 2048...2_000_000, step: 8192)
+                    TextField("已验证上下文（tokens，未知留空）", text: $verifiedContextWindowText)
                     TextField("软 RPM 上限（可选，超限优先分流到同档备用）", text: $maxRPMText)
                     VStack(alignment: .leading, spacing: 6) {
                         Text("能力标签")
@@ -549,6 +551,7 @@ struct ModelEditorSheet: View {
                     maxRPMText = String(rpm)
                 }
                 contextWindow = existing.contextWindow
+                verifiedContextWindowText = existing.verifiedContextWindow.map(String.init) ?? ""
                 capabilities = existing.capabilities
                 defaultRole = existing.defaultRole
                 qualityScore = Double(existing.qualityScore)
@@ -614,6 +617,19 @@ struct ModelEditorSheet: View {
             maxRPM = v
         }
 
+        let verifiedText = verifiedContextWindowText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let verifiedWindow = Int(verifiedText)
+        if !verifiedText.isEmpty && (verifiedWindow ?? 0) <= 0 {
+            validationError = "已验证上下文请填正整数，或留空。"
+            return
+        }
+        if let existing = existingModel, trimmedID != existing.modelID,
+           verifiedWindow != nil, verifiedWindow == existing.verifiedContextWindow {
+            verifiedContextWindowText = ""
+            validationError = "模型 ID 已更改，请重新填写已验证上下文，或留空。"
+            return
+        }
+
         var updated = existingModel ?? ModelConfig(providerID: providerID, modelID: trimmedID)
         updated.providerID = existingModel?.providerID ?? providerID
         updated.modelID = trimmedID
@@ -624,6 +640,7 @@ struct ModelEditorSheet: View {
         updated.cacheCreationPricePerMillion = cacheCreatePrice
         updated.maxRequestsPerMinute = maxRPM
         updated.contextWindow = contextWindow
+        updated.verifiedContextWindow = verifiedWindow
         updated.capabilities = capabilities
         updated.defaultRole = defaultRole
         updated.qualityScore = Int(qualityScore)

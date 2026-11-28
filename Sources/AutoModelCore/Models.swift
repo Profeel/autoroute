@@ -268,6 +268,9 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
     /// Optional soft RPM cap used to spill traffic to same-tier backups before hitting upstream 429.
     public var maxRequestsPerMinute: Int?
     public var contextWindow: Int
+    /// Operator-verified context on this provider and model, including any upstream routing paths.
+    /// Legacy routing estimates and import defaults leave this unset.
+    public var verifiedContextWindow: Int?
     public var capabilities: Set<ModelCapability>
     public var defaultRole: ModelDefaultUsage
     /// 1...100 subjective quality rating configured by user or template
@@ -295,6 +298,7 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         cacheCreationPricePerMillion: Double? = nil,
         maxRequestsPerMinute: Int? = nil,
         contextWindow: Int = 128_000,
+        verifiedContextWindow: Int? = nil,
         capabilities: Set<ModelCapability> = [.chat],
         defaultRole: ModelDefaultUsage = .general,
         qualityScore: Int = 75,
@@ -318,6 +322,7 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         self.cacheCreationPricePerMillion = cacheCreationPricePerMillion
         self.maxRequestsPerMinute = maxRequestsPerMinute.flatMap { $0 > 0 ? $0 : nil }
         self.contextWindow = max(1024, contextWindow)
+        self.verifiedContextWindow = verifiedContextWindow
         self.capabilities = capabilities
         self.defaultRole = defaultRole
         self.qualityScore = min(100, max(1, qualityScore))
@@ -335,7 +340,7 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         case id, providerID, modelID, displayName, isEnabled
         case inputPricePerMillion, outputPricePerMillion
         case cachedInputPricePerMillion, cacheCreationPricePerMillion, maxRequestsPerMinute
-        case contextWindow
+        case contextWindow, verifiedContextWindow
         case capabilities, defaultRole, qualityScore, speedScore
         case availabilityStatus, lastAvailabilityNote
         case discoveredSource, isAutoEvicted, lastProbeLatencyMs, lastProbedAt
@@ -356,6 +361,7 @@ public struct ModelConfig: Identifiable, Codable, Equatable, Hashable, Sendable 
         let rawRPM = try c.decodeIfPresent(Int.self, forKey: .maxRequestsPerMinute)
         maxRequestsPerMinute = rawRPM.flatMap { $0 > 0 ? $0 : nil }
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow) ?? 128_000
+        verifiedContextWindow = try c.decodeIfPresent(Int.self, forKey: .verifiedContextWindow)
         capabilities = try c.decodeIfPresent(Set<ModelCapability>.self, forKey: .capabilities) ?? [.chat]
         defaultRole = try c.decodeIfPresent(ModelDefaultUsage.self, forKey: .defaultRole) ?? .general
         qualityScore = try c.decodeIfPresent(Int.self, forKey: .qualityScore) ?? 75

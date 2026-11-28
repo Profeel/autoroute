@@ -155,6 +155,81 @@ final class P0SecurityTests: XCTestCase {
     }
 
     @MainActor
+    func testAutoCatalogPublishesOnlyTheVerifiedPoolMinimum() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoroute-catalog-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = AutoModelEngine(persistence: LocalPersistenceStore(baseDirectoryURL: directory),
+                                     keychain: InMemoryKeychainService(), autoStartProxyIfConfigured: false)
+        let port = try XCTUnwrap(LoopbackHTTPServer.findAvailablePort(startingFrom: 21_120))
+        engine.updateProxyPort(port)
+        engine.startProxy()
+        defer { engine.stopProxy() }
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/models")!)
+        request.setValue("Bearer \(engine.localAPIToken)", forHTTPHeaderField: "Authorization")
+        func fetchWindow() async throws -> Int? {
+            let (body, response) = try await URLSession.shared.data(for: request)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            let catalog = try XCTUnwrap(payload["data"] as? [[String: Any]])
+            let auto = try XCTUnwrap(catalog.first { $0["id"] as? String == "auto" })
+            return auto["context_length"] as? Int
+        }
+
+        let provider = ProviderConfig(name: "Catalog Test", baseURL: "http://127.0.0.1:9")
+        try engine.upsertProvider(provider, apiKey: nil)
+        let emptyWindow = try await fetchWindow()
+        XCTAssertNil(emptyWindow)
+
+        let primary = ModelConfig(providerID: provider.id, modelID: "primary", contextWindow: 128_000,
+                                  verifiedContextWindow: 500_000)
+        engine.upsertModel(primary)
+        let constrainedWindow = try await fetchWindow()
+        XCTAssertEqual(constrainedWindow, 128_000)
+
+        var alternate = ModelConfig(providerID: provider.id, modelID: "alternate")
+        let legacyData = try JSONEncoder().encode(alternate)
+        alternate = try JSONDecoder().decode(ModelConfig.self, from: legacyData)
+        XCTAssertEqual(alternate.contextWindow, 128_000)
+        XCTAssertNil(alternate.verifiedContextWindow)
+        engine.upsertModel(alternate)
+        engine.updatePolicy {
+            $0.fallbackModelID = alternate.id
+            $0.enableRetryOnUpstreamFailure = true
+        }
+        let unknownWindow = try await fetchWindow()
+        XCTAssertNil(unknownWindow)
+
+        alternate.verifiedContextWindow = 32_768
+        engine.upsertModel(alternate)
+        let belowHermesMinimum = try await fetchWindow()
+        XCTAssertEqual(belowHermesMinimum, 32_768)
+        alternate.verifiedContextWindow = 64_000
+        engine.upsertModel(alternate)
+        let poolMinimum = try await fetchWindow()
+        XCTAssertEqual(poolMinimum, 64_000)
+
+        alternate.isEnabled = false
+        engine.upsertModel(alternate)
+        let disabledWindow = try await fetchWindow()
+        XCTAssertEqual(disabledWindow, 128_000)
+
+        alternate.isEnabled = true
+        alternate.verifiedContextWindow = nil
+        engine.upsertModel(alternate)
+        let reenabledWindow = try await fetchWindow()
+        XCTAssertNil(reenabledWindow)
+
+        alternate.isEnabled = false
+        engine.upsertModel(alternate)
+        var movedProvider = provider
+        movedProvider.baseURL = "http://127.0.0.1:10"
+        try engine.upsertProvider(movedProvider, apiKey: nil)
+        let movedWindow = try await fetchWindow()
+        XCTAssertNil(movedWindow)
+    }
+
+    @MainActor
     func testRealHTTPAuthenticationAndBodyRecordingLifecycle() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("autoroute-p0-http-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }

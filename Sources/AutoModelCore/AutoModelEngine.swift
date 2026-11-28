@@ -549,6 +549,12 @@ public final class AutoModelEngine: ObservableObject {
         }
 
         if let idx = config.providers.firstIndex(where: { $0.id == updated.id }) {
+            let existing = config.providers[idx]
+            if existing.baseURL != updated.baseURL || existing.apiProtocol != updated.apiProtocol {
+                for modelIndex in config.models.indices where config.models[modelIndex].providerID == updated.id {
+                    config.models[modelIndex].verifiedContextWindow = nil
+                }
+            }
             config.providers[idx] = updated
         } else {
             config.providers.append(updated)
@@ -1703,6 +1709,20 @@ public final class AutoModelEngine: ObservableObject {
             }
             return true
         }
+    }
+
+    func autoCatalogContextWindow() -> Int? {
+        // The catalog has no request features or sticky session. Use the available pool as
+        // a conservative bound, including models that may only receive a retry.
+        let candidates = healthyAvailableModels()
+        var window: Int?
+        for candidate in candidates {
+            guard let verified = candidate.verifiedContextWindow, verified > 0,
+                  candidate.contextWindow > 0 else { return nil }
+            let usable = min(verified, candidate.contextWindow)
+            window = min(window ?? usable, usable)
+        }
+        return window
     }
 
     public func isProviderAvailable(_ provider: ProviderConfig) -> Bool {
