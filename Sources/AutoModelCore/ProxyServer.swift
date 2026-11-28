@@ -194,6 +194,9 @@ public final class ProxyServer: @unchecked Sendable {
                     "owned_by": "automodel-tier"
                 ]
             ]
+            if let window = engine.autoCatalogContextWindow() {
+                items[0]["context_length"] = window
+            }
             for kind in AgentKind.allCases {
                 let alias = "auto/agent/\(kind.rawValue)"
                 for suffix in ["", "/low", "/medium", "/high"] {
